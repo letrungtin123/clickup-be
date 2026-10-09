@@ -127,7 +127,45 @@ export const WorkspaceContextSchema = z.object({
   user: AppUserSchema,
   organization: OrganizationSchema,
   role: RoleSchema,
-  hasFullOrganizationAuthority: z.boolean()
+  hasFullOrganizationAuthority: z.boolean(),
+  /** Set for admin-created accounts until the user replaces the temporary password (PD-005). */
+  mustChangePassword: z.boolean().default(false)
+});
+
+/** Password policy for user-chosen passwords. */
+export const NewPasswordSchema = z
+  .string()
+  .min(10, "Password must be at least 10 characters.")
+  .max(128)
+  .refine((value) => /[A-Za-z]/.test(value) && /[0-9]/.test(value), "Password must contain letters and numbers.");
+
+export const ChangePasswordRequestSchema = z
+  .object({
+    currentPassword: z.string().min(1).max(4096),
+    newPassword: NewPasswordSchema
+  })
+  .strict()
+  .refine((value) => value.currentPassword !== value.newPassword, {
+    message: "The new password must be different.",
+    path: ["newPassword"]
+  });
+
+export const CreateOrganizationMemberRequestSchema = z
+  .object({
+    email: z.string().trim().toLowerCase().email().max(254),
+    displayName: z.string().trim().min(1).max(160),
+    roleId: OpaqueIdSchema,
+    jobTitle: z.string().trim().max(120).nullable().optional()
+  })
+  .strict();
+
+export const TemporaryPasswordResponseSchema = z.object({
+  /** Shown to the admin exactly once; never stored in plain text. */
+  temporaryPassword: z.string().min(12)
+});
+
+export const CreatedMemberResponseSchema = TemporaryPasswordResponseSchema.extend({
+  member: OrganizationMemberSchema
 });
 
 export const ProjectKeySchema = z.string().trim().regex(/^[A-Z][A-Z0-9]{1,11}$/);
@@ -367,6 +405,8 @@ export type OrganizationMember = z.infer<typeof OrganizationMemberSchema>;
 export type OrganizationMemberCollection = z.infer<typeof OrganizationMemberCollectionSchema>;
 export type UpdateOrganizationMemberRequest = z.infer<typeof UpdateOrganizationMemberRequestSchema>;
 export type WorkspaceContext = z.infer<typeof WorkspaceContextSchema>;
+export type ChangePasswordRequest = z.infer<typeof ChangePasswordRequestSchema>;
+export type CreateOrganizationMemberRequest = z.infer<typeof CreateOrganizationMemberRequestSchema>;
 export type ProjectSummary = z.infer<typeof ProjectSummarySchema>;
 export type ProjectCollection = z.infer<typeof ProjectCollectionSchema>;
 export type CreateProjectRequest = z.infer<typeof CreateProjectRequestSchema>;

@@ -2,7 +2,7 @@ import type { NextFunction, Request, RequestHandler, Response } from "express";
 import { z } from "zod";
 
 import type { AuthenticatedRequest } from "../../middleware/auth.js";
-import { resolveAccessContext, type AccessContext } from "../access/access-context.js";
+import { assertPasswordCurrent, resolveAccessContext, type AccessContext } from "../access/access-context.js";
 
 export const IdParam = z.string().uuid();
 
@@ -17,7 +17,7 @@ export const handle =
   ): RequestHandler =>
   (req: Request, res: Response, next: NextFunction) => {
     resolveAccessContext((req as AuthenticatedRequest).auth.id)
-      .then((context) => handler(context, req, res))
+      .then((context) => handler(assertPasswordCurrent(context), req, res))
       .then((body) => {
         if (!res.headersSent) {
           res.status(status).json(body);

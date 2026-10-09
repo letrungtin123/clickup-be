@@ -18,7 +18,7 @@ import { AppError } from "../lib/app-error.js";
 import { readCookieFromHeader } from "../lib/cookies.js";
 import { logger } from "../lib/logger.js";
 import { getOptionalRedis, getRedisSubscriber } from "../lib/redis.js";
-import { resolveAccessContext } from "../modules/access/access-context.js";
+import { assertPasswordCurrent, resolveAccessContext } from "../modules/access/access-context.js";
 import { accessTokenCookieName } from "../modules/auth/auth.cookies.js";
 import { verifyAccessToken } from "../modules/auth/supabase-auth.service.js";
 import { setLocalRealtimeServer } from "./publisher.js";
@@ -101,7 +101,7 @@ export const attachRealtimeGateway = (httpServer: HttpServer): GatewayServer => 
     }
 
     const session = await verifyAccessToken(token);
-    const context = await resolveAccessContext(session.id);
+    const context = assertPasswordCurrent(await resolveAccessContext(session.id));
 
     socket.data.userId = context.user.id;
     socket.data.organizationId = context.organization.id;

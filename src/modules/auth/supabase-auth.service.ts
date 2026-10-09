@@ -153,6 +153,7 @@ const jwtSecret = env.SUPABASE_JWT_SECRET ? new TextEncoder().encode(env.SUPABAS
 const AccessTokenClaimsSchema = z.object({
   sub: z.string().uuid(),
   exp: z.number().int(),
+  iat: z.number().int().optional(),
   role: z.literal("authenticated"),
   email: z.string().email().nullable().optional(),
   session_id: z.string().uuid().nullable().optional(),
@@ -162,13 +163,32 @@ const AccessTokenClaimsSchema = z.object({
 
 const revokedSessionKey = (sessionId: string) => `auth:revoked:${sessionId}`;
 
-const isSessionRevoked = async (sessionId: string | null) => {
+const validAfterKey = (userId: string) => `auth:valid-after:${userId}`;
+
+/** A token is revoked when its session was logged out, or it was issued before a user-wide revocation. */
+const isTokenRevoked = async (userId: string, sessionId: string | null, issuedAt: number | undefined) => {
   const redis = getOptionalRedis();
-  if (!redis || !sessionId) {
+  if (!redis) {
     return false;
   }
+  const [sessionRevoked, validAfter] = await Promise.all([
+    sessionId ? redis.exists(revokedSessionKey(sessionId)) : Promise.resolve(0),
+    redis.get(validAfterKey(userId))
+  ]);
+  if (sessionRevoked === 1) {
+    return true;
+  }
+  return validAfter !== null && (issuedAt === undefined || issuedAt < Number(validAfter));
+};
 
-  return (await redis.exists(revokedSessionKey(sessionId))) === 1;
+/** Rejects every access token of a user issued before now (password reset, account disabled). */
+export const revokeTokensIssuedBefore = async (userId: string, nowSeconds = Math.floor(Date.now() / 1000)) => {
+  const redis = getOptionalRedis();
+  if (!redis) {
+    return;
+  }
+  // Access tokens live at most JWT_EXPIRY (1h); keep the marker a little longer.
+  await redis.set(validAfterKey(userId), String(nowSeconds), "EX", 2 * 3600);
 };
 
 const verifyAccessTokenRemotely = async (accessToken: string): Promise<VerifiedSession> => {
@@ -208,7 +228,7 @@ export const verifyAccessToken = async (accessToken: string): Promise<VerifiedSe
   }
 
   const sessionId = claims.session_id ?? null;
-  if (await isSessionRevoked(sessionId)) {
+  if (await isTokenRevoked(claims.sub, sessionId, claims.iat)) {
     throw new AppError("AUTH_INVALID", "Email, password, or session is invalid.", 401);
   }
 

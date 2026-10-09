@@ -24,6 +24,7 @@ type WorkspaceContextRow = {
   user_id: string;
   email: string | null;
   display_name: string;
+  must_change_password: boolean;
   organization_id: string;
   organization_slug: string;
   organization_name: string;
@@ -228,6 +229,29 @@ const assertOrganizationWillKeepSuperadmin = async (
   }
 };
 
+/**
+ * Privilege-escalation guard: only superadmins may grant capabilities they do not hold themselves,
+ * edit their own role, or assign/modify superadmin memberships.
+ */
+export const assertCanGrantPermissions = (context: WorkspaceContext, permissions: PermissionKey[]) => {
+  if (context.hasFullOrganizationAuthority) {
+    return;
+  }
+  const own = new Set(context.role.permissions);
+  if (permissions.some((permission) => !own.has(permission))) {
+    throw new AppError("PERMISSION_ESCALATION", "You cannot grant permissions you do not have.", 403);
+  }
+};
+
+export const assertCanAssignRole = async (sql: QuerySql, context: WorkspaceContext, roleId: string) => {
+  const role = await getManagedRoleById(sql, context, roleId);
+  if (!context.hasFullOrganizationAuthority && role.key === "superadmin") {
+    throw new AppError("PERMISSION_ESCALATION", "Only a superadmin can assign the superadmin role.", 403);
+  }
+  assertCanGrantPermissions(context, role.permissions);
+  return role;
+};
+
 export const getWorkspaceContext = async (userId: string): Promise<WorkspaceContext> => {
   const sql = getSql();
   const rows = await sql<WorkspaceContextRow[]>`
@@ -235,6 +259,7 @@ export const getWorkspaceContext = async (userId: string): Promise<WorkspaceCont
       au.id AS user_id,
       au.email,
       au.display_name,
+      au.must_change_password,
       o.id AS organization_id,
       o.slug AS organization_slug,
       o.name AS organization_name,
@@ -260,7 +285,7 @@ export const getWorkspaceContext = async (userId: string): Promise<WorkspaceCont
       AND rp.organization_id = r.organization_id
     WHERE au.id = ${userId}
       AND au.deleted_at IS NULL
-    GROUP BY au.id, au.email, au.display_name, o.id, o.slug, o.name, r.id, r.key, r.name, om.joined_at, om.created_at
+    GROUP BY au.id, au.email, au.display_name, au.must_change_password, o.id, o.slug, o.name, r.id, r.key, r.name, om.joined_at, om.created_at
     ORDER BY om.joined_at ASC NULLS LAST, om.created_at ASC
     LIMIT 1
   `;
@@ -292,7 +317,8 @@ export const getWorkspaceContext = async (userId: string): Promise<WorkspaceCont
       name: row.organization_name
     },
     role,
-    hasFullOrganizationAuthority: row.role_key === "superadmin"
+    hasFullOrganizationAuthority: row.role_key === "superadmin",
+    mustChangePassword: row.must_change_password
   };
 };
 
@@ -325,7 +351,10 @@ export const listPermissions = async (context: WorkspaceContext): Promise<Permis
 };
 
 export const listRoles = async (context: WorkspaceContext): Promise<RoleCollection> => {
-  assertPermission(context, Permission.RoleView);
+  // Member managers need the role list to pick one when creating or editing members.
+  if (!context.role.permissions.includes(Permission.MemberManage)) {
+    assertPermission(context, Permission.RoleView);
+  }
   const sql = getSql();
   const rows = await sql<ManagedRoleRow[]>`
     SELECT
@@ -356,6 +385,7 @@ export const createRole = async (context: WorkspaceContext, input: CreateRoleReq
   assertPermission(context, Permission.RoleCreate);
   const sql = getSql();
   const permissions = uniquePermissionKeys(input.permissions);
+  assertCanGrantPermissions(context, permissions);
   const description = nullableText(input.description);
 
   if (input.key === "superadmin") {
@@ -438,6 +468,10 @@ export const updateRolePermissions = async (
   return await sql.begin(async (tx) => {
     const current = await getManagedRoleById(tx, context, roleId);
     assertManagedRoleEditable(current);
+    if (!context.hasFullOrganizationAuthority && current.id === context.role.id) {
+      throw new AppError("PERMISSION_ESCALATION", "You cannot change the permissions of your own role.", 403);
+    }
+    assertCanGrantPermissions(context, permissions);
 
     await tx`
       DELETE FROM public.role_permissions
@@ -498,7 +532,7 @@ export const archiveRole = async (context: WorkspaceContext, roleId: string) => 
 export const listOrganizationMembers = async (
   context: WorkspaceContext
 ): Promise<OrganizationMemberCollection> => {
-  assertPermission(context, Permission.RoleView);
+  assertPermission(context, Permission.MemberView);
   const sql = getSql();
   const rows = await sql<OrganizationMemberRow[]>`
     SELECT
@@ -548,7 +582,7 @@ export const updateOrganizationMember = async (
   membershipId: string,
   input: UpdateOrganizationMemberRequest
 ) => {
-  assertPermission(context, Permission.RoleUpdate);
+  assertPermission(context, Permission.MemberManage);
   const sql = getSql();
 
   const currentRows = await sql<{ user_id: string; role_key: string; status: EditableMembershipStatus | "invited" }[]>`
@@ -575,6 +609,11 @@ export const updateOrganizationMember = async (
 
   if (input.roleId) {
     await assertRoleExists(sql, context, input.roleId);
+    await assertCanAssignRole(sql, context, input.roleId);
+  }
+
+  if (current.role_key === "superadmin" && !context.hasFullOrganizationAuthority) {
+    throw new AppError("PERMISSION_ESCALATION", "Only a superadmin can change a superadmin membership.", 403);
   }
 
   if (current.role_key === "superadmin" && (input.status === "disabled" || input.roleId)) {

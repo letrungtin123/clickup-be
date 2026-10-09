@@ -49,14 +49,16 @@ const rolePermissions: Record<SeedUser["role"], string[]> = {
     "task.view", "task.create", "task.update", "task.delete", "task.assign",
     "status.view", "status.create", "status.update", "status.delete",
     "channel.view", "channel.create", "channel.update", "channel.manage_members",
-    "knowledge.view"
+    "knowledge.view",
+    "task.comment", "member.view", "member.manage"
   ],
   member: [
     "project.view", "list.view",
     "task.view", "task.create", "task.update", "task.assign",
     "status.view",
     "channel.view", "channel.create",
-    "knowledge.view"
+    "knowledge.view",
+    "task.comment", "member.view"
   ]
 };
 

@@ -1,5 +1,6 @@
 import { env } from "../../config/env.js";
 import { WorkspaceContextSchema, type WorkspaceContext } from "../../contracts/schemas.js";
+import { AppError } from "../../lib/app-error.js";
 import { logger } from "../../lib/logger.js";
 import { getOptionalRedis } from "../../lib/redis.js";
 import { getWorkspaceContext } from "../workspace/workspace.service.js";
@@ -43,6 +44,17 @@ export const resolveAccessContext = async (userId: string): Promise<AccessContex
     });
   }
 
+  return context;
+};
+
+/**
+ * Accounts created with a temporary password (PD-005) may only read their context and change
+ * the password until they do; every business endpoint calls this.
+ */
+export const assertPasswordCurrent = (context: AccessContext) => {
+  if (context.mustChangePassword) {
+    throw new AppError("PASSWORD_CHANGE_REQUIRED", "Please change your temporary password to continue.", 403);
+  }
   return context;
 };
 

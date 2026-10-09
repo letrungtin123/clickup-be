@@ -65,6 +65,24 @@ export const publishToUsers = <Name extends EventName>(userIds: string[], event:
   publishToRooms([...new Set(userIds)].map(userRoom), event, payload);
 };
 
+/** Disconnects every live socket of the given users, cluster-wide (account disabled, password reset). */
+export const disconnectUsers = (userIds: string[]) => {
+  if (userIds.length === 0) {
+    return;
+  }
+  const rooms = [...new Set(userIds)].map(userRoom);
+  try {
+    const redisEmitter = getEmitter();
+    if (redisEmitter) {
+      redisEmitter.in(rooms).disconnectSockets(true);
+    } else {
+      localServer?.in(rooms).disconnectSockets(true);
+    }
+  } catch (error) {
+    logger.warn({ err: error }, "Realtime disconnect failed");
+  }
+};
+
 /** Removes every socket of the given users from a room (e.g. after membership removal), cluster-wide. */
 export const evictUsersFromRoom = (userIds: string[], room: RealtimeRoomRef) => {
   if (userIds.length === 0) {
