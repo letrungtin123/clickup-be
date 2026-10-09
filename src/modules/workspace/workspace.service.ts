@@ -25,6 +25,7 @@ type WorkspaceContextRow = {
   email: string | null;
   display_name: string;
   must_change_password: boolean;
+  production_roles: string[] | null;
   organization_id: string;
   organization_slug: string;
   organization_name: string;
@@ -260,6 +261,11 @@ export const getWorkspaceContext = async (userId: string): Promise<WorkspaceCont
       au.email,
       au.display_name,
       au.must_change_password,
+      (
+        SELECT array_agg(pur.role_code ORDER BY pur.role_code)
+        FROM production.user_roles pur
+        WHERE pur.organization_id = o.id AND pur.user_id = au.id
+      ) AS production_roles,
       o.id AS organization_id,
       o.slug AS organization_slug,
       o.name AS organization_name,
@@ -318,7 +324,8 @@ export const getWorkspaceContext = async (userId: string): Promise<WorkspaceCont
     },
     role,
     hasFullOrganizationAuthority: row.role_key === "superadmin",
-    mustChangePassword: row.must_change_password
+    mustChangePassword: row.must_change_password,
+    productionRoles: row.production_roles ?? []
   };
 };
 

@@ -47,3 +47,36 @@ export const session = async (who) => {
   }
   return { call, cookieHeader };
 };
+
+// Local-only DB/Redis access for suite setup (refuses any container outside the dev compose projects).
+import { spawnSync } from "node:child_process";
+
+const assertProject = (container, expected) => {
+  const project = spawnSync("docker", ["inspect", container, "--format", '{{index .Config.Labels "com.docker.compose.project"}}'], { encoding: "utf8" }).stdout.trim();
+  if (project !== expected) {
+    throw new Error(`refusing: ${container} belongs to '${project}', expected '${expected}'`);
+  }
+};
+
+/** Runs SQL on the LOCAL dev database and returns unaligned rows (`a|b`). */
+export const localSql = (statement) => {
+  assertProject("supabase-db", "clickup-supabase-selfhost");
+  const result = spawnSync("docker", ["exec", "-i", "supabase-db", "psql", "-v", "ON_ERROR_STOP=1", "-U", "postgres", "-d", "postgres", "-At"], {
+    input: statement,
+    encoding: "utf8"
+  });
+  if (result.status !== 0) {
+    throw new Error(`localSql failed: ${result.stderr}`);
+  }
+  return result.stdout.trim().split(/\r?\n/).filter(Boolean);
+};
+
+/** Bumps the access-context cache version after direct SQL changes to authorization data. */
+export const bumpAuthz = () => {
+  assertProject("nesso-work-redis", "nesso-work-infra");
+  const password = readFileSync(new URL("../../../infra/.env", import.meta.url), "utf8").match(/^REDIS_PASSWORD=(.*)$/m)?.[1]?.trim();
+  const result = spawnSync("docker", ["exec", "-e", `REDISCLI_AUTH=${password ?? ""}`, "nesso-work-redis", "redis-cli", "INCR", "authz:ver"], { encoding: "utf8" });
+  if (result.status !== 0) {
+    throw new Error("bumpAuthz failed");
+  }
+};

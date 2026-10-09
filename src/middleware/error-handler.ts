@@ -9,6 +9,7 @@ const postgresErrors: Record<string, { status: number; code: string; message: st
   "23505": { status: 409, code: "CONFLICT", message: "This change conflicts with existing data." },
   "23503": { status: 409, code: "REFERENCE_INVALID", message: "A referenced item no longer exists." },
   "23514": { status: 409, code: "RULE_VIOLATION", message: "This change is not allowed by a data rule." },
+  "23P01": { status: 409, code: "CONFLICT", message: "This change overlaps existing data." },
   "22P02": { status: 400, code: "VALIDATION_FAILED", message: "Request validation failed." },
   "40001": { status: 409, code: "RETRY", message: "The request conflicted with another change. Please retry." },
   "40P01": { status: 409, code: "RETRY", message: "The request conflicted with another change. Please retry." }

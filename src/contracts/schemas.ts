@@ -132,7 +132,9 @@ export const WorkspaceContextSchema = z.object({
   role: RoleSchema,
   hasFullOrganizationAuthority: z.boolean(),
   /** Set for admin-created accounts until the user replaces the temporary password (PD-005). */
-  mustChangePassword: z.boolean().default(false)
+  mustChangePassword: z.boolean().default(false),
+  /** Production (retouch) roles: ADMIN | ACCOUNT | LEADER | QC | STAFF (PD-011). */
+  productionRoles: z.array(z.string().min(1).max(20)).default([])
 });
 
 /** Password policy for user-chosen passwords. */
