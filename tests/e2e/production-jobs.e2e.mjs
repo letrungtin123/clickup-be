@@ -16,6 +16,12 @@ localSql(`
   ON CONFLICT DO NOTHING;
 `);
 bumpAuthz();
+// Archive leftovers of earlier runs that crashed before their own cleanup (they would clutter real job lists).
+localSql(`
+  UPDATE production.jobs j SET archived_at = now() FROM production.projects p
+  WHERE p.id = j.project_id AND p.name LIKE 'E2E jobs %' AND j.archived_at IS NULL;
+  UPDATE production.projects SET active = false WHERE name LIKE 'E2E jobs %' AND active;
+`);
 
 const admin = await session("MANAGER");
 const leader = await session("MEMBER_A");
