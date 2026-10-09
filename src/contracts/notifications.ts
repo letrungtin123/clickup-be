@@ -18,6 +18,7 @@ export const notificationTypes = [
   "task.overdue",
   "project.member_added",
   "chat.mentioned",
+  "chat.thread_replied",
   "channel.member_added"
 ] as const;
 export const NotificationTypeSchema = z.enum(notificationTypes);

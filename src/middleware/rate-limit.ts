@@ -5,6 +5,8 @@ import { RedisStore } from "rate-limit-redis";
 import { env } from "../config/env.js";
 import { AppError } from "../lib/app-error.js";
 import { getOptionalRedis } from "../lib/redis.js";
+import { verifyAccessToken } from "../modules/auth/supabase-auth.service.js";
+import { getAccessTokenFromRequest, type AuthenticatedRequest } from "./auth.js";
 
 const redisStore = (prefix: string): Partial<Options> => {
   const redis = getOptionalRedis();
@@ -29,14 +31,39 @@ const rejectWith = (code: string, message: string): Options["handler"] => {
   };
 };
 
-/** Global per-IP limiter shared across API instances. */
+/**
+ * Resolves the verified session once per request (reused by requireSupabaseUser) so signed-in
+ * traffic is limited per user — many colleagues behind one office NAT must not share a bucket.
+ */
+const resolveSessionForLimit = async (req: Request) => {
+  const existing = (req as Partial<AuthenticatedRequest>).auth;
+  if (existing) {
+    return existing;
+  }
+  const token = getAccessTokenFromRequest(req);
+  if (!token) {
+    return null;
+  }
+  try {
+    const session = await verifyAccessToken(token);
+    (req as AuthenticatedRequest).auth = session;
+    return session;
+  } catch {
+    return null;
+  }
+};
+
+/** Global limiter shared across API instances: per user when signed in, per IP otherwise. */
 export const createApiRateLimit = () =>
   rateLimit({
     windowMs: env.RATE_LIMIT_WINDOW_MS,
-    limit: env.RATE_LIMIT_MAX,
+    limit: async (req: Request) => ((await resolveSessionForLimit(req)) ? env.RATE_LIMIT_MAX * 2 : env.RATE_LIMIT_MAX),
     standardHeaders: "draft-8",
     legacyHeaders: false,
-    keyGenerator: clientIp,
+    keyGenerator: async (req: Request) => {
+      const session = await resolveSessionForLimit(req);
+      return session ? `user:${session.id}` : `ip:${clientIp(req)}`;
+    },
     handler: rejectWith("RATE_LIMITED", "Too many requests. Please slow down."),
     ...redisStore("api")
   });

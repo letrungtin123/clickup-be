@@ -70,6 +70,95 @@ const taskTarget = (task: TaskInfo) => ({
   payloadBase: { taskKey: task.task_key, projectName: task.project_name }
 });
 
+
+type ChatContext = { name: string | null; kind: string; text: string | null; threadRootId: string | null };
+
+const loadChatMessage = async (event: DomainEventEnvelope, channelId: string, messageId: string) => {
+  const sql = getSql();
+  const row = (
+    await sql<ChatContext[]>`
+      SELECT c.name, c.kind, m.body_text AS text, m.thread_root_id AS "threadRootId"
+      FROM public.channels c
+      LEFT JOIN public.messages m ON m.id = ${messageId} AND m.organization_id = c.organization_id AND m.deleted_at IS NULL
+      WHERE c.id = ${channelId} AND c.organization_id = ${event.organizationId} AND c.deleted_at IS NULL
+    `
+  )[0];
+  return row && row.text !== null ? row : null;
+};
+
+/** Private conversations only notify current members; public channels may notify any org member. */
+const currentMembers = async (event: DomainEventEnvelope, channelId: string, userIds: string[]) => {
+  if (userIds.length === 0) {
+    return [];
+  }
+  const rows = await getSql()<{ user_id: string }[]>`
+    SELECT user_id FROM public.channel_members
+    WHERE organization_id = ${event.organizationId} AND channel_id = ${channelId}
+      AND user_id = ANY(${userIds}::uuid[]) AND deleted_at IS NULL
+  `;
+  return rows.map((row) => row.user_id);
+};
+
+const notifyChatMentions = async (event: DomainEventEnvelope, mentioned: string[]) => {
+  const channelId = str(event.payload.channelId);
+  const messageId = str(event.payload.messageId) ?? event.aggregateId;
+  if (mentioned.length === 0 || !channelId || !messageId) {
+    return;
+  }
+  const chat = await loadChatMessage(event, channelId, messageId);
+  if (!chat) {
+    return;
+  }
+  const recipients = chat.kind === "public" ? mentioned : await currentMembers(event, channelId, mentioned);
+  await deliverNotifications({
+    organizationId: event.organizationId,
+    recipientIds: recipients,
+    type: "chat.mentioned",
+    actorUserId: str(event.payload.authorId) ?? event.actorUserId,
+    title: chat.name ?? "Direct message",
+    body: chat.text,
+    channelId,
+    messageId,
+    payload: { channelKind: chat.kind, threadRootId: chat.threadRootId },
+    dedupeKey: `evt:${event.id}:mention`
+  });
+};
+
+/** A thread reply notifies the root author and earlier repliers (minus anyone already @mentioned). */
+const notifyThreadParticipants = async (event: DomainEventEnvelope) => {
+  const channelId = str(event.payload.channelId);
+  const messageId = str(event.payload.messageId) ?? event.aggregateId;
+  const threadRootId = str(event.payload.threadRootId);
+  if (!channelId || !messageId || !threadRootId) {
+    return;
+  }
+  const chat = await loadChatMessage(event, channelId, messageId);
+  if (!chat) {
+    return;
+  }
+  const participants = await getSql()<{ author_user_id: string }[]>`
+    SELECT DISTINCT author_user_id FROM public.messages
+    WHERE organization_id = ${event.organizationId} AND channel_id = ${channelId}
+      AND (id = ${threadRootId} OR thread_root_id = ${threadRootId})
+      AND deleted_at IS NULL AND kind = 'user'
+    LIMIT 200
+  `;
+  const mentioned = new Set(strArray(event.payload.mentionedUserIds));
+  const candidates = participants.map((row) => row.author_user_id).filter((id) => !mentioned.has(id));
+  await deliverNotifications({
+    organizationId: event.organizationId,
+    recipientIds: await currentMembers(event, channelId, candidates),
+    type: "chat.thread_replied",
+    actorUserId: str(event.payload.authorId) ?? event.actorUserId,
+    title: chat.name ?? "Direct message",
+    body: chat.text,
+    channelId,
+    messageId,
+    payload: { channelKind: chat.kind, threadRootId },
+    dedupeKey: `evt:${event.id}:thread`
+  });
+};
+
 type Handler = (event: DomainEventEnvelope) => Promise<void>;
 
 const handlers: Record<string, Handler> = {
@@ -203,50 +292,13 @@ const handlers: Record<string, Handler> = {
   },
 
   "chat.message.created": async (event) => {
-    const mentioned = strArray(event.payload.mentionedUserIds);
-    const channelId = str(event.payload.channelId);
-    const messageId = str(event.payload.messageId) ?? event.aggregateId;
-    if (mentioned.length === 0 || !channelId) {
-      return;
-    }
-    const sql = getSql();
-    const channel = (
-      await sql<{ name: string | null; kind: string; text: string | null }[]>`
-        SELECT c.name, c.kind, m.body_text AS text
-        FROM public.channels c
-        LEFT JOIN public.messages m ON m.id = ${messageId} AND m.organization_id = c.organization_id AND m.deleted_at IS NULL
-        WHERE c.id = ${channelId} AND c.organization_id = ${event.organizationId} AND c.deleted_at IS NULL
-      `
-    )[0];
-    if (!channel || channel.text === null) {
-      return;
-    }
-    // Private conversations only notify current members; public channels may notify any org member.
-    const recipients =
-      channel.kind === "public"
-        ? mentioned
-        : (
-            await sql<{ user_id: string }[]>`
-              SELECT user_id FROM public.channel_members
-              WHERE organization_id = ${event.organizationId} AND channel_id = ${channelId}
-                AND user_id = ANY(${mentioned}::uuid[]) AND deleted_at IS NULL
-            `
-          ).map((row) => row.user_id);
-    await deliverNotifications({
-      organizationId: event.organizationId,
-      recipientIds: recipients,
-      type: "chat.mentioned",
-      actorUserId: str(event.payload.authorId) ?? event.actorUserId,
-      title: channel.name ?? "Direct message",
-      body: channel.text,
-      channelId,
-      messageId,
-      payload: {
-        channelKind: channel.kind,
-        threadRootId: str(event.payload.threadRootId)
-      },
-      dedupeKey: `evt:${event.id}`
-    });
+    await notifyChatMentions(event, strArray(event.payload.mentionedUserIds));
+    await notifyThreadParticipants(event);
+  },
+
+  "chat.message.updated": async (event) => {
+    // Only people newly mentioned by an edit are notified.
+    await notifyChatMentions(event, strArray(event.payload.addedMentionUserIds));
   },
 
   "chat.channel.member_added": async (event) => {

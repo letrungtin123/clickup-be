@@ -24,6 +24,11 @@ export const getAccessTokenFromRequest = (req: Pick<Request, "header">) => {
  */
 export const requireSupabaseUser = async (req: Request, _res: Response, next: NextFunction) => {
   try {
+    // Already verified for this request (e.g. by the rate limiter).
+    if ((req as Partial<AuthenticatedRequest>).auth) {
+      next();
+      return;
+    }
     const accessToken = getAccessTokenFromRequest(req);
     if (!accessToken) {
       throw new AppError("AUTH_REQUIRED", "Authentication is required.", 401);

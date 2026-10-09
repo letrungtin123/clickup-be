@@ -1,6 +1,7 @@
 import { startDeadlineScheduler } from "../modules/notifications/deadline-scheduler.js";
 import { handleNotificationEvent, notificationBindings } from "../modules/notifications/notification-handlers.js";
 import { startConsumer } from "./consumer.js";
+import { startMaintenanceScheduler } from "./maintenance-scheduler.js";
 
 type Stop = () => Promise<void>;
 
@@ -19,6 +20,7 @@ export const startWorkerConsumers = async (): Promise<Stop> => {
     })
   );
   stops.push(startDeadlineScheduler());
+  stops.push(startMaintenanceScheduler());
 
   return async () => {
     await Promise.allSettled(stops.map((stop) => stop()));

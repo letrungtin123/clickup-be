@@ -114,7 +114,16 @@ export const rankForPlacement = async (
       throw new AppError("PLACEMENT_CONFLICT", "Could not place the item. Please retry.", 409);
     }
 
-    return generateKeyBetween(lower, upper);
+    try {
+      return generateKeyBetween(lower, upper);
+    } catch {
+      // A malformed stored rank (e.g. imported data) — renumber the sibling set once and retry.
+      if (attempt === 0) {
+        await rebalance(sql, scope);
+        continue;
+      }
+      throw new AppError("PLACEMENT_CONFLICT", "Could not place the item. Please retry.", 409);
+    }
   }
 
   throw new AppError("PLACEMENT_CONFLICT", "Could not place the item. Please retry.", 409);
