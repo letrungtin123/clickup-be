@@ -42,6 +42,6 @@ export const enqueueDomainEvents = async (tx: QuerySql, events: DomainEventInput
       (event->>'aggregateId')::uuid,
       (event->>'actorUserId')::uuid,
       event->'payload'
-    FROM jsonb_array_elements(${tx.json(events as unknown as postgres.JSONValue)}) AS event
+    FROM jsonb_array_elements(${tx.json(events)}) AS event
   `;
 };

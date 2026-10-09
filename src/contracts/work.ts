@@ -289,7 +289,10 @@ export const TaskQuerySchema = z.object({
   statusIds: csv(Id),
   assigneeIds: csv(z.union([Id, z.literal("me"), z.literal("none")])),
   priorities: csv(TaskPrioritySchema),
-  due: z.enum(["overdue", "today", "week", "none"]).optional(),
+  /** "overdue" and "none" are timezone-independent; date windows (today/this week) come as dueFrom/dueTo from the client. */
+  due: z.enum(["overdue", "none"]).optional(),
+  dueFrom: IsoDate.optional(),
+  dueTo: IsoDate.optional(),
   includeDone: z
     .enum(["true", "false"])
     .default("true")
@@ -423,10 +426,16 @@ export const UploadTicketSchema = z.object({
 });
 export type UploadTicket = z.infer<typeof UploadTicketSchema>;
 
+export const CompleteUploadRequestSchema = z
+  .object({ target: z.enum(["task", "comment"]).default("task") })
+  .strict();
+
 export const AttachmentUrlRequestSchema = z.object({ ids: z.array(Id).min(1).max(100) }).strict();
 export const AttachmentUrlCollectionSchema = z.object({
   items: z.array(z.object({ id: Id, url: z.string().url(), expiresAt: IsoDate }))
 });
+
+export const TaskKeyLookupSchema = z.object({ id: Id, projectId: Id });
 
 // Directory ---------------------------------------------------------------------------------------
 

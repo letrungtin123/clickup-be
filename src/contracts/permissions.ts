@@ -16,6 +16,7 @@ export const Permission = {
   TaskUpdate: "task.update",
   TaskDelete: "task.delete",
   TaskAssign: "task.assign",
+  TaskComment: "task.comment",
 
   StatusView: "status.view",
   StatusCreate: "status.create",
@@ -38,7 +39,10 @@ export const Permission = {
   RoleCreate: "role.create",
   RoleUpdate: "role.update",
   RoleDelete: "role.delete",
-  RoleAssignPermission: "role.assign_permission"
+  RoleAssignPermission: "role.assign_permission",
+
+  MemberView: "member.view",
+  MemberManage: "member.manage"
 } as const;
 
 export const permissionValues = Object.values(Permission);
