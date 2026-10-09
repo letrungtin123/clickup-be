@@ -3,6 +3,7 @@ import { Router, type Request, type Router as ExpressRouter } from "express";
 import {
   ArchiveResponseSchema,
   ChangePasswordRequestSchema,
+  ChangePasswordResponseSchema,
   CreatedMemberResponseSchema,
   CreateOrganizationMemberRequestSchema,
   TemporaryPasswordResponseSchema,
@@ -187,7 +188,7 @@ workspaceRoutes.post("/auth/change-password", async (req, res, next) => {
         clearAuthCookies(res);
       }
     }
-    res.json({ ok: true, reauthenticate });
+    res.json(ChangePasswordResponseSchema.parse({ ok: true, reauthenticate }));
   } catch (error) {
     next(error);
   }

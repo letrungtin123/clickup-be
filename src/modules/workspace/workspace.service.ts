@@ -233,7 +233,7 @@ const assertOrganizationWillKeepSuperadmin = async (
  * Privilege-escalation guard: only superadmins may grant capabilities they do not hold themselves,
  * edit their own role, or assign/modify superadmin memberships.
  */
-export const assertCanGrantPermissions = (context: WorkspaceContext, permissions: PermissionKey[]) => {
+export const assertCanGrantPermissions = (context: WorkspaceContext, permissions: readonly string[]) => {
   if (context.hasFullOrganizationAuthority) {
     return;
   }

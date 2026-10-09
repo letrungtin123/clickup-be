@@ -26,6 +26,7 @@ export type RealtimeRoomRef = z.infer<typeof RealtimeRoomRefSchema>;
 
 export const roomName = (ref: RealtimeRoomRef) => `${ref.type}:${ref.id}`;
 export const userRoom = (userId: string) => `user:${userId}`;
+export const orgRoom = (organizationId: string) => `org:${organizationId}`;
 
 export const TypingInputSchema = z.object({
   channelId: z.string().uuid(),
@@ -62,6 +63,13 @@ export type ProjectStructureEvent = {
   at: string;
 };
 
+/** Sidebar refresh hint: only ids, never names (private projects are only hinted to people who can see them). */
+export type SidebarHintEvent = {
+  projectId: string;
+  kind: "project" | "lists" | "members" | "removed";
+  at: string;
+};
+
 export type ChatTypingEvent = {
   channelId: string;
   threadRootId: string | null;
@@ -75,6 +83,7 @@ export type ServerToClientEvents = {
   "task:changed": (event: TaskChangedEvent) => void;
   "task:timeline": (event: TaskTimelineEvent) => void;
   "project:structure": (event: ProjectStructureEvent) => void;
+  "workspace:sidebar": (event: SidebarHintEvent) => void;
   "chat:message": (event: ChatMessageEvent) => void;
   "chat:message:updated": (event: ChatMessageUpdatedEvent) => void;
   "chat:message:deleted": (event: ChatMessageDeletedEvent) => void;

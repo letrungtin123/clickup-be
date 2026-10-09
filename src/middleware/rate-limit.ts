@@ -68,11 +68,12 @@ export const createApiRateLimit = () =>
     ...redisStore("api")
   });
 
-/** Brute-force guard for credential endpoints, keyed by IP + normalized email. */
+/** Brute-force guard for credential endpoints, keyed by IP + normalized email; only failures count. */
 export const createLoginRateLimit = () =>
   rateLimit({
     windowMs: 15 * 60 * 1000,
     limit: env.LOGIN_RATE_LIMIT_MAX,
+    skipSuccessfulRequests: true,
     standardHeaders: "draft-8",
     legacyHeaders: false,
     keyGenerator: (req) => {

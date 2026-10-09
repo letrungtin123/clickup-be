@@ -98,6 +98,16 @@ export const ProjectSchema = z.object({
   myAccess: ProjectAccessLevelSchema,
   isMember: z.boolean(),
   hasStatusOverride: z.boolean(),
+  /** What the caller may do here (RBAC + project access); UI hints only — the API enforces. */
+  capabilities: z.object({
+    canUpdate: z.boolean(),
+    canArchive: z.boolean(),
+    canManageMembers: z.boolean(),
+    canCreateList: z.boolean(),
+    canManageLists: z.boolean(),
+    canManageStatuses: z.boolean(),
+    canCreateTask: z.boolean()
+  }),
   lists: z.array(ListSchema),
   createdAt: IsoDate,
   updatedAt: IsoDate

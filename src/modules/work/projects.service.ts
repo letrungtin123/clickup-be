@@ -13,7 +13,9 @@ import { getSql } from "../../db/client.js";
 import { AppError } from "../../lib/app-error.js";
 import { nullableText, toIso, type QuerySql } from "../../lib/db-types.js";
 import { rankAtEnd, rankForPlacement } from "../../lib/rank.js";
-import { evictUsersFromRoom, publishToRoom } from "../../realtime/publisher.js";
+import { orgRoom } from "../../contracts/realtime.js";
+import { logger } from "../../lib/logger.js";
+import { evictUsersFromRoom, publishToRoom, publishToRooms, publishToUsers } from "../../realtime/publisher.js";
 import type { AccessContext } from "../access/access-context.js";
 import {
   assertPermission,
@@ -56,6 +58,15 @@ const toProject = (context: AccessContext, row: ProjectRow): Project => {
     myAccess,
     isMember: row.access_level !== null,
     hasStatusOverride: row.has_status_override,
+    capabilities: {
+      canUpdate: myAccess === "manage" && hasPermission(context, Permission.ProjectUpdate),
+      canArchive: myAccess === "manage" && hasPermission(context, Permission.ProjectDelete),
+      canManageMembers: myAccess === "manage" && hasPermission(context, Permission.ProjectManageMembers),
+      canCreateList: myAccess === "manage" && hasPermission(context, Permission.ListCreate),
+      canManageLists: myAccess === "manage" && hasPermission(context, Permission.ListUpdate),
+      canManageStatuses: myAccess === "manage" && hasPermission(context, Permission.ListManageStatus),
+      canCreateTask: myAccess !== "view" && hasPermission(context, Permission.TaskCreate)
+    },
     lists: hasPermission(context, Permission.ListView) ? (row.lists ?? []).map(toList) : [],
     createdAt: toIso(row.created_at),
     updatedAt: toIso(row.updated_at)
@@ -107,6 +118,44 @@ const publishStructure = (projectId: string, kind: "lists" | "statuses" | "membe
     kind,
     at: new Date().toISOString()
   });
+};
+
+/**
+ * Sidebar refresh hint after commit. Public projects (or a visibility change) hint the whole
+ * organization; private projects only their members, superadmins, and explicitly affected users.
+ */
+const publishSidebar = async (
+  context: AccessContext,
+  projectId: string,
+  kind: "project" | "lists" | "members" | "removed",
+  options: { broadcast?: boolean; extraUserIds?: string[] } = {}
+) => {
+  const event = { projectId, kind, at: new Date().toISOString() };
+  try {
+    const sql = getSql();
+    const project = (
+      await sql<{ visibility: "public" | "private" }[]>`
+        SELECT visibility FROM public.projects WHERE id = ${projectId} AND organization_id = ${context.organization.id}
+      `
+    )[0];
+    if (options.broadcast || project?.visibility === "public") {
+      publishToRooms([orgRoom(context.organization.id)], "workspace:sidebar", event);
+      return;
+    }
+    const recipients = await sql<{ user_id: string }[]>`
+      SELECT pm.user_id FROM public.project_memberships pm
+      WHERE pm.organization_id = ${context.organization.id} AND pm.project_id = ${projectId}
+        AND pm.status = 'active' AND pm.deleted_at IS NULL
+      UNION
+      SELECT om.user_id FROM public.organization_memberships om
+      JOIN public.roles r ON r.id = om.role_id AND r.organization_id = om.organization_id AND r.key = 'superadmin'
+      WHERE om.organization_id = ${context.organization.id} AND om.status = 'active' AND om.deleted_at IS NULL
+      LIMIT 5000
+    `;
+    publishToUsers([...recipients.map((row) => row.user_id), ...(options.extraUserIds ?? [])], "workspace:sidebar", event);
+  } catch (error) {
+    logger.warn({ err: error, projectId }, "Sidebar hint failed");
+  }
 };
 
 export const listProjects = async (context: AccessContext) => {
@@ -184,6 +233,7 @@ export const createProject = async (context: AccessContext, input: CreateProject
     return created.id;
   });
 
+  await publishSidebar(context, projectId, "project");
   return await getProject(context, projectId);
 };
 
@@ -225,6 +275,7 @@ export const updateProject = async (
   });
 
   publishStructure(projectId, "project");
+  await publishSidebar(context, projectId, "project", { broadcast: input.visibility !== undefined });
   return await getProject(context, projectId);
 };
 
@@ -238,6 +289,7 @@ export const archiveProject = async (context: AccessContext, projectId: string) 
     WHERE id = ${projectId} AND organization_id = ${context.organization.id} AND archived_at IS NULL AND deleted_at IS NULL
   `;
   publishStructure(projectId, "project");
+  await publishSidebar(context, projectId, "removed");
   return { ok: true as const };
 };
 
@@ -351,6 +403,7 @@ export const upsertProjectMember = async (
   });
 
   publishStructure(projectId, "members");
+  await publishSidebar(context, projectId, "members", { extraUserIds: [input.userId] });
   return member;
 };
 
@@ -384,6 +437,7 @@ export const removeProjectMember = async (context: AccessContext, projectId: str
     evictUsersFromRoom([userId], { type: "project", id: projectId });
   }
   publishStructure(projectId, "members");
+  await publishSidebar(context, projectId, "members", { extraUserIds: [userId] });
   return { ok: true as const };
 };
 
@@ -439,6 +493,7 @@ export const createList = async (
     return row.id;
   });
   publishStructure(projectId, "lists");
+  await publishSidebar(context, projectId, "lists");
   const row = (await selectList(sql, context, listId))[0]!;
   return toList(row);
 };
@@ -472,6 +527,7 @@ export const updateList = async (
     `;
   });
   publishStructure(projectId, "lists");
+  await publishSidebar(context, projectId, "lists");
   return toList((await selectList(sql, context, listId))[0]!);
 };
 
@@ -495,5 +551,6 @@ export const archiveList = async (context: AccessContext, projectId: string, lis
     `;
   });
   publishStructure(projectId, "lists");
+  await publishSidebar(context, projectId, "lists");
   return { ok: true as const };
 };

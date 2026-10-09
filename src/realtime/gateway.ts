@@ -8,6 +8,7 @@ import {
   PresenceQuerySchema,
   RealtimeRoomRefSchema,
   TypingInputSchema,
+  orgRoom,
   roomName,
   userRoom,
   type ClientToServerEvents,
@@ -122,7 +123,7 @@ export const attachRealtimeGateway = (httpServer: HttpServer): GatewayServer => 
   });
 
   io.on("connection", (socket: GatewaySocket) => {
-    void socket.join(userRoom(socket.data.userId));
+    void socket.join([userRoom(socket.data.userId), orgRoom(socket.data.organizationId)]);
     void touchPresence(socket).catch(() => undefined);
 
     // Force re-authentication when the access token expires; the client refreshes and reconnects.
