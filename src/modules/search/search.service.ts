@@ -33,27 +33,38 @@ export const globalSearch = async (context: AccessContext, query: GlobalSearchQu
     if (!groups.has("tasks") || !canSeeProjects || !hasPermission(context, Permission.TaskView)) {
       return [];
     }
-    // Phase 1: rank matching ids on narrow rows; phase 2 enriches only the hits.
+    // Phase 1: search runs exactly once (MATERIALIZED), then visibility filters the matches.
+    // Without the fence the planner may re-run the full-text scan once per visible project.
+    const keyCondition = keyMatch
+      ? sql`(t.number = ${Number(keyMatch[2])} AND t.project_id IN (
+          SELECT kp.id FROM public.projects kp
+          WHERE kp.organization_id = ${context.organization.id} AND upper(kp.key) = ${keyMatch[1]!.toUpperCase()} AND kp.deleted_at IS NULL
+        ))`
+      : sql`FALSE`;
     const hits = await sql<{ id: string }[]>`
-      SELECT t.id
-      FROM public.tasks t
-      JOIN public.projects p ON p.id = t.project_id AND p.organization_id = t.organization_id AND p.deleted_at IS NULL AND p.archived_at IS NULL
-      WHERE t.organization_id = ${context.organization.id}
-        AND t.deleted_at IS NULL AND t.archived_at IS NULL
-        AND EXISTS (
+      WITH matches AS MATERIALIZED (
+        SELECT t.id, t.project_id, t.list_id, t.completed_at, t.updated_at,
+          ${keyCondition} AS is_key,
+          ${tsQuery ? sql`ts_rank(t.search_vector, to_tsquery('simple', ${tsQuery}))` : sql`0::real`} AS score
+        FROM public.tasks t
+        WHERE t.organization_id = ${context.organization.id}
+          AND t.deleted_at IS NULL AND t.archived_at IS NULL
+          AND (
+            ${keyCondition}
+            OR ${tsQuery ? sql`t.search_vector @@ to_tsquery('simple', ${tsQuery})` : sql`FALSE`}
+            OR public.immutable_unaccent(lower(t.title)) LIKE public.immutable_unaccent(${like})
+          )
+      )
+      SELECT m.id
+      FROM matches m
+      JOIN public.projects p ON p.id = m.project_id AND p.organization_id = ${context.organization.id}
+        AND p.deleted_at IS NULL AND p.archived_at IS NULL
+      WHERE EXISTS (
           SELECT 1 FROM public.lists l
-          WHERE l.id = t.list_id AND l.organization_id = t.organization_id AND l.deleted_at IS NULL AND l.archived_at IS NULL
+          WHERE l.id = m.list_id AND l.organization_id = p.organization_id AND l.deleted_at IS NULL AND l.archived_at IS NULL
         )
         AND ${visibleProjectsPredicate(sql, context)}
-        AND (
-          ${keyMatch ? sql`(upper(p.key) = ${keyMatch[1]!.toUpperCase()} AND t.number = ${Number(keyMatch[2])})` : sql`FALSE`}
-          OR ${tsQuery ? sql`t.search_vector @@ to_tsquery('simple', ${tsQuery})` : sql`FALSE`}
-          OR public.immutable_unaccent(lower(t.title)) LIKE public.immutable_unaccent(${like})
-        )
-      ORDER BY
-        ${keyMatch ? sql`(upper(p.key) = ${keyMatch[1]!.toUpperCase()} AND t.number = ${Number(keyMatch[2])}) DESC,` : sql``}
-        ${tsQuery ? sql`ts_rank(t.search_vector, to_tsquery('simple', ${tsQuery})) DESC,` : sql``}
-        (t.completed_at IS NULL) DESC, t.updated_at DESC, t.id
+      ORDER BY m.is_key DESC, m.score DESC, (m.completed_at IS NULL) DESC, m.updated_at DESC, m.id
       LIMIT ${limit}
     `;
     if (hits.length === 0) {
