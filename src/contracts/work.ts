@@ -255,7 +255,9 @@ export const AttachmentSchema = z.object({
   sizeBytes: z.number().int(),
   isImage: z.boolean(),
   uploadedBy: UserRefSchema.nullable(),
-  createdAt: IsoDate
+  createdAt: IsoDate,
+  /** Uploader with submit access, or a project manager (mirrors DELETE /attachments/:id). */
+  canDelete: z.boolean()
 });
 export type Attachment = z.infer<typeof AttachmentSchema>;
 
@@ -429,9 +431,15 @@ export const CreateUploadRequestSchema = z
   .strict();
 export type CreateUploadRequest = z.infer<typeof CreateUploadRequestSchema>;
 
+/** Signed storage URL: absolute, or a same-origin /storage/v1/ path proxied by the web server. */
+export const SignedStorageUrlSchema = z
+  .string()
+  .max(4000)
+  .refine((value) => value.startsWith("https://") || value.startsWith("http://") || value.startsWith("/storage/v1/"), "Invalid storage URL.");
+
 export const UploadTicketSchema = z.object({
   attachmentId: Id,
-  uploadUrl: z.string().url(),
+  uploadUrl: SignedStorageUrlSchema,
   expiresAt: IsoDate
 });
 export type UploadTicket = z.infer<typeof UploadTicketSchema>;
@@ -442,7 +450,7 @@ export const CompleteUploadRequestSchema = z
 
 export const AttachmentUrlRequestSchema = z.object({ ids: z.array(Id).min(1).max(100) }).strict();
 export const AttachmentUrlCollectionSchema = z.object({
-  items: z.array(z.object({ id: Id, url: z.string().url(), expiresAt: IsoDate }))
+  items: z.array(z.object({ id: Id, url: SignedStorageUrlSchema, expiresAt: IsoDate }))
 });
 
 export const TaskKeyLookupSchema = z.object({ id: Id, projectId: Id });

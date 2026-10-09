@@ -16,6 +16,11 @@ const EnvSchema = z
       .default("false")
       .transform((value) => value === "true"),
     SUPABASE_URL: z.string().url().default("http://127.0.0.1:56321"),
+    /**
+     * Origin browsers use for signed storage URLs. Unset: URLs are same-origin paths (/storage/v1/...)
+     * that the web server proxies to storage, so any LAN/host name of the web app works.
+     */
+    STORAGE_PUBLIC_URL: z.string().url().optional(),
     SUPABASE_ANON_KEY: z.string().min(1).optional(),
     SUPABASE_JWT_SECRET: z.string().min(32).optional(),
     SUPABASE_JWT_ISSUER: z.string().url().optional(),

@@ -80,3 +80,7 @@ export const bumpAuthz = () => {
     throw new Error("bumpAuthz failed");
   }
 };
+
+/** Signed storage URLs may be same-origin paths; resolve them against the web app (Vite proxies /storage/v1). */
+export const webAppOrigin = process.env.E2E_APP_ORIGIN ?? "http://127.0.0.1:5276";
+export const storageFetch = (url, init) => fetch(new URL(url, webAppOrigin), init);

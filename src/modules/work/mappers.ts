@@ -11,6 +11,7 @@ import type {
 } from "../../contracts/work.js";
 import { colorTokens } from "../../contracts/work.js";
 import { toIso, toNullableIso } from "../../lib/db-types.js";
+import { projectLevelAtLeast } from "../access/resource-access.js";
 
 const colorSet = new Set<string>(colorTokens);
 export const toColor = (value: string | null | undefined, fallback: ColorToken = "slate"): ColorToken =>
@@ -132,7 +133,17 @@ export type AttachmentRow = {
   created_at: Date;
 };
 
-export const toAttachment = (row: AttachmentRow, isImage: (mime: string) => boolean): Attachment => ({
+/** Who may delete a task attachment, given the caller's project access level. */
+export const attachmentDeleteRule =
+  (userId: string, level: ProjectAccessLevel) =>
+  (row: AttachmentRow): boolean =>
+    projectLevelAtLeast(level, "manage") || (row.uploaded_by?.id === userId && projectLevelAtLeast(level, "submit"));
+
+export const toAttachment = (
+  row: AttachmentRow,
+  isImage: (mime: string) => boolean,
+  canDelete: (row: AttachmentRow) => boolean = () => false
+): Attachment => ({
   id: row.id,
   taskId: row.task_id,
   commentId: row.comment_id,
@@ -141,7 +152,8 @@ export const toAttachment = (row: AttachmentRow, isImage: (mime: string) => bool
   sizeBytes: Number(row.size_bytes),
   isImage: isImage(row.mime_type),
   uploadedBy: toUserRef(row.uploaded_by),
-  createdAt: toIso(row.created_at)
+  createdAt: toIso(row.created_at),
+  canDelete: canDelete(row)
 });
 
 export type ActivityRow = {

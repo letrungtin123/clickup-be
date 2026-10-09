@@ -1,4 +1,4 @@
-import { session } from "./lib.mjs";
+import { session, storageFetch } from "./lib.mjs";
 const ok = (label, cond, extra = "") => console.log(`${cond ? "PASS" : "FAIL"}  ${label} ${extra}`);
 const para = (...content) => ({ type: "doc", content: [{ type: "paragraph", content }] });
 const text = (value, marks) => (marks ? { type: "text", text: value, marks } : { type: "text", text: value });
@@ -108,18 +108,28 @@ ok("tasks back on inherited statuses", r.body.status.name === "To do", r.body.st
 r = await mgr.call("POST", `/tasks/${t1.id}/attachments`, { fileName: "spec v1 (final).txt", mimeType: "text/plain", sizeBytes: 11 });
 ok("upload ticket", r.status === 201, r.body?.error?.code ?? "");
 if (r.status === 201) {
-  const put = await fetch(r.body.uploadUrl, { method: "PUT", headers: { "content-type": "text/plain" }, body: "hello world" });
+  const put = await storageFetch(r.body.uploadUrl, { method: "PUT", headers: { "content-type": "text/plain" }, body: "hello world" });
   ok("direct PUT to storage", put.ok, `${put.status} ${put.ok ? "" : await put.text()}`);
   const completed = await mgr.call("POST", `/attachments/${r.body.attachmentId}/complete`, { target: "task" });
   ok("complete upload", completed.status === 200 && completed.body.sizeBytes === 11, JSON.stringify(completed.body?.error ?? ""));
   const urls = await mgr.call("POST", `/attachments/urls`, { ids: [r.body.attachmentId] });
-  const dl = urls.body.items?.[0] ? await fetch(urls.body.items[0].url) : null;
+  const dl = urls.body.items?.[0] ? await storageFetch(urls.body.items[0].url) : null;
   ok("signed download", Boolean(dl?.ok) && (await dl.text()) === "hello world", dl?.headers.get("content-disposition") ?? "");
   const viewer = await b.call("POST", `/attachments/urls`, { ids: [r.body.attachmentId] });
   ok("view member can download", viewer.body.items?.length === 1);
   const outsider = await (await session("MEMBER_C")).call("POST", `/attachments/urls`, { ids: [r.body.attachmentId] });
   ok("outsider gets no url", outsider.body.items?.length === 0);
+  const canDeleteFor = async (who) =>
+    (await who.call("GET", `/tasks/${t1.id}`)).body.attachments?.find((item) => item.id === r.body.attachmentId)?.canDelete;
+  ok("canDelete: uploader/manager yes, viewer no", (await canDeleteFor(mgr)) === true && (await canDeleteFor(b)) === false);
 }
+r = await mgr.call("GET", `/tasks/${t1.id}/timeline?limit=50`);
+const assigned = r.body.items?.find((item) => item.kind === "activity" && item.activity.action === "TASK_ASSIGNEE_ADDED" && item.activity.newValue?.userId === ctxA.user.id);
+ok("assignee activity names the user", assigned?.activity.newValue?.userId === ctxA.user.id && typeof assigned.activity.newValue.user?.displayName === "string", JSON.stringify(assigned?.activity.newValue ?? r.body.items?.map((item) => item.activity?.action ?? item.kind)));
+r = await a.call("GET", "/notifications?types=task.assigned");
+ok("notifications filtered by type", r.status === 200 && r.body.items.every((item) => item.type === "task.assigned"), `${r.body.items?.length}`);
+r = await a.call("GET", "/notifications?types=nope.nope");
+ok("unknown notification type rejected (400)", r.status === 400);
 r = await mgr.call("POST", `/tasks/${t1.id}/attachments`, { fileName: "x.html", mimeType: "text/html", sizeBytes: 10 });
 ok("html blocked", r.status === 400);
 r = await a.call("GET", `/directory/users?projectId=${proj.id}&q=an`);

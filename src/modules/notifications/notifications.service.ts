@@ -65,7 +65,7 @@ export const countUnread = async (sql: QuerySql, organizationId: string, userId:
 
 export const listNotifications = async (
   context: AccessContext,
-  input: { filter: "all" | "unread"; cursor?: string | undefined; limit: number }
+  input: { filter: "all" | "unread"; types?: string[] | undefined; cursor?: string | undefined; limit: number }
 ): Promise<NotificationPage> => {
   const sql = getSql();
   const cursor = decodeCursor(input.cursor, 2);
@@ -79,6 +79,7 @@ export const listNotifications = async (
       AND n.recipient_user_id = ${context.user.id}
       AND n.archived_at IS NULL
       AND (${input.filter} = 'all' OR n.read_at IS NULL)
+      AND (${input.types ?? null}::text[] IS NULL OR n.type = ANY(${input.types ?? null}::text[]))
       AND (${cursor ? String(cursor[0]) : null}::timestamptz IS NULL
         OR (n.created_at, n.id) < (${cursor ? String(cursor[0]) : null}::timestamptz, ${cursor ? String(cursor[1]) : null}::uuid))
     ORDER BY n.created_at DESC, n.id DESC

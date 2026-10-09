@@ -87,7 +87,7 @@ export const completeTaskUpload = async (context: AccessContext, attachmentId: s
   const sql = getSql();
   await authorizeTask(sql, context, row.task_id, "submit");
   if (row.status === "ready") {
-    return toAttachment(row, (mime) => inlineImageTypes.has(mime));
+    return toAttachment(row, (mime) => inlineImageTypes.has(mime), () => true);
   }
 
   const info = await getObjectInfo(row.storage_path);
@@ -129,7 +129,7 @@ export const completeTaskUpload = async (context: AccessContext, attachmentId: s
       at: new Date().toISOString()
     });
   }
-  return toAttachment({ ...row, size_bytes: info.size }, (mime) => inlineImageTypes.has(mime));
+  return toAttachment({ ...row, size_bytes: info.size }, (mime) => inlineImageTypes.has(mime), () => true);
 };
 
 /** Short-lived signed URLs; every id is authorized through its task's project. */

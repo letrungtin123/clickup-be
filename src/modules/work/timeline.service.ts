@@ -1,6 +1,6 @@
 import { Permission } from "../../contracts/permissions.js";
 import { commentLimits, RichTextError, sanitizeRichText, type RichTextDoc } from "../../contracts/rich-text.js";
-import type { Comment, CreateCommentRequest, TimelineItem, TimelinePage } from "../../contracts/work.js";
+import type { Comment, CreateCommentRequest, ProjectAccessLevel, TimelineItem, TimelinePage } from "../../contracts/work.js";
 import { getSql } from "../../db/client.js";
 import { AppError } from "../../lib/app-error.js";
 import { decodeCursor, encodeCursor, toIso, type QuerySql } from "../../lib/db-types.js";
@@ -10,7 +10,7 @@ import { publishToRoom } from "../../realtime/publisher.js";
 import type { AccessContext } from "../access/access-context.js";
 import { assertPermission, projectLevelAtLeast } from "../access/resource-access.js";
 import { enqueueDomainEvents, type DomainEventInput } from "../events/outbox.js";
-import { toActivity, toAttachment, toUserRef, type ActivityRow, type AttachmentRow, type UserRefJson } from "./mappers.js";
+import { attachmentDeleteRule, toActivity, toAttachment, toUserRef, type ActivityRow, type AttachmentRow, type UserRefJson } from "./mappers.js";
 import { authorizeTask, mentionEvent } from "./tasks.service.js";
 import { userJsonSql } from "./tasks.repo.js";
 
@@ -29,7 +29,7 @@ type CommentRow = {
   edited_at: Date | null;
 };
 
-const toComment = (row: CommentRow, context: AccessContext): Comment => ({
+const toComment = (row: CommentRow, context: AccessContext, level: ProjectAccessLevel): Comment => ({
   id: row.id,
   taskId: row.task_id,
   parentCommentId: row.parent_comment_id,
@@ -39,7 +39,11 @@ const toComment = (row: CommentRow, context: AccessContext): Comment => ({
   mentionedUserIds: row.mentioned_user_ids,
   replyCount: Number(row.reply_count),
   attachments: (row.attachments ?? []).map((attachment) =>
-    toAttachment({ ...attachment, created_at: new Date(attachment.created_at) }, (mime) => inlineImageTypes.has(mime))
+    toAttachment(
+      { ...attachment, created_at: new Date(attachment.created_at) },
+      (mime) => inlineImageTypes.has(mime),
+      attachmentDeleteRule(context.user.id, level)
+    )
   ),
   createdAt: toIso(row.created_at),
   editedAt: row.edited_at ? toIso(row.edited_at) : null,
@@ -89,7 +93,7 @@ export const getTimeline = async (
   input: { cursor?: string | undefined; limit: number }
 ): Promise<TimelinePage> => {
   const sql = getSql();
-  await authorizeTask(sql, context, taskId, "view");
+  const { access } = await authorizeTask(sql, context, taskId, "view");
   const cursor = decodeCursor(input.cursor, 2);
   if (input.cursor && !cursor) {
     throw new AppError("INVALID_CURSOR", "The pagination cursor is invalid.", 400);
@@ -110,7 +114,13 @@ export const getTimeline = async (
       LIMIT ${limit + 1}
     `,
     sql<ActivityRow[]>`
-      SELECT e.id, e.task_id, e.action, e.previous_value, e.new_value, e.created_at,
+      SELECT e.id, e.task_id, e.action, e.previous_value, e.created_at,
+        -- Assignment events target a user: expose who, so the UI can name them.
+        CASE WHEN e.target_type = 'user' AND coalesce(e.new_value, 'null'::jsonb) = 'null'::jsonb
+          THEN jsonb_build_object('userId', e.target_id,
+            'user', (SELECT jsonb_build_object('id', tu.id, 'displayName', tu.display_name, 'avatarUrl', tu.avatar_url)
+                     FROM public.app_users tu WHERE tu.id = e.target_id))
+          ELSE e.new_value END AS new_value,
         (SELECT ${userJsonSql(sql)} FROM public.app_users au WHERE au.id = e.actor_user_id) AS actor
       FROM public.task_activity_events e
       CROSS JOIN LATERAL (SELECT e.created_at, e.id) x
@@ -122,7 +132,7 @@ export const getTimeline = async (
   ]);
 
   const merged: { at: Date; id: string; item: TimelineItem }[] = [
-    ...comments.map((row) => ({ at: row.created_at, id: row.id, item: { kind: "comment" as const, comment: toComment(row, context) } })),
+    ...comments.map((row) => ({ at: row.created_at, id: row.id, item: { kind: "comment" as const, comment: toComment(row, context, access.level) } })),
     ...activity.map((row) => ({ at: row.created_at, id: row.id, item: { kind: "activity" as const, activity: toActivity(row) } }))
   ].sort((a, b) => b.at.getTime() - a.at.getTime() || (a.id < b.id ? 1 : a.id > b.id ? -1 : 0));
 
@@ -137,7 +147,7 @@ export const getTimeline = async (
 
 export const listReplies = async (context: AccessContext, taskId: string, commentId: string) => {
   const sql = getSql();
-  await authorizeTask(sql, context, taskId, "view");
+  const { access } = await authorizeTask(sql, context, taskId, "view");
   const rows = await sql<CommentRow[]>`
     SELECT ${commentSelect(sql)}
     FROM public.task_comments c
@@ -146,7 +156,7 @@ export const listReplies = async (context: AccessContext, taskId: string, commen
     ORDER BY c.created_at, c.id
     LIMIT 200
   `;
-  return { items: rows.map((row) => toComment(row, context)), pageInfo: { hasMore: rows.length === 200, nextCursor: null } };
+  return { items: rows.map((row) => toComment(row, context, access.level)), pageInfo: { hasMore: rows.length === 200, nextCursor: null } };
 };
 
 const loadComment = async (sql: QuerySql, context: AccessContext, taskId: string, commentId: string) => {
@@ -173,7 +183,7 @@ export const createComment = async (context: AccessContext, taskId: string, inpu
   const sql = getSql();
 
   const result = await sql.begin(async (tx) => {
-    const { task } = await authorizeTask(tx, context, taskId, "submit");
+    const { task, access } = await authorizeTask(tx, context, taskId, "submit");
     let parentAuthorId: string | null = null;
     if (input.parentCommentId) {
       const parent = await loadComment(tx, context, taskId, input.parentCommentId);
@@ -237,7 +247,7 @@ export const createComment = async (context: AccessContext, taskId: string, inpu
       projectId: task.project_id,
       listId: task.list_id,
       parentTaskId: task.parent_task_id,
-      comment: toComment(await loadComment(tx, context, taskId, created.id), context)
+      comment: toComment(await loadComment(tx, context, taskId, created.id), context, access.level)
     };
   });
 
@@ -260,7 +270,7 @@ export const updateComment = async (context: AccessContext, taskId: string, comm
   const sql = getSql();
   const result = await sql.begin(async (tx) => {
     // Editing can add mentions (notifications): same bar as commenting.
-    const { task } = await authorizeTask(tx, context, taskId, "submit");
+    const { task, access } = await authorizeTask(tx, context, taskId, "submit");
     const comment = await loadComment(tx, context, taskId, commentId);
     if (comment.author_user_id !== context.user.id) {
       throw new AppError("FORBIDDEN", "Only the author can edit this comment.", 403);
@@ -280,7 +290,7 @@ export const updateComment = async (context: AccessContext, taskId: string, comm
       mention.payload.userIds = newlyMentioned;
       await enqueueDomainEvents(tx, [mention]);
     }
-    return { projectId: task.project_id, comment: toComment(await loadComment(tx, context, taskId, commentId), context) };
+    return { projectId: task.project_id, comment: toComment(await loadComment(tx, context, taskId, commentId), context, access.level) };
   });
   publishTimeline(result.projectId, taskId, context.user.id);
   return result.comment;

@@ -9,6 +9,15 @@ import { logger } from "./logger.js";
 
 const storageUrl = (path: string) => new URL(`/storage/v1${path}`, env.SUPABASE_URL).toString();
 
+/** URL handed to browsers: absolute when STORAGE_PUBLIC_URL is set, otherwise a same-origin path. */
+const browserUrl = (path: string, query?: Record<string, string>) => {
+  const url = new URL(`/storage/v1${path}`, env.STORAGE_PUBLIC_URL ?? "http://same-origin.invalid");
+  for (const [key, value] of Object.entries(query ?? {})) {
+    url.searchParams.set(key, value);
+  }
+  return env.STORAGE_PUBLIC_URL ? url.toString() : `${url.pathname}${url.search}`;
+};
+
 const serviceHeaders = () => {
   if (!env.SUPABASE_SERVICE_ROLE_KEY) {
     throw new AppError("STORAGE_NOT_CONFIGURED", "File storage is not configured.", 503);
@@ -104,7 +113,7 @@ export const createSignedUploadUrl = async (objectPath: string) => {
   if (!body.url) {
     throw new AppError("STORAGE_ERROR", "File storage did not return an upload URL.", 502);
   }
-  return new URL(`/storage/v1${body.url}`, env.SUPABASE_URL).toString();
+  return browserUrl(body.url);
 };
 
 export const getObjectInfo = async (objectPath: string) => {
@@ -136,11 +145,7 @@ export const createSignedDownloadUrl = async (objectPath: string, options: { exp
   if (!body.signedURL) {
     throw new AppError("STORAGE_ERROR", "File storage did not return a download URL.", 502);
   }
-  const url = new URL(`/storage/v1${body.signedURL}`, env.SUPABASE_URL);
-  if (options.downloadName) {
-    url.searchParams.set("download", options.downloadName);
-  }
-  return url.toString();
+  return browserUrl(body.signedURL, options.downloadName ? { download: options.downloadName } : undefined);
 };
 
 export const removeObjects = async (objectPaths: string[]) => {

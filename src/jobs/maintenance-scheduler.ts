@@ -10,6 +10,8 @@ const batchSize = 500;
  * - abandoned uploads: task attachments never completed, chat files never sent (> 24h)
  * - published outbox rows older than 7 days
  * - read or archived notifications older than 180 days
+ * - planner statistics for tables never analyzed (small lookup tables stay below the autovacuum
+ *   threshold forever, and default estimates on them produced 1M-row join plans)
  */
 export const runMaintenance = async () => {
   // Transaction-scoped lock: safe with pooled connections (released on commit).
@@ -65,11 +67,28 @@ export const runMaintenance = async () => {
   if (result.paths.length > 0) {
     await removeObjects(result.paths).catch((error: unknown) => logger.warn({ err: error }, "Storage cleanup of abandoned uploads failed"));
   }
+  await analyzeUnanalyzedTables().catch((error: unknown) => logger.warn({ err: error }, "Statistics refresh failed"));
   if (result.paths.length + result.outboxRows + result.notifications > 0) {
     logger.info(
       { abandonedUploads: result.paths.length, outboxRows: result.outboxRows, notifications: result.notifications },
       "Maintenance cleanup"
     );
+  }
+};
+
+const analyzeUnanalyzedTables = async () => {
+  const sql = getSql();
+  const tables = await sql<{ schema: string; name: string }[]>`
+    SELECT schemaname AS schema, relname AS name FROM pg_stat_user_tables
+    WHERE schemaname IN ('public', 'production') AND n_live_tup > 0
+      AND last_analyze IS NULL AND last_autoanalyze IS NULL
+    LIMIT 50
+  `;
+  for (const table of tables) {
+    await sql`ANALYZE ${sql(table.schema)}.${sql(table.name)}`;
+  }
+  if (tables.length > 0) {
+    logger.info({ tables: tables.map((table) => `${table.schema}.${table.name}`) }, "Analyzed tables without statistics");
   }
 };
 

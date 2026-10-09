@@ -22,7 +22,7 @@ import {
   type ProjectAccess
 } from "../access/resource-access.js";
 import { enqueueDomainEvents, type DomainEventInput } from "../events/outbox.js";
-import { toAttachment, toColor, toTaskSummary, toUserRef, type AttachmentRow, type TaskRow, type UserRefJson } from "./mappers.js";
+import { attachmentDeleteRule, toAttachment, toColor, toTaskSummary, toUserRef, type AttachmentRow, type TaskRow, type UserRefJson } from "./mappers.js";
 import { assertListInProject } from "./projects.service.js";
 import { loadEffectiveWorkflow } from "./statuses.service.js";
 import {
@@ -252,7 +252,9 @@ export const getTaskDetail = async (context: AccessContext, taskId: string, sql:
     list: { id: row.list_id, name: row.list_name },
     ancestors: ancestors.map((ancestor) => ({ id: ancestor.id, key: `${row.project_key}-${ancestor.number}`, title: ancestor.title })),
     subtasks: subtasks.map(toTaskSummary),
-    attachments: attachments.map((attachment) => toAttachment(attachment, (mime) => inlineImageTypes.has(mime))),
+    attachments: attachments.map((attachment) =>
+      toAttachment(attachment, (mime) => inlineImageTypes.has(mime), attachmentDeleteRule(context.user.id, access.level))
+    ),
     capabilities: {
       canEdit: canSubmit && hasPermission(context, Permission.TaskUpdate),
       canAssign: canSubmit && hasPermission(context, Permission.TaskAssign),

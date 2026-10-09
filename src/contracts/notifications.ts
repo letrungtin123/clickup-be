@@ -56,6 +56,13 @@ export type NotificationPage = z.infer<typeof NotificationPageSchema>;
 
 export const NotificationQuerySchema = z.object({
   filter: z.enum(["all", "unread"]).default("all"),
+  /** Comma-separated notification types (e.g. the "Nhắc đến" tab); omitted = every type. */
+  types: z
+    .string()
+    .max(500)
+    .optional()
+    .transform((value) => (value ? [...new Set(value.split(",").map((item) => item.trim()).filter(Boolean))] : undefined))
+    .pipe(z.array(NotificationTypeSchema).max(20).optional()),
   cursor: z.string().max(500).optional(),
   limit: z.coerce.number().int().min(1).max(100).default(30)
 });

@@ -1,7 +1,7 @@
 // Live smoke test for the chat backend. Run with cwd = D:\Clickup-System\BE.
 import { randomUUID } from "node:crypto";
 import { createRequire } from "node:module";
-import { apiOrigin, session } from "./lib.mjs";
+import { apiOrigin, session, storageFetch } from "./lib.mjs";
 
 const require = createRequire("D:/Clickup-System/BE/package.json");
 const { io } = require("socket.io-client");
@@ -355,7 +355,7 @@ if (r.status === 201) {
   check("upload ticket", typeof ticket.uploadUrl === "string" && ticket.attachmentId, ticket);
   let c2 = await A.call("POST", `/chat-attachments/${ticket.attachmentId}/complete`);
   check("complete before upload 409", c2.status === 409, c2);
-  const put = await fetch(ticket.uploadUrl, { method: "PUT", headers: { "content-type": "text/plain" }, body: "hello world" });
+  const put = await storageFetch(ticket.uploadUrl, { method: "PUT", headers: { "content-type": "text/plain" }, body: "hello world" });
   check("browser PUT to signed URL", put.ok, put.status);
   c2 = await B.call("POST", `/chat-attachments/${ticket.attachmentId}/complete`);
   check("only uploader completes", c2.status === 404, c2.status);

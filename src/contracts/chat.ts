@@ -2,7 +2,7 @@ import { z } from "zod";
 
 import { createCursorPageSchema, PageInfoSchema } from "./pagination.js";
 import { RichTextDocSchema } from "./rich-text.js";
-import { UserRefSchema } from "./work.js";
+import { SignedStorageUrlSchema, UserRefSchema } from "./work.js";
 
 /**
  * Chat contract (PD-001 / PD-002): public & private channels, 1:1 and group DMs, messages, threads,
@@ -396,7 +396,7 @@ export type ChatUploadRequest = z.infer<typeof ChatUploadRequestSchema>;
 /** Browser PUTs the file body to `uploadUrl`, then calls POST /chat-attachments/:id/complete. */
 export const ChatUploadTicketSchema = z.object({
   attachmentId: Id,
-  uploadUrl: z.string().url(),
+  uploadUrl: SignedStorageUrlSchema,
   expiresAt: IsoDate
 });
 export type ChatUploadTicket = z.infer<typeof ChatUploadTicketSchema>;
@@ -404,7 +404,7 @@ export type ChatUploadTicket = z.infer<typeof ChatUploadTicketSchema>;
 export const ChatAttachmentUrlRequestSchema = z.object({ ids: z.array(Id).min(1).max(50) }).strict();
 /** Unauthorized or unknown ids are silently omitted. */
 export const ChatAttachmentUrlCollectionSchema = z.object({
-  items: z.array(z.object({ id: Id, url: z.string().url(), expiresAt: IsoDate }))
+  items: z.array(z.object({ id: Id, url: SignedStorageUrlSchema, expiresAt: IsoDate }))
 });
 export type ChatAttachmentUrlCollection = z.infer<typeof ChatAttachmentUrlCollectionSchema>;
 
