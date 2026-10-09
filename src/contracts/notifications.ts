@@ -100,3 +100,5 @@ export const UnreadCountSchema = z.object({ unreadCount: z.number().int() });
 export type NotificationNewEvent = { notification: Notification; unreadCount: number };
 /** `notification:read` → room user:<id> (multi-device sync). */
 export type NotificationReadEvent = { ids: string[] | "all"; unreadCount: number };
+/** `notification:archived` → room user:<id> (other tabs/devices drop the archived entries, BUG-WK-48). */
+export type NotificationArchivedEvent = { ids: string[]; unreadCount: number };

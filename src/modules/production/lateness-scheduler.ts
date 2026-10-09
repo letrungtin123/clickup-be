@@ -1,19 +1,20 @@
 import { getSql } from "../../db/client.js";
 import { logger } from "../../lib/logger.js";
 import { notifyDeadline } from "./notifications.js";
-import { findDueSoonTasks, markLateTasks } from "./tasks.service.js";
+import { markDueSoonTasks, markLateTasks } from "./tasks.service.js";
 
 const intervalMs = 15 * 60 * 1000;
 
 /**
  * SPEC Phase 2 §2 + PLAN §8: every 15 minutes, open production tasks past their deadline are flagged
  * late, and the worker + job leader are told once per task and deadline (late, and "còn N giờ").
- * One worker instance at a time (transaction-scoped advisory lock); notifications are deduplicated.
+ * One worker instance at a time (transaction-scoped advisory lock); the tasks are marked notified in the
+ * same short transaction and the notifications are written after it commits (deduplicated as well).
  */
 export const runLatenessScan = async () => {
   const scan = await getSql().begin(async (sql) => {
     const locked = await sql<{ locked: boolean }[]>`SELECT pg_try_advisory_xact_lock(hashtextextended('production:lateness', 0)) AS locked`;
-    return locked[0]?.locked ? { late: await markLateTasks(sql), dueSoon: await findDueSoonTasks(sql) } : null;
+    return locked[0]?.locked ? { late: await markLateTasks(sql), dueSoon: await markDueSoonTasks(sql) } : null;
   });
   if (!scan) {
     return;
@@ -21,7 +22,7 @@ export const runLatenessScan = async () => {
   await notifyDeadline("production.task_late", scan.late);
   await notifyDeadline("production.task_due_soon", scan.dueSoon);
   if (scan.late.length > 0) {
-    logger.info({ marked: scan.late.length }, "Production tasks flagged late");
+    logger.info({ notified: scan.late.length }, "Production tasks notified late");
   }
 };
 

@@ -11,14 +11,21 @@ export const maxTargetPoints = 1_000_000;
 
 /**
  * Target points from a sheet cell: "2600", "2.600" / "2,600" (thousands separators), "2472,5"
- * (decimal comma). At most 2 decimals, 0 … 1 000 000. Null when invalid.
+ * (decimal comma), "2.472,5" (Vietnamese: dot thousands, comma decimals — PR-25) and "2,472.5" (English).
+ * At most 2 decimals, 0 … 1 000 000. Null when invalid.
  */
 export const parseTargetNumber = (text: string): number | null => {
   const compact = text.trim().replace(/[\s_]/g, "");
   if (compact === "") {
     return null;
   }
-  const normalized = /^\d{1,3}([.,]\d{3})+$/.test(compact) ? compact.replace(/[.,]/g, "") : compact.replace(",", ".");
+  const normalized = /^\d{1,3}([.,]\d{3})+$/.test(compact)
+    ? compact.replace(/[.,]/g, "")
+    : /^\d{1,3}(\.\d{3})+,\d+$/.test(compact)
+      ? compact.replace(/\./g, "").replace(",", ".")
+      : /^\d{1,3}(,\d{3})+\.\d+$/.test(compact)
+        ? compact.replace(/,/g, "")
+        : compact.replace(",", ".");
   if (!/^\d+(\.\d{1,2})?$/.test(normalized)) {
     return null;
   }

@@ -7,6 +7,7 @@ import type {
   EditableMembershipStatus,
   ManagedRole,
   OrganizationMemberCollection,
+  OrganizationMemberQuery,
   PermissionCollection,
   Role,
   RoleCollection,
@@ -17,6 +18,7 @@ import type {
 } from "../../contracts/schemas.js";
 import { getSql } from "../../db/client.js";
 import { AppError } from "../../lib/app-error.js";
+import { decodeCursor, encodeCursor, escapeLike, invalidCursor, isUuid } from "../../lib/db-types.js";
 
 type QuerySql = postgres.Sql | postgres.TransactionSql;
 
@@ -253,6 +255,54 @@ export const assertCanAssignRole = async (sql: QuerySql, context: WorkspaceConte
   return role;
 };
 
+/**
+ * Account takeover guard for the production module (BUG-WK-03): resetting a password, disabling or re-roling an
+ * account is only allowed when the caller's production roles cover the target's. A production ADMIN target can
+ * only be handled by a production ADMIN or an organization superadmin (implicitly ADMIN, PD-011).
+ * Production roles are read from the database directly (the production module stays independent).
+ */
+export const assertProductionRolesCovered = async (sql: QuerySql, context: WorkspaceContext, targetUserId: string) => {
+  const callerRoles = new Set(context.productionRoles);
+  if (context.hasFullOrganizationAuthority || callerRoles.has("ADMIN")) {
+    return;
+  }
+  let targetRoles: string[];
+  try {
+    targetRoles = (
+      await sql<{ role_code: string }[]>`
+        SELECT role_code FROM production.user_roles
+        WHERE organization_id = ${context.organization.id} AND user_id = ${targetUserId}
+      `
+    ).map((row) => row.role_code);
+  } catch (error) {
+    // Production module not installed: nothing to protect.
+    if (typeof error === "object" && error !== null && "code" in error && error.code === "42P01") {
+      return;
+    }
+    throw error;
+  }
+  if (targetRoles.some((role) => !callerRoles.has(role))) {
+    throw new AppError(
+      "PRODUCTION_ROLE_ESCALATION",
+      targetRoles.includes("ADMIN")
+        ? "Chỉ Quản trị sản xuất hoặc superadmin mới thao tác được trên tài khoản Quản trị sản xuất."
+        : "Bạn không thể thao tác trên tài khoản có vai trò sản xuất mà bạn không có.",
+      403
+    );
+  }
+};
+
+/** Role edits and deletions need every capability of the role (and never the caller's own role, WK-40). */
+const assertCanManageRole = (context: WorkspaceContext, role: ManagedRole) => {
+  if (context.hasFullOrganizationAuthority) {
+    return;
+  }
+  if (role.id === context.role.id) {
+    throw new AppError("PERMISSION_ESCALATION", "Bạn không thể sửa hoặc xoá vai trò của chính mình.", 403);
+  }
+  assertCanGrantPermissions(context, role.permissions);
+};
+
 export const getWorkspaceContext = async (userId: string): Promise<WorkspaceContext> => {
   const sql = getSql();
   const rows = await sql<WorkspaceContextRow[]>`
@@ -445,6 +495,7 @@ export const updateRole = async (
   const sql = getSql();
   const current = await getManagedRoleById(sql, context, roleId);
   assertManagedRoleEditable(current);
+  assertCanManageRole(context, current);
 
   const hasName = input.name !== undefined;
   const hasDescription = input.description !== undefined;
@@ -478,6 +529,8 @@ export const updateRolePermissions = async (
     if (!context.hasFullOrganizationAuthority && current.id === context.role.id) {
       throw new AppError("PERMISSION_ESCALATION", "You cannot change the permissions of your own role.", 403);
     }
+    // Removing capabilities the caller lacks is as much an escalation as granting them (WK-40).
+    assertCanManageRole(context, current);
     assertCanGrantPermissions(context, permissions);
 
     await tx`
@@ -511,18 +564,19 @@ export const archiveRole = async (context: WorkspaceContext, roleId: string) => 
   const sql = getSql();
   const current = await getManagedRoleById(sql, context, roleId);
   assertManagedRoleEditable(current);
+  assertCanManageRole(context, current);
 
+  // Disabled and invited members still hold the role: deleting it would hide them for good (BUG-WK-14).
   const usageRows = await sql<{ count: string }[]>`
     SELECT COUNT(*)::text AS count
     FROM public.organization_memberships
     WHERE organization_id = ${context.organization.id}
       AND role_id = ${roleId}
-      AND status = 'active'
       AND deleted_at IS NULL
   `;
 
   if (Number(usageRows[0]?.count ?? 0) > 0) {
-    throw new AppError("ROLE_IN_USE", "Role is assigned to active organization members.", 409);
+    throw new AppError("ROLE_IN_USE", "Vai trò đang được gán cho thành viên (kể cả thành viên đã vô hiệu hoá). Hãy đổi vai trò của họ trước.", 409);
   }
 
   await sql`
@@ -536,52 +590,100 @@ export const archiveRole = async (context: WorkspaceContext, roleId: string) => 
   return { ok: true as const };
 };
 
+/** Member rows (role included even when the role was deleted, so nobody disappears from the list). */
+const selectOrganizationMembers = (
+  sql: QuerySql,
+  context: WorkspaceContext,
+  filter: postgres.PendingQuery<postgres.Row[]>,
+  limit: number
+) => sql<(OrganizationMemberRow & { status_rank: number })[]>`
+  SELECT
+    om.id,
+    om.organization_id,
+    au.id AS user_id,
+    au.email,
+    au.display_name,
+    r.id AS role_id,
+    r.key AS role_key,
+    r.name AS role_name,
+    array_remove(array_agg(rp.permission_key ORDER BY rp.permission_key), NULL) AS role_permissions,
+    om.status,
+    om.joined_at,
+    om.created_at,
+    om.updated_at,
+    ${memberStatusRank(sql)} AS status_rank
+  FROM public.organization_memberships om
+  JOIN public.app_users au
+    ON au.id = om.user_id
+    AND au.deleted_at IS NULL
+  JOIN public.roles r
+    ON r.id = om.role_id
+    AND r.organization_id = om.organization_id
+  LEFT JOIN public.role_permissions rp
+    ON rp.role_id = r.id
+    AND rp.organization_id = r.organization_id
+  WHERE om.organization_id = ${context.organization.id}
+    AND om.deleted_at IS NULL
+    AND ${filter}
+  GROUP BY om.id, au.id, r.id
+  ORDER BY ${memberStatusRank(sql)}, au.display_name ASC, au.id ASC
+  LIMIT ${limit}
+`;
+
+const memberStatusRank = (sql: QuerySql) => sql`(CASE om.status WHEN 'active' THEN 1 WHEN 'invited' THEN 2 ELSE 3 END)`;
+
+const memberCursorTag = "members";
+
+/** Members ordered by status (active, invited, disabled), name, id; keyset paged (WK-37). */
 export const listOrganizationMembers = async (
-  context: WorkspaceContext
+  context: WorkspaceContext,
+  query: OrganizationMemberQuery = { limit: 500 }
 ): Promise<OrganizationMemberCollection> => {
   assertPermission(context, Permission.MemberView);
   const sql = getSql();
-  const rows = await sql<OrganizationMemberRow[]>`
-    SELECT
-      om.id,
-      om.organization_id,
-      au.id AS user_id,
-      au.email,
-      au.display_name,
-      r.id AS role_id,
-      r.key AS role_key,
-      r.name AS role_name,
-      array_remove(array_agg(rp.permission_key ORDER BY rp.permission_key), NULL) AS role_permissions,
-      om.status,
-      om.joined_at,
-      om.created_at,
-      om.updated_at
-    FROM public.organization_memberships om
-    JOIN public.app_users au
-      ON au.id = om.user_id
-      AND au.deleted_at IS NULL
-    JOIN public.roles r
-      ON r.id = om.role_id
-      AND r.organization_id = om.organization_id
-      AND r.deleted_at IS NULL
-    LEFT JOIN public.role_permissions rp
-      ON rp.role_id = r.id
-      AND rp.organization_id = r.organization_id
-    WHERE om.organization_id = ${context.organization.id}
-      AND om.deleted_at IS NULL
-    GROUP BY om.id, au.id, r.id
-    ORDER BY
-      CASE om.status
-        WHEN 'active' THEN 1
-        WHEN 'invited' THEN 2
-        ELSE 3
-      END,
-      au.display_name ASC,
-      au.id ASC
-    LIMIT 500
-  `;
+  const [tag, rank, name, id] = query.cursor ? (decodeCursor(query.cursor, 4) ?? []) : [];
+  if (
+    query.cursor &&
+    (tag !== memberCursorTag || typeof rank !== "number" || !Number.isInteger(rank) || typeof name !== "string" || name.length > 400 || !isUuid(id))
+  ) {
+    throw invalidCursor();
+  }
+  const q = query.q?.trim().toLowerCase() ?? "";
+  const like = `%${escapeLike(q)}%`;
+  let filter = sql`TRUE`;
+  if (q.length > 0) {
+    filter = sql`${filter} AND (
+      public.immutable_unaccent(lower(au.display_name)) LIKE public.immutable_unaccent(${like})
+      OR lower(au.email) LIKE ${like}
+    )`;
+  }
+  if (query.status) {
+    filter = sql`${filter} AND om.status = ${query.status}`;
+  }
+  if (query.cursor) {
+    filter = sql`${filter} AND (${memberStatusRank(sql)}, au.display_name, au.id) > (${Number(rank)}::int, ${String(name)}::text, ${String(id)}::uuid)`;
+  }
+  const rows = await selectOrganizationMembers(sql, context, filter, query.limit + 1);
+  const page = rows.slice(0, query.limit);
+  const last = page.at(-1);
+  const hasMore = rows.length > query.limit;
+  return {
+    items: page.map(toOrganizationMember),
+    pageInfo: {
+      hasMore,
+      nextCursor: hasMore && last ? encodeCursor([memberCursorTag, Number(last.status_rank), last.display_name, last.user_id]) : null
+    }
+  };
+};
 
-  return { items: rows.map(toOrganizationMember) };
+/** One member by user id (any status), or 404. */
+export const getOrganizationMemberByUserId = async (context: WorkspaceContext, userId: string) => {
+  const sql = getSql();
+  const row = (await selectOrganizationMembers(sql, context, sql`om.user_id = ${userId}`, 1))[0];
+  if (!row) {
+    throw new AppError("ORG_MEMBER_NOT_FOUND", "Organization member was not found.", 404);
+  }
+  return toOrganizationMember(row);
 };
 
 export const updateOrganizationMember = async (
@@ -598,7 +700,6 @@ export const updateOrganizationMember = async (
     JOIN public.roles r
       ON r.id = om.role_id
       AND r.organization_id = om.organization_id
-      AND r.deleted_at IS NULL
     WHERE om.id = ${membershipId}
       AND om.organization_id = ${context.organization.id}
       AND om.deleted_at IS NULL
@@ -622,8 +723,14 @@ export const updateOrganizationMember = async (
   if (current.role_key === "superadmin" && !context.hasFullOrganizationAuthority) {
     throw new AppError("PERMISSION_ESCALATION", "Only a superadmin can change a superadmin membership.", 403);
   }
-  // Nobody may disable or re-role someone who holds capabilities they do not hold themselves.
-  assertCanGrantPermissions(context, (await getManagedRoleById(sql, context, current.role_id)).permissions);
+  // Nobody may disable or re-role someone who holds capabilities they do not hold themselves (the current role
+  // may have been deleted already: its permissions still count).
+  const currentPermissions = await sql<{ permission_key: string }[]>`
+    SELECT permission_key FROM public.role_permissions
+    WHERE organization_id = ${context.organization.id} AND role_id = ${current.role_id}
+  `;
+  assertCanGrantPermissions(context, currentPermissions.map((row) => row.permission_key));
+  await assertProductionRolesCovered(sql, context, current.user_id);
 
   if (current.role_key === "superadmin" && (input.status === "disabled" || input.roleId)) {
     await assertOrganizationWillKeepSuperadmin(sql, context, membershipId);
@@ -646,40 +753,7 @@ export const updateOrganizationMember = async (
       AND deleted_at IS NULL
   `;
 
-  const updatedRows = await sql<OrganizationMemberRow[]>`
-    SELECT
-      om.id,
-      om.organization_id,
-      au.id AS user_id,
-      au.email,
-      au.display_name,
-      r.id AS role_id,
-      r.key AS role_key,
-      r.name AS role_name,
-      array_remove(array_agg(rp.permission_key ORDER BY rp.permission_key), NULL) AS role_permissions,
-      om.status,
-      om.joined_at,
-      om.created_at,
-      om.updated_at
-    FROM public.organization_memberships om
-    JOIN public.app_users au
-      ON au.id = om.user_id
-      AND au.deleted_at IS NULL
-    JOIN public.roles r
-      ON r.id = om.role_id
-      AND r.organization_id = om.organization_id
-      AND r.deleted_at IS NULL
-    LEFT JOIN public.role_permissions rp
-      ON rp.role_id = r.id
-      AND rp.organization_id = r.organization_id
-    WHERE om.id = ${membershipId}
-      AND om.organization_id = ${context.organization.id}
-      AND om.deleted_at IS NULL
-    GROUP BY om.id, au.id, r.id
-    LIMIT 1
-  `;
-
-  const updated = updatedRows[0];
+  const updated = (await selectOrganizationMembers(sql, context, sql`om.id = ${membershipId}`, 1))[0];
   if (!updated) {
     throw new AppError("ORG_MEMBER_NOT_FOUND", "Organization member was not found.", 404);
   }

@@ -3,8 +3,11 @@ import { Router, type Router as ExpressRouter } from "express";
 import {
   AuthSessionSchema,
   LoginRequestSchema,
-  LogoutResponseSchema
+  LogoutResponseSchema,
+  SocketTicketSchema
 } from "../../contracts/schemas.js";
+import { resolveAccessContext } from "../access/access-context.js";
+import { issueSocketTicket } from "./socket-ticket.js";
 import { AppError } from "../../lib/app-error.js";
 import { readCookie } from "../../lib/cookies.js";
 import {
@@ -60,7 +63,8 @@ export const createAuthRoutes = (): ExpressRouter => {
     try {
       const accessToken = getAccessTokenFromRequest(req) ?? readCookie(req, accessTokenCookieName);
       clearAuthCookies(res);
-      const sessionId = await revokeAuthSession(accessToken);
+      // This device only (BUG-WK-02): other devices keep their sessions.
+      const sessionId = await revokeAuthSession(accessToken, { scope: "local" });
       if (sessionId) {
         disconnectRooms([sessionRoom(sessionId)]);
       }
@@ -71,9 +75,33 @@ export const createAuthRoutes = (): ExpressRouter => {
     }
   });
 
-  authRoutes.get("/auth/me", requireSupabaseUser, (req, res) => {
-    res.setHeader("cache-control", "no-store");
-    res.json(AuthSessionSchema.parse({ user: (req as AuthenticatedRequest).auth }));
+  authRoutes.get("/auth/me", requireSupabaseUser, async (req, res, next) => {
+    try {
+      res.setHeader("cache-control", "no-store");
+      const auth = (req as AuthenticatedRequest).auth;
+      // Permissions come from the database role (token claims carry none, WK-59); none without a membership.
+      const permissions = await resolveAccessContext(auth.id)
+        .then((context) => context.role.permissions)
+        .catch((error: unknown) => {
+          if (error instanceof AppError && error.statusCode === 403) {
+            return [] as string[];
+          }
+          throw error;
+        });
+      res.json(AuthSessionSchema.parse({ user: { id: auth.id, email: auth.email, permissions } }));
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  /** Short-lived ticket that lets the open socket survive the access-token refresh (PERF-02). */
+  authRoutes.post("/auth/socket-ticket", requireSupabaseUser, async (req, res, next) => {
+    try {
+      res.setHeader("cache-control", "no-store");
+      res.json(SocketTicketSchema.parse(await issueSocketTicket((req as AuthenticatedRequest).auth)));
+    } catch (error) {
+      next(error);
+    }
   });
 
   // GET /auth/providers, /auth/google/start, /auth/google/callback (PD-012; off unless GOOGLE_AUTH_ENABLED).

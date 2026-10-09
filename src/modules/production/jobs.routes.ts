@@ -2,6 +2,7 @@ import { Router, type Router as ExpressRouter } from "express";
 
 import {
   AssignTaskRequestSchema,
+  CloseFeedbackRequestSchema,
   CreateFeedbackRequestSchema,
   CreateJobRequestSchema,
   CreateProductionCommentRequestSchema,
@@ -29,7 +30,7 @@ import {
 import { requireSupabaseUser } from "../../middleware/auth.js";
 import { handle, param } from "../work/http.js";
 import { openJobChat } from "./job-chat.service.js";
-import { createFeedback, createJob, getJobDetail, listJobs, reassignFeedback, transitionJob, updateJob } from "./jobs.service.js";
+import { closeFeedback, createFeedback, createJob, getJobDetail, listJobs, reassignFeedback, transitionJob, updateJob } from "./jobs.service.js";
 import {
   assignProductionTask,
   createProductionTasks,
@@ -75,6 +76,12 @@ export const createProductionJobRoutes = (): ExpressRouter => {
     handle(
       async (context, req) => JobDetailSchema.parse(await createFeedback(context, param(req, "jobId"), CreateFeedbackRequestSchema.parse(req.body))),
       201
+    )
+  );
+  routes.post(
+    "/production/feedbacks/:feedbackId/close",
+    handle(async (context, req) =>
+      JobDetailSchema.parse(await closeFeedback(context, param(req, "feedbackId"), CloseFeedbackRequestSchema.parse(req.body)))
     )
   );
   routes.post(

@@ -162,6 +162,26 @@ export const softDeleteTestAccounts = (emails) => {
 const count = (rows) => rows.filter((row) => /^[0-9a-f-]{36}$/.test(row)).length;
 
 /**
+ * Removes roles created by accounts.e2e (key r_e2e_<digits>): memberships still on them (soft-deleted test
+ * accounts) move back to the "member" role first, production roles of test accounts go too.
+ */
+export const purgeTestRoles = (keys = null) => {
+  const filter = keys ? `key IN (${sqlList(keys)})` : `key ~ '^r_e2e_[0-9]+$'`;
+  const rows = localSql(`
+    BEGIN;
+    CREATE TEMP TABLE e2e_roles ON COMMIT DROP AS SELECT id, organization_id FROM public.roles WHERE ${filter} AND key ~ '^r_e2e_[0-9]+$';
+    UPDATE public.organization_memberships om SET role_id = m.id
+    FROM e2e_roles r, public.roles m
+    WHERE om.role_id = r.id AND m.organization_id = r.organization_id AND m.key = 'member' AND m.deleted_at IS NULL;
+    DELETE FROM public.role_permissions WHERE role_id IN (SELECT id FROM e2e_roles);
+    DELETE FROM public.roles WHERE id IN (SELECT id FROM e2e_roles) RETURNING id;
+    COMMIT;
+  `);
+  bumpAuthz();
+  return rows.filter((row) => /^[0-9a-f-]{36}$/.test(row));
+};
+
+/**
  * Removes leftovers of e2e runs that crashed before their own cleanup (and of runs from before the suites cleaned
  * up after themselves). Returns a short summary, or "" when there was nothing to remove.
  */
@@ -173,7 +193,7 @@ export const sweepLeftovers = async () => {
   const projects = localSql(`
     SELECT id FROM public.projects
     WHERE created_by IN ${devUsers} AND (
-      name ~ '^E2E (tasks|projects|sidebar|search|notifications|upload-xss) '
+      name ~ '^E2E (tasks|projects|sidebar|search|notifications|upload-xss|paging|fixes|accounts) '
       OR name ~ '^My tasks e2e [A-Z0-9]+$'
       OR name IN ('Task smoke', 'QA – projects private', 'QA – projects public', 'Sidebar public', 'Sidebar public (done)',
                   'Sidebar private', 'Bí mật dự án', 'Notif smoke', 'QA – upload xss')
@@ -263,12 +283,19 @@ export const sweepLeftovers = async () => {
   purgeChannels(channels);
   note("channels/DMs", channels.length);
 
-  // Accounts created by members.e2e.
+  // Accounts created by members.e2e / accounts.e2e.
   const accounts = localSql(`
     SELECT email_normalized FROM public.app_users
     WHERE deleted_at IS NULL AND email_normalized ~ '^(new|e2e\\.member)\\.[0-9]{13}@nesso\\.test$'
   `);
   note("test accounts", softDeleteTestAccounts(accounts).length);
+  note("test roles", purgeTestRoles().length);
+
+  // Inbox rows written directly by suites (paging fixtures), keyed "e2e-…".
+  const synthetic = localSql(`
+    DELETE FROM public.notifications WHERE dedupe_key LIKE 'e2e-%' AND recipient_user_id IN ${devUsers} RETURNING id
+  `);
+  note("synthetic notifications", count(synthetic));
 
   // Notifications that point at something that no longer exists, involving a dev account (as actor or recipient).
   const dangling = localSql(`

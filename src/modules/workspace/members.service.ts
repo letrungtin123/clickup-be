@@ -11,32 +11,47 @@ import { assertPermission } from "../access/resource-access.js";
 import { createAuthUser, generateTemporaryPassword, setAuthUserBanned, setAuthUserPassword } from "../auth/supabase-admin.service.js";
 import { revokeTokensIssuedBefore, signInWithPassword } from "../auth/supabase-auth.service.js";
 import { enqueueDomainEvents } from "../events/outbox.js";
-import { assertCanAssignRole, listOrganizationMembers } from "./workspace.service.js";
+import { assertCanAssignRole, assertProductionRolesCovered, getOrganizationMemberByUserId } from "./workspace.service.js";
 
 const accessTokenTtlSeconds = 3600;
+/**
+ * GoTrue (another container) stamps `iat` with its own clock. The user-wide "issued before" marker leaves this
+ * much slack so a sign-in right after an admin reset never yields a dead session (WK-39); tokens inside the
+ * slack are still ended through their session id (below).
+ */
+const clockSkewToleranceSeconds = 5;
+
+const listSessionIds = async (sql: QuerySql, userId: string, keepSessionId: string | null) =>
+  (
+    await sql<{ id: string }[]>`
+      SELECT id FROM auth.sessions
+      WHERE user_id = ${userId} AND (${keepSessionId}::uuid IS NULL OR id <> ${keepSessionId}::uuid)
+    `
+  ).map((row) => row.id);
 
 /**
- * Ends every session of a user: refresh tokens are deleted and still-valid access tokens are
- * denylisted until they expire. Live sockets are disconnected.
+ * Ends sessions of a user: refresh tokens are deleted and still-valid access tokens are denylisted (by
+ * session id) until they expire. `knownSessionIds` are sessions listed before a password change, which may
+ * already be gone from auth.sessions by now. Without `keepSessionId`, every token issued before now dies and
+ * live sockets are disconnected.
  */
-export const revokeUserSessions = async (userId: string, keepSessionId: string | null = null) => {
+export const revokeUserSessions = async (userId: string, keepSessionId: string | null = null, knownSessionIds: string[] = []) => {
   const sql = getSql();
   if (!keepSessionId) {
-    // Admin reset / disable: every access token issued up to and including this second dies.
-    // (JWT iat has one-second resolution; the user signs in again later, never within this second.)
-    await revokeTokensIssuedBefore(userId, Math.floor(Date.now() / 1000) + 1);
+    await revokeTokensIssuedBefore(userId, Math.floor(Date.now() / 1000) - clockSkewToleranceSeconds);
   }
   try {
-    const sessions = await sql<{ id: string }[]>`
+    const deleted = await sql<{ id: string }[]>`
       DELETE FROM auth.sessions
       WHERE user_id = ${userId} AND (${keepSessionId}::uuid IS NULL OR id <> ${keepSessionId}::uuid)
       RETURNING id
     `;
+    const sessionIds = [...new Set([...knownSessionIds, ...deleted.map((row) => row.id)])].filter((id) => id !== keepSessionId);
     const redis = getOptionalRedis();
-    if (redis && sessions.length > 0) {
+    if (redis && sessionIds.length > 0) {
       const pipeline = redis.pipeline();
-      for (const session of sessions) {
-        pipeline.set(`auth:revoked:${session.id}`, "1", "EX", accessTokenTtlSeconds);
+      for (const sessionId of sessionIds) {
+        pipeline.set(`auth:revoked:${sessionId}`, "1", "EX", accessTokenTtlSeconds);
       }
       await pipeline.exec();
     }
@@ -48,13 +63,19 @@ export const revokeUserSessions = async (userId: string, keepSessionId: string |
   }
 };
 
-const findMemberById = async (context: WorkspaceContext, userId: string) => {
-  const members = await listOrganizationMembers(context);
-  const member = members.items.find((item) => item.user.id === userId);
-  if (!member) {
-    throw new AppError("ORG_MEMBER_NOT_FOUND", "Organization member was not found.", 404);
-  }
-  return member;
+/**
+ * Changes a password through GoTrue and only then ends the other sessions: a rejected password (GoTrue
+ * error) leaves every session as it was (BUG-WK-09). Sessions are listed first because GoTrue may drop them
+ * on a password change, and their access tokens must still be denylisted.
+ */
+const changePasswordAndRevoke = async (userId: string, password: string, keepSessionId: string | null) => {
+  const sql = getSql();
+  const before = await listSessionIds(sql, userId, keepSessionId).catch((error: unknown) => {
+    logger.warn({ err: error }, "Listing sessions before a password change failed");
+    return [] as string[];
+  });
+  await setAuthUserPassword(userId, password);
+  await revokeUserSessions(userId, keepSessionId, before);
 };
 
 /** PD-005: admins create accounts with a one-time temporary password the user must replace. */
@@ -63,45 +84,47 @@ export const createOrganizationMember = async (context: WorkspaceContext, input:
   const sql = getSql();
   await assertCanAssignRole(sql, context, input.roleId);
 
-  const existing = await sql<{ id: string; has_membership: boolean; other_org: boolean }[]>`
-    SELECT u.id,
-      EXISTS (
-        SELECT 1 FROM public.organization_memberships om
-        WHERE om.organization_id = ${context.organization.id} AND om.user_id = u.id AND om.deleted_at IS NULL
-      ) AS has_membership,
-      EXISTS (
-        SELECT 1 FROM public.organization_memberships oo
-        WHERE oo.organization_id <> ${context.organization.id} AND oo.user_id = u.id AND oo.deleted_at IS NULL
-      ) AS other_org
-    FROM auth.users u
-    WHERE lower(u.email) = ${input.email}
-    LIMIT 1
-  `;
-  if (existing[0]?.has_membership) {
-    throw new AppError("MEMBER_EXISTS", "This person is already a member.", 409);
-  }
-  if (existing[0]?.other_org) {
-    // Never take over an account that belongs to another organization.
-    throw new AppError("ACCOUNT_EXISTS", "An account with this email already exists.", 409);
-  }
+  // One creation per address at a time: a double click must not hand out a password the second request
+  // already replaced (WK-33). The lock is held while GoTrue is called (one short request).
+  const { userId, temporaryPassword } = await sql.begin(async (tx) => {
+    await tx`SELECT pg_advisory_xact_lock(hashtextextended(${`member-email:${input.email}`}, 0))`;
+    const existing = await tx<{ id: string; has_membership: boolean; other_org: boolean }[]>`
+      SELECT u.id,
+        EXISTS (
+          SELECT 1 FROM public.organization_memberships om
+          WHERE om.organization_id = ${context.organization.id} AND om.user_id = u.id AND om.deleted_at IS NULL
+        ) AS has_membership,
+        EXISTS (
+          SELECT 1 FROM public.organization_memberships oo
+          WHERE oo.organization_id <> ${context.organization.id} AND oo.user_id = u.id AND oo.deleted_at IS NULL
+        ) AS other_org
+      FROM auth.users u
+      WHERE lower(u.email) = ${input.email}
+      LIMIT 1
+    `;
+    if (existing[0]?.has_membership) {
+      throw new AppError("MEMBER_EXISTS", "This person is already a member.", 409);
+    }
+    if (existing[0]?.other_org) {
+      // Never take over an account that belongs to another organization.
+      throw new AppError("ACCOUNT_EXISTS", "An account with this email already exists.", 409);
+    }
 
-  const temporaryPassword = generateTemporaryPassword();
-  let userId = existing[0]?.id;
-  if (userId) {
-    // Account exists without a membership here (e.g. previously removed): take it over cleanly —
-    // new password, every old session revoked, any ban lifted.
-    await setAuthUserPassword(userId, temporaryPassword);
-    await setAuthUserBanned(userId, false);
-    await revokeUserSessions(userId);
-  } else {
-    userId = await createAuthUser({ email: input.email, password: temporaryPassword, displayName: input.displayName });
-  }
+    const password = generateTemporaryPassword();
+    let id = existing[0]?.id;
+    if (id) {
+      // Account exists without a membership here (e.g. previously removed): take it over cleanly —
+      // new password, every old session revoked, any ban lifted. Leftover production roles must be covered.
+      await assertProductionRolesCovered(tx, context, id);
+      await changePasswordAndRevoke(id, password, null);
+      await setAuthUserBanned(id, false);
+    } else {
+      id = await createAuthUser({ email: input.email, password, displayName: input.displayName });
+    }
 
-  const createdUserId = userId;
-  await sql.begin(async (tx) => {
     await insertOrganizationMemberRecords(tx, {
       organizationId: context.organization.id,
-      userId: createdUserId,
+      userId: id,
       email: input.email,
       displayName: input.displayName,
       jobTitle: input.jobTitle ?? null,
@@ -111,10 +134,11 @@ export const createOrganizationMember = async (context: WorkspaceContext, input:
       invitedBy: context.user.id,
       actorUserId: context.user.id
     });
+    return { userId: id, temporaryPassword: password };
   });
 
   await invalidateAccessContexts();
-  return { member: await findMemberById(context, userId), temporaryPassword };
+  return { member: await getOrganizationMemberByUserId(context, userId), temporaryPassword };
 };
 
 /**
@@ -188,17 +212,21 @@ export const resetMemberPassword = async (context: WorkspaceContext, membershipI
   if (target.role_key === "superadmin" && !context.hasFullOrganizationAuthority) {
     throw new AppError("PERMISSION_ESCALATION", "Only a superadmin can reset a superadmin's password.", 403);
   }
-  // Resetting a password hands over the account: only for people with no more privileges than the caller.
+  // Resetting a password hands over the account: only for people with no more privileges than the caller,
+  // in the workspace and in the production module (BUG-WK-03).
   await assertCanAssignRole(sql, context, target.role_id);
+  await assertProductionRolesCovered(sql, context, target.user_id);
   logger.info({ actorId: context.user.id, targetUserId: target.user_id }, "Member password reset");
 
   const temporaryPassword = generateTemporaryPassword();
-  await setAuthUserPassword(target.user_id, temporaryPassword);
+  await changePasswordAndRevoke(target.user_id, temporaryPassword, null);
   await sql`UPDATE public.app_users SET must_change_password = true WHERE id = ${target.user_id}`;
-  await revokeUserSessions(target.user_id);
   await invalidateAccessContexts();
   return { temporaryPassword };
 };
+
+/** Raised when the current password is wrong: the only failure the change-password limiter counts (WK-38). */
+export const currentPasswordInvalid = () => new AppError("CURRENT_PASSWORD_INVALID", "The current password is incorrect.", 400);
 
 /** Self-service change; verifies the current password and keeps only the caller's current session. */
 export const changeOwnPassword = async (
@@ -212,11 +240,9 @@ export const changeOwnPassword = async (
   try {
     await signInWithPassword({ email: context.user.email, password: input.currentPassword });
   } catch {
-    throw new AppError("CURRENT_PASSWORD_INVALID", "The current password is incorrect.", 400);
+    throw currentPasswordInvalid();
   }
-  // Denylist the other sessions first: changing the password makes GoTrue drop them before we could list them.
-  await revokeUserSessions(context.user.id, sessionId);
-  await setAuthUserPassword(context.user.id, input.newPassword);
+  await changePasswordAndRevoke(context.user.id, input.newPassword, sessionId);
   await getSql()`UPDATE public.app_users SET must_change_password = false WHERE id = ${context.user.id}`;
   await invalidateAccessContexts();
   return { ok: true as const };

@@ -18,6 +18,7 @@ import {
   ChatOkSchema,
   ChatSearchPageSchema,
   ChatSearchQuerySchema,
+  ChatSettingsSchema,
   ChatUploadRequestSchema,
   ChatUploadTicketSchema,
   CreateChannelRequestSchema,
@@ -38,7 +39,9 @@ import {
   UpdateChannelRequestSchema,
   UpdateMyMembershipRequestSchema
 } from "../../contracts/chat.js";
+import { getSql } from "../../db/client.js";
 import { requireSupabaseUser, type AuthenticatedRequest } from "../../middleware/auth.js";
+import { chatAttachmentsEnabled } from "./chat-settings.js";
 import { registerMessageSearchProvider } from "../search/search.service.js";
 import { handle, param } from "../work/http.js";
 import { completeChatUpload, createChatAttachmentUrls, createChatUpload, deleteUnsentChatAttachment } from "./attachments.service.js";
@@ -233,6 +236,14 @@ export const createChatRoutes = (): ExpressRouter => {
   routes.delete(
     "/chat-attachments/:attachmentId",
     handle(async (context, req) => ChatOkSchema.parse(await deleteUnsentChatAttachment(context, param(req, "attachmentId"))))
+  );
+
+  // Settings (composer): file sharing on/off (PD-013) ------------------------------------------------
+  routes.get(
+    "/chat/settings",
+    handle(async (context) =>
+      ChatSettingsSchema.parse({ attachmentsEnabled: await chatAttachmentsEnabled(getSql(), context.organization.id) })
+    )
   );
 
   // Search & mentions ---------------------------------------------------------------------------

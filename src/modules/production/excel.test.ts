@@ -4,7 +4,7 @@ import ExcelJS from "exceljs";
 import type { Response } from "express";
 import { describe, expect, it } from "vitest";
 
-import { businessDate, contentDisposition, safeCell, safeText, sendWorkbook } from "./excel.js";
+import { businessDate, contentDisposition, numberFormats, percentCell, safeCell, safeText, sendWorkbook } from "./excel.js";
 
 describe("excel helpers", () => {
   it("neutralises formula-looking text with an apostrophe", () => {
@@ -23,6 +23,43 @@ describe("excel helpers", () => {
       "attachment; filename=\"Bao_cao_2026-09-26_2026-10-25_xuat_2026-10-09.xlsx\"; filename*=UTF-8''B%C3%A1o%20c%C3%A1o%202026-09-26_2026-10-25%20%28xu%E1%BA%A5t%202026-10-09%29.xlsx"
     );
     expect(contentDisposition('a"b\r\n.xlsx')).not.toMatch(/[\r\n]|filename="a"/);
+  });
+
+  it("PR-25: percent cells are rounded to what 0.00% shows", () => {
+    expect(percentCell(103.25 / 100)).toBe(1.0325);
+    expect(String(percentCell(103.25 / 100))).toBe("1.0325");
+    expect(percentCell(0.123456)).toBe(0.1235);
+    expect(percentCell(null)).toBeNull();
+    expect(percentCell(Number.NaN)).toBeNull();
+  });
+
+  it("PR-25: date cells without a column format still show as dates", async () => {
+    const stream = new PassThrough();
+    const res = Object.assign(stream, { status: () => res, setHeader: () => undefined }) as unknown as Response;
+    const chunks: Buffer[] = [];
+    stream.on("data", (chunk: Buffer) => chunks.push(chunk));
+    const done = new Promise((resolve) => stream.on("end", resolve));
+    await sendWorkbook(res, "x.xlsx", [
+      {
+        name: "Thông tin",
+        columns: [
+          { header: "Mục", key: "item" },
+          { header: "Giá trị", key: "value" }
+        ],
+        rows: [
+          { item: "Thời điểm xuất", value: businessDate("2026-10-09T17:30:00.000Z") },
+          { item: "Ngày", value: new Date("2026-10-09T00:00:00Z") },
+          { item: "Số", value: 3 }
+        ]
+      }
+    ]);
+    await done;
+    const workbook = new ExcelJS.Workbook();
+    await workbook.xlsx.load(Buffer.concat(chunks) as unknown as ArrayBuffer);
+    const sheet = workbook.getWorksheet("Thông tin")!;
+    expect(sheet.getRow(2).getCell(2).numFmt).toBe(numberFormats.datetime);
+    expect(sheet.getRow(3).getCell(2).numFmt).toBe(numberFormats.day);
+    expect(sheet.getRow(4).getCell(2).numFmt).toBeFalsy();
   });
 
   it("shows instants in business time", () => {

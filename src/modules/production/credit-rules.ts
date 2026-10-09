@@ -71,9 +71,31 @@ export const listRuleHistory = async (sql: QuerySql, organizationId: string, pro
   ).map(toCreditRule);
 
 /**
+ * PR-12: a price that already priced a score is history. It is never edited in place, and a new version
+ * may only start after the last business day it priced — otherwise the price list would claim another
+ * price was in force on days whose scores used this one. Returns the last priced day, or null.
+ */
+const lastPricedDay = async (sql: QuerySql, organizationId: string, ruleId: string) =>
+  (
+    await sql<{ day: string | null }[]>`
+      SELECT to_char(max(business_day), 'YYYY-MM-DD') AS day FROM production.score_entries
+      WHERE organization_id = ${organizationId} AND credit_rule_id = ${ruleId}
+    `
+  )[0]?.day ?? null;
+
+const ruleInUse = (day: string) =>
+  new AppError(
+    "CREDIT_RULE_IN_USE",
+    `Đơn giá này đã được dùng để tính điểm đến ngày ${day.slice(8, 10)}/${day.slice(5, 7)}/${day.slice(0, 4)} — hãy tạo phiên bản mới bắt đầu sau ngày đó.`,
+    409
+  );
+
+/**
  * Writes a new price for (project, process) starting on `effectiveFrom` without touching history:
  * the version covering that day is split (it now ends the day before), the new version inherits
- * the old end. Same-day versions are corrected in place. Scores keep the values they recorded.
+ * the old end. A same-day version is corrected in place only while no score used it; a version that
+ * priced scores can only be followed by a version starting after its last priced day (PR-12, 409).
+ * Scores keep the values they recorded.
  */
 export const setCreditRule = async (
   sql: QuerySql,
@@ -100,6 +122,10 @@ export const setCreditRule = async (
     `
   )[0];
   if (sameDay) {
+    const usedUntil = await lastPricedDay(sql, input.organizationId, sameDay.id);
+    if (usedUntil) {
+      throw ruleInUse(usedUntil);
+    }
     await sql`
       UPDATE production.credit_rules
       SET credit_per_image = ${input.creditPerImage}, money_per_image = ${input.moneyPerImage}
@@ -119,6 +145,10 @@ export const setCreditRule = async (
   )[0];
   let newEnd: string | null = null;
   if (covering) {
+    const usedUntil = await lastPricedDay(sql, input.organizationId, covering.id);
+    if (usedUntil && usedUntil >= input.effectiveFrom) {
+      throw ruleInUse(usedUntil);
+    }
     newEnd = covering.effective_to;
     await sql`UPDATE production.credit_rules SET effective_to = ${input.effectiveFrom}::date WHERE id = ${covering.id}`;
   } else {
@@ -319,16 +349,28 @@ export const importCreditRules = async (
       processes.set(processKey, created.id);
       result.createdProcesses.push(row.processName);
     }
-    await setCreditRule(sql, {
-      organizationId: input.organizationId,
-      projectId: projects.get(code)!,
-      processId: processes.get(processKey)!,
-      creditPerImage: row.credit,
-      moneyPerImage: row.money,
-      effectiveFrom: input.effectiveFrom,
-      userId: input.userId
-    });
+    try {
+      await setCreditRule(sql, {
+        organizationId: input.organizationId,
+        projectId: projects.get(code)!,
+        processId: processes.get(processKey)!,
+        creditPerImage: row.credit,
+        moneyPerImage: row.money,
+        effectiveFrom: input.effectiveFrom,
+        userId: input.userId
+      });
+    } catch (error) {
+      // A price that already priced scores on/after that day (PR-12): reported on its line, nothing is written.
+      if (error instanceof AppError && error.code === "CREDIT_RULE_IN_USE") {
+        errors.push({ line: row.line, message: error.message });
+        continue;
+      }
+      throw error;
+    }
     result.imported += 1;
+  }
+  if (errors.length > 0) {
+    return { ...result, imported: 0, errors };
   }
   return { ...result, ok: true };
 };

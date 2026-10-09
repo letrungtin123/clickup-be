@@ -1,7 +1,7 @@
 import { z } from "zod";
 
 import { createCursorPageSchema } from "./pagination.js";
-import { CustomValuesSchema, PayModeSchema } from "./production-catalog.js";
+import { CustomValuesSchema, IsoDateInputSchema, PayModeSchema, SafeText } from "./production-catalog.js";
 import { colorTokens, UserRefSchema } from "./work.js";
 
 /**
@@ -11,6 +11,8 @@ import { colorTokens, UserRefSchema } from "./work.js";
 
 const Id = z.string().uuid();
 const IsoDate = z.string().datetime({ offset: true });
+/** Request instants (PR-16: impossible dates are a 400, not a database error). */
+const IsoDateInput = IsoDateInputSchema;
 const Color = z.enum(colorTokens);
 const BoolQuery = z
   .enum(["true", "false"])
@@ -60,6 +62,8 @@ export const ProductionTaskSchema = z.object({
   feedbackId: Id.nullable(),
   note: z.string().nullable(),
   isLate: z.boolean(),
+  /** The task's job is archived: the task is read-only (PD-014 / BUG-PR-04). */
+  jobArchived: z.boolean(),
   qcFailCount: z.number().int(),
   customValues: CustomValuesSchema,
   tagIds: z.array(Id),
@@ -84,9 +88,9 @@ export const CreateTaskLineSchema = z
     shiftId: Id,
     qtyAssigned: z.number().int().min(1).max(1_000_000),
     qcId: Id.nullable().optional(),
-    /** Default: job deadline − project QC buffer. */
-    deadline: IsoDate.optional(),
-    note: z.string().trim().max(5000).optional(),
+    /** Default: job deadline − project QC buffer (feedback redo tasks: see "Giao lại"). */
+    deadline: IsoDateInput.optional(),
+    note: SafeText().trim().max(5000).optional(),
     customValues: CustomValuesSchema.optional(),
     tagIds: z.array(Id).max(50).optional()
   })
@@ -100,7 +104,7 @@ export type CreateTasksResult = z.infer<typeof CreateTasksResultSchema>;
 export const TransitionTaskRequestSchema = z
   .object({
     toStatusId: Id,
-    note: z.string().trim().max(5000).optional(),
+    note: SafeText().trim().max(5000).optional(),
     qtyDone: z.number().int().min(0).max(1_000_000).optional(),
     otHours: z.number().positive().max(24).multipleOf(0.1).optional()
   })
@@ -108,19 +112,19 @@ export const TransitionTaskRequestSchema = z
 export type TransitionTaskRequest = z.infer<typeof TransitionTaskRequestSchema>;
 
 export const UpdateTaskQtyRequestSchema = z
-  .object({ qtyDone: z.number().int().min(0).max(1_000_000), note: z.string().trim().max(5000).optional() })
+  .object({ qtyDone: z.number().int().min(0).max(1_000_000), note: SafeText().trim().max(5000).optional() })
   .strict();
 
 export const AssignTaskRequestSchema = z
-  .object({ assigneeId: Id.optional(), qcId: Id.nullable().optional(), note: z.string().trim().max(5000).optional() })
+  .object({ assigneeId: Id.optional(), qcId: Id.nullable().optional(), note: SafeText().trim().max(5000).optional() })
   .strict()
   .refine((value) => value.assigneeId !== undefined || value.qcId !== undefined, "Nothing to change.");
 
 export const UpdateProductionTaskRequestSchema = z
   .object({
     qtyAssigned: z.number().int().min(1).max(1_000_000).optional(),
-    deadline: IsoDate.optional(),
-    note: z.string().trim().max(5000).nullable().optional(),
+    deadline: IsoDateInput.optional(),
+    note: SafeText().trim().max(5000).nullable().optional(),
     processId: Id.optional(),
     shiftId: Id.optional(),
     customValues: CustomValuesSchema.optional(),
@@ -133,7 +137,7 @@ export const MyProductionTasksQuerySchema = z.object({
   role: z.enum(["assignee", "qc", "all"]).default("all"),
   /** Include tasks already past the QC/complete stage (terminal or delivered). */
   includeFinished: BoolQuery,
-  cursor: z.string().max(500).optional(),
+  cursor: SafeText().max(500).optional(),
   limit: z.coerce.number().int().min(1).max(200).default(100)
 });
 export type MyProductionTasksQuery = z.infer<typeof MyProductionTasksQuerySchema>;
@@ -150,6 +154,11 @@ export const FeedbackSchema = z.object({
   createdBy: UserRefSchema.nullable(),
   createdAt: IsoDate,
   resolvedAt: IsoDate.nullable(),
+  /** REWORKED: the re-done work was checked; CLOSED: an Account/Admin closed it without rework (BUG-PR-02). */
+  resolution: z.enum(["REWORKED", "CLOSED"]).nullable(),
+  resolvedBy: UserRefSchema.nullable(),
+  /** Why it was closed without rework. */
+  resolutionNote: z.string().nullable(),
   taskIds: z.array(Id)
 });
 export type Feedback = z.infer<typeof FeedbackSchema>;
@@ -199,6 +208,8 @@ export const JobDetailSchema = JobSummarySchema.extend({
     canEdit: z.boolean(),
     canSplit: z.boolean(),
     canFeedback: z.boolean(),
+    /** "Đóng feedback, không cần làm lại" on an open feedback (Account / Admin). */
+    canCloseFeedback: z.boolean(),
     canArchive: z.boolean(),
     /** Job-level moves (e.g. Complete → Delivering → Delivered) the caller may apply to all eligible tasks. */
     bulkActions: z.array(JobBulkActionSchema)
@@ -211,26 +222,25 @@ export const JobQuerySchema = z.object({
   statusId: Id.optional(),
   leaderId: Id.optional(),
   tagId: Id.optional(),
-  q: z.string().trim().min(1).max(120).optional(),
-  deadlineFrom: IsoDate.optional(),
-  deadlineTo: IsoDate.optional(),
+  q: SafeText().trim().min(1).max(120).optional(),
+  deadlineFrom: IsoDateInput.optional(),
+  deadlineTo: IsoDateInput.optional(),
   /** Only jobs with at least one late task. */
   late: BoolQuery,
   includeArchived: BoolQuery,
-  cursor: z.string().max(500).optional(),
+  cursor: SafeText().max(500).optional(),
   limit: z.coerce.number().int().min(1).max(100).default(50)
 });
 export type JobQuery = z.infer<typeof JobQuerySchema>;
 
 const JobFields = {
   projectId: Id,
-  code: z.string().trim().min(1).max(160),
-  name: z.string().trim().max(300).nullable().optional(),
+  code: SafeText().trim().min(1).max(160),
+  name: SafeText().trim().max(300).nullable().optional(),
   leaderId: Id.optional(),
-  deadline: IsoDate,
+  deadline: IsoDateInput,
   totalImages: z.number().int().min(1).max(1_000_000),
-  driveLink: z
-    .string()
+  driveLink: SafeText()
     .trim()
     .max(2000)
     .regex(/^https?:\/\//i, "Link phải bắt đầu bằng http:// hoặc https://")
@@ -242,18 +252,21 @@ const JobFields = {
 export const CreateJobRequestSchema = z.object(JobFields).strict();
 export type CreateJobRequest = z.infer<typeof CreateJobRequestSchema>;
 export const UpdateJobRequestSchema = z
-  .object({ ...JobFields, projectId: Id.optional(), code: JobFields.code.optional(), deadline: IsoDate.optional(), totalImages: JobFields.totalImages.optional(), archived: z.boolean().optional() })
+  .object({ ...JobFields, projectId: Id.optional(), code: JobFields.code.optional(), deadline: IsoDateInput.optional(), totalImages: JobFields.totalImages.optional(), archived: z.boolean().optional() })
   .strict();
 export type UpdateJobRequest = z.infer<typeof UpdateJobRequestSchema>;
 
 export const JobChatResultSchema = z.object({ channelId: Id, created: z.boolean() });
 
-export const JobTransitionRequestSchema = z.object({ toStatusId: Id, note: z.string().trim().max(5000).optional() }).strict();
+export const JobTransitionRequestSchema = z.object({ toStatusId: Id, note: SafeText().trim().max(5000).optional() }).strict();
 export const JobTransitionResultSchema = z.object({ moved: z.number().int(), job: JobDetailSchema });
 
 export const CreateFeedbackRequestSchema = z
-  .object({ type: z.enum(["WRONG", "EXTRA"]), note: z.string().trim().min(1).max(5000), sourceTaskId: Id.optional() })
+  .object({ type: z.enum(["WRONG", "EXTRA"]), note: SafeText().trim().min(1).max(5000), sourceTaskId: Id.optional() })
   .strict();
+
+/** POST /production/feedbacks/:feedbackId/close — "Đóng feedback, không cần làm lại" (Account / Admin, note required). */
+export const CloseFeedbackRequestSchema = z.object({ note: SafeText().trim().min(1).max(5000) }).strict();
 
 export const ReassignFeedbackRequestSchema = z
   .object({ tasks: z.array(CreateTaskLineSchema.extend({ sourceTaskId: Id.optional() }).strict()).min(1).max(50) })
@@ -276,9 +289,9 @@ export const ProductionCommentSchema = z.object({
 export type ProductionComment = z.infer<typeof ProductionCommentSchema>;
 
 export const CreateProductionCommentRequestSchema = z
-  .object({ body: z.string().trim().min(1).max(5000), mentionedUserIds: z.array(Id).max(50).default([]) })
+  .object({ body: SafeText().trim().min(1).max(5000), mentionedUserIds: z.array(Id).max(50).default([]) })
   .strict();
-export const UpdateProductionCommentRequestSchema = z.object({ body: z.string().trim().min(1).max(5000) }).strict();
+export const UpdateProductionCommentRequestSchema = z.object({ body: SafeText().trim().min(1).max(5000) }).strict();
 
 export const TaskLogSchema = z.object({
   id: Id,
@@ -301,6 +314,6 @@ export const ProductionTimelineItemSchema = z.discriminatedUnion("kind", [
 export const ProductionTimelinePageSchema = createCursorPageSchema(ProductionTimelineItemSchema);
 export type ProductionTimelinePage = z.infer<typeof ProductionTimelinePageSchema>;
 export const ProductionTimelineQuerySchema = z.object({
-  cursor: z.string().max(500).optional(),
+  cursor: SafeText().max(500).optional(),
   limit: z.coerce.number().int().min(1).max(100).default(50)
 });

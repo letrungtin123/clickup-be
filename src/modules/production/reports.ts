@@ -53,6 +53,7 @@ type ExprContext = { day: () => string; close: () => string };
 const joinSql: Record<Source, Partial<Record<JoinName, string>>> = {
   SCORES: {
     task: "JOIN production.tasks t ON t.organization_id = e.organization_id AND t.id = e.task_id",
+    job: "JOIN production.jobs j ON j.organization_id = e.organization_id AND j.id = e.job_id",
     project: "LEFT JOIN production.projects p ON p.organization_id = e.organization_id AND p.id = e.project_id",
     member: "LEFT JOIN production.member_profiles mp ON mp.organization_id = e.organization_id AND mp.user_id = e.user_id"
   },
@@ -147,9 +148,10 @@ const dimensionSpecs: Record<ReportDimension, DimensionSpec> = {
     nullLabel: ""
   },
   period: {
-    // KPI period: day ≤ close day → this month, else next month (closeDay ≤ 28).
+    // KPI period: day ≤ close day → this month, else next month (closeDay ≤ 28), always with the CURRENT close
+    // day like the board and the settlement (PR-17) — never the period_month stored with the close day of the time.
     expr: {
-      SCORES: () => "to_char(e.period_month, 'YYYY-MM')",
+      SCORES: (ctx) => `to_char(date_trunc('month', (e.business_day - ${ctx.close()}) + interval '1 month'), 'YYYY-MM')`,
       TASKS: (ctx) => `to_char(date_trunc('month', (${ctx.day()} - ${ctx.close()}) + interval '1 month'), 'YYYY-MM')`
     },
     joins: { SCORES: [], TASKS: [] },
@@ -233,7 +235,8 @@ const filterSpecs: Record<FilterKey, FilterSpec> = {
     cast: "uuid[]"
   },
   scoreRole: { condition: { SCORES: anyOf("e.role"), TASKS: null }, joins: { SCORES: [], TASKS: [] }, cast: "text[]" },
-  taskState: { condition: { SCORES: null, TASKS: null }, joins: { SCORES: [], TASKS: [] }, cast: "none" }
+  taskState: { condition: { SCORES: null, TASKS: null }, joins: { SCORES: [], TASKS: [] }, cast: "none" },
+  jobState: { condition: { SCORES: null, TASKS: null }, joins: { SCORES: ["job"], TASKS: ["job"] }, cast: "none" }
 };
 
 const taskAnchors: Record<ReportConfig["taskDate"], string> = { DONE: "t.done_at", ASSIGNED: "t.assigned_at", DEADLINE: "t.deadline" };
@@ -389,8 +392,14 @@ export const buildReportQuery = (
       const spec = filterSpecs[key];
       if (key === "taskState") {
         if (source === "TASKS") {
-          where.push(config.filters.taskState === "OPEN" ? "t.done_at IS NULL" : "t.done_at IS NOT NULL");
+          // Open work = not Done and not closed (a task closed by an override without Done is not open, PR-08).
+          where.push(config.filters.taskState === "OPEN" ? "t.done_at IS NULL AND t.closed_at IS NULL" : "t.done_at IS NOT NULL");
         }
+        continue;
+      }
+      if (key === "jobState") {
+        spec.joins[source].forEach((join) => joins.add(join));
+        where.push(config.filters.jobState === "ACTIVE" ? "j.archived_at IS NULL" : "j.archived_at IS NOT NULL");
         continue;
       }
       const condition = spec.condition[source];
@@ -584,11 +593,15 @@ export const executeReport = async (
 };
 
 const pointMeasures = new Set<ReportMeasure>(["points", "points_khoan"]);
+/** Breakdowns that single out people's points: a person, or a job / tag (often one worker, or a USER tag). */
+const personalDimensions = new Set<string>(["user", "job"]);
+const personalFilters = ["user", "job", "tag"] as const;
 
 /**
  * Who may run what: ADMIN and LEADER use reports (LEADER sees every job — PD-014). Money (money_khoan)
  * is ADMIN only — refused, never silently dropped. When settings.scoresPublic is off, non-admins cannot
- * break points down by person (dimension or filter `user`).
+ * break points down by person (PR-11): no `user` or `job` dimension and no `user` / `job` / `tag` filter
+ * with point measures. Team / project / client / process / shift / time aggregates stay available.
  */
 export const assertReportAllowed = (context: AccessContext, config: Pick<ReportConfig, "dimensions" | "measures" | "filters">, scoresPublic: boolean) => {
   assertProductionRole(context, "LEADER");
@@ -600,9 +613,9 @@ export const assertReportAllowed = (context: AccessContext, config: Pick<ReportC
     !admin &&
     !scoresPublic &&
     config.measures.some((measure) => pointMeasures.has(measure)) &&
-    (config.dimensions.includes("user") || (config.filters.user?.length ?? 0) > 0)
+    (config.dimensions.some((dimension) => personalDimensions.has(dimension)) || personalFilters.some((key) => (config.filters[key]?.length ?? 0) > 0))
   ) {
-    throw new AppError("SCORES_PRIVATE", "Bảng điểm đang để riêng tư; không xem được điểm theo từng người.", 403);
+    throw new AppError("SCORES_PRIVATE", "Bảng điểm đang để riêng tư; không xem được điểm theo từng người hoặc từng job.", 403);
   }
 };
 

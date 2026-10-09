@@ -49,6 +49,15 @@ export const businessDate = (iso: string | Date | null | undefined) => {
 /** "YYYY-MM-DD" → a date cell at midnight (no shift: already a business day). */
 export const dayCell = (day: string | null | undefined) => (day ? new Date(`${day}T00:00:00Z`) : null);
 
+/**
+ * A ratio (0.1234 = 12.34 %) for a "0.00%" cell, rounded to what the format shows (PR-25): no float tails
+ * such as 1.0325000000000002 in the cell value.
+ */
+export const percentCell = (fraction: number | null | undefined) =>
+  fraction === null || fraction === undefined || !Number.isFinite(fraction) ? null : Math.round(fraction * 10_000) / 10_000;
+
+const isMidnight = (date: Date) => date.getUTCHours() === 0 && date.getUTCMinutes() === 0 && date.getUTCSeconds() === 0;
+
 const asciiFallback = (name: string) =>
   name
     .normalize("NFD")
@@ -107,6 +116,14 @@ export const sendWorkbook = async (res: Response, filename: string, sheets: Shee
       header.commit();
       spec.rows.forEach((values, index) => {
         const row = sheet.addRow(Object.fromEntries(spec.columns.map((column) => [column.key, safeCell(values[column.key])])));
+        // Date cells always show as dates (PR-25): columns without a format (e.g. the info sheets) get
+        // dd/mm/yyyy, or dd/mm/yyyy hh:mm when the value has a time of day.
+        spec.columns.forEach((column, position) => {
+          const value = values[column.key];
+          if (value instanceof Date && !column.numFmt) {
+            row.getCell(position + 1).numFmt = isMidnight(value) ? numberFormats.day : numberFormats.datetime;
+          }
+        });
         if (spec.boldLastRow && index === spec.rows.length - 1) {
           row.font = { bold: true };
         }

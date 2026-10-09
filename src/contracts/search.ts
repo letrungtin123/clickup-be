@@ -1,5 +1,6 @@
 import { z } from "zod";
 
+import { SafeSearchSchema } from "./schemas.js";
 import { ColorTokenSchema, TaskStatusRefSchema, UserRefSchema } from "./work.js";
 
 /** Global search contract (spec §29, §55). Every group is authorization-filtered server side. */
@@ -12,7 +13,7 @@ export const SearchGroupSchema = z.enum(searchGroups);
 export type SearchGroup = z.infer<typeof SearchGroupSchema>;
 
 export const GlobalSearchQuerySchema = z.object({
-  q: z.string().trim().min(2).max(200),
+  q: SafeSearchSchema(200, 2),
   groups: z
     .preprocess(
       (value) => (typeof value === "string" && value.length > 0 ? value.split(",").map((entry) => entry.trim()) : [...searchGroups]),

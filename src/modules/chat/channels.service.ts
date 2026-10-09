@@ -77,12 +77,21 @@ const channelEvent = (
   payload: { channelId, ...payload }
 });
 
-const nameTaken = () => new AppError("CHANNEL_NAME_TAKEN", "A channel with this name already exists.", 409);
+const nameTaken = () => new AppError("CHANNEL_NAME_TAKEN", "A public channel with this name already exists.", 409);
 
-const assertNameFree = async (sql: QuerySql, context: AccessContext, name: string, exceptId: string | null) => {
+/**
+ * Names are unique among public channels only (index channels_org_name_uidx): a clash can only ever point at
+ * a channel everyone may browse, never reveal that a private channel exists (SEC-API-13). Private channels
+ * may share names; an emptied private channel no longer holds its name (WK-41).
+ */
+const assertNameFree = async (sql: QuerySql, context: AccessContext, name: string, kind: string, exceptId: string | null) => {
+  if (kind !== "public") {
+    return;
+  }
   const rows = await sql<{ id: string }[]>`
     SELECT id FROM public.channels
     WHERE organization_id = ${context.organization.id}
+      AND kind = 'public'
       AND name_normalized = lower(${name})
       AND deleted_at IS NULL
       AND (${exceptId}::uuid IS NULL OR id <> ${exceptId}::uuid)
@@ -200,7 +209,7 @@ export const createChannel = async (context: AccessContext, input: CreateChannel
   try {
     created = await sql.begin(async (tx) => {
       const names = await requireActiveOrgMembers(tx, context, memberIds);
-      await assertNameFree(tx, context, input.name, null);
+      await assertNameFree(tx, context, input.name, input.kind, null);
 
       const channel = (
         await tx<{ id: string }[]>`
@@ -266,9 +275,9 @@ export const createChannel = async (context: AccessContext, input: CreateChannel
 
 export const updateChannel = async (context: AccessContext, channelId: string, input: UpdateChannelRequest): Promise<ChatChannelDetail> => {
   const sql = getSql();
-  let systemMessageIds: string[] = [];
+  let outcome: { systemMessageIds: string[]; changed: boolean; madePrivate: boolean };
   try {
-    systemMessageIds = await sql.begin(async (tx) => {
+    outcome = await sql.begin(async (tx) => {
       const resolved = await requireChannel(tx, context, channelId, { lock: true });
       assertNotDirect(resolved);
       const { channel } = resolved;
@@ -283,12 +292,16 @@ export const updateChannel = async (context: AccessContext, channelId: string, i
 
       const nextName = input.name ?? channel.name;
       const renamed = nextName !== channel.name;
-      if (renamed && nextName !== null) {
-        await assertNameFree(tx, context, nextName, channelId);
-      }
       const description = input.description === undefined ? channel.description : (nullableText(input.description) ?? null);
       const topic = input.topic === undefined ? channel.topic : (nullableText(input.topic) ?? null);
       const kind = input.kind ?? channel.kind;
+      if ((renamed || kind !== channel.kind) && nextName !== null) {
+        await assertNameFree(tx, context, nextName, kind, channelId);
+      }
+      // A save that changes nothing writes nothing and notifies nobody (WK-42).
+      if (!renamed && description === channel.description && topic === channel.topic && kind === channel.kind) {
+        return { systemMessageIds: [], changed: false, madePrivate: false };
+      }
 
       await tx`
         UPDATE public.channels
@@ -322,7 +335,20 @@ export const updateChannel = async (context: AccessContext, channelId: string, i
           kind
         })
       ]);
-      return ids;
+      const madePrivate = channel.kind === "public" && kind === "private";
+      if (madePrivate) {
+        // Non-members lose the channel: their inbox entries quoting it go too (BUG-WK-04).
+        await tx`
+          DELETE FROM public.notifications n
+          WHERE n.organization_id = ${context.organization.id} AND n.channel_id = ${channelId}
+            AND NOT EXISTS (
+              SELECT 1 FROM public.channel_members cm
+              WHERE cm.organization_id = n.organization_id AND cm.channel_id = n.channel_id
+                AND cm.user_id = n.recipient_user_id AND cm.deleted_at IS NULL
+            )
+        `;
+      }
+      return { systemMessageIds: ids, changed: true, madePrivate };
     });
   } catch (error) {
     if (isUniqueViolation(error, "channels_org_name_uidx")) {
@@ -332,7 +358,10 @@ export const updateChannel = async (context: AccessContext, channelId: string, i
   }
 
   const detail = await getChannel(context, channelId);
-  await publishMessages(sql, context, channelId, systemMessageIds);
+  if (!outcome.changed) {
+    return detail;
+  }
+  await publishMessages(sql, context, channelId, outcome.systemMessageIds);
   publishChannelEvent({ kind: "updated", channelId, channel: detail, actorId: context.user.id, toRoom: true });
   return detail;
 };
@@ -407,7 +436,8 @@ export const deleteChannel = async (context: AccessContext, channelId: string) =
     toUsers: memberIds
   });
   evictUsersFromRoom(memberIds, channelRoom(channelId));
-  await purgeNotificationsFor({ organizationId: context.organization.id, userIds: memberIds, channelId });
+  // Everyone's inbox entries about the channel go, members or not (public mentions reach non-members, BUG-WK-04).
+  await sql`DELETE FROM public.notifications WHERE organization_id = ${context.organization.id} AND channel_id = ${channelId}`;
   return { ok: true as const };
 };
 
@@ -436,11 +466,17 @@ export const joinChannel = async (context: AccessContext, channelId: string): Pr
       `
     )[0];
     const access = previous?.access === "view" ? "view" : "submit";
-    await tx`
+    // A concurrent join of the same person (double click, two tabs) already added them: nothing to do (WK-46).
+    const inserted = await tx`
       INSERT INTO public.channel_members (organization_id, channel_id, user_id, access, role, last_read_seq, added_by)
       VALUES (${context.organization.id}, ${channelId}, ${context.user.id}, ${access}, 'member',
               ${resolved.channel.last_message_seq}, ${context.user.id})
+      ON CONFLICT (organization_id, channel_id, user_id) WHERE deleted_at IS NULL DO NOTHING
+      RETURNING 1
     `;
+    if (inserted.length === 0) {
+      return null;
+    }
     const message = await insertSystemMessage(tx, context, channelId, { type: "joined", actorId: context.user.id, userIds: [context.user.id] });
     await enqueueDomainEvents(tx, [
       channelEvent(context, "chat.channel.member_added", channelId, {
@@ -501,9 +537,16 @@ const removeMembership = async (
     `
   )[0];
   if (!target) {
+    if (userId === context.user.id) {
+      // Already left (a concurrent second "leave"): idempotent (WK-46).
+      return { removed: false, systemMessageId: null };
+    }
     throw new AppError("CHANNEL_MEMBER_NOT_FOUND", "Channel member was not found.", 404);
   }
   if (target.role === "admin") {
+    if (userId !== context.user.id && !resolved.caps.canManageAdmins) {
+      throw new AppError("CHANNEL_ADMIN_REQUIRED_TO_REMOVE_ADMIN", "Chỉ quản trị viên kênh mới xoá được một quản trị viên khác.", 403);
+    }
     await assertAdminRemains(tx, context, channelId, userId);
   }
   await tx`
@@ -531,10 +574,19 @@ const removeMembership = async (
   await enqueueDomainEvents(tx, [
     channelEvent(context, "chat.channel.member_removed", channelId, { userIds: [userId], removedBy: context.user.id })
   ]);
-  return systemMessageId;
+  return { removed: true, systemMessageId };
 };
 
-const afterMemberRemoved = async (context: AccessContext, channelId: string, userId: string, systemMessageId: string | null) => {
+const afterMemberRemoved = async (
+  context: AccessContext,
+  channelId: string,
+  userId: string,
+  outcome: { removed: boolean; systemMessageId: string | null }
+) => {
+  if (!outcome.removed) {
+    return;
+  }
+  const systemMessageId = outcome.systemMessageId;
   const sql = getSql();
   await publishMessages(sql, context, channelId, systemMessageId ? [systemMessageId] : []);
   const info = (
@@ -559,15 +611,16 @@ const afterMemberRemoved = async (context: AccessContext, channelId: string, use
 
 export const leaveChannel = async (context: AccessContext, channelId: string) => {
   const sql = getSql();
-  const systemMessageId = await sql.begin(async (tx) => {
+  const outcome = await sql.begin(async (tx) => {
     const resolved = await requireChannel(tx, context, channelId, { lock: true });
     assertNotDirect(resolved);
     if (!resolved.member) {
-      throw new AppError("CHANNEL_NOT_MEMBER", "You are not a member of this channel.", 409);
+      // Leaving twice (two tabs, a retried request) is not an error (WK-46).
+      return { removed: false, systemMessageId: null };
     }
     return await removeMembership(tx, context, resolved, context.user.id, null);
   });
-  await afterMemberRemoved(context, channelId, context.user.id, systemMessageId);
+  await afterMemberRemoved(context, channelId, context.user.id, outcome);
   return { ok: true as const };
 };
 
@@ -576,7 +629,7 @@ export const removeChannelMember = async (context: AccessContext, channelId: str
     return await leaveChannel(context, channelId);
   }
   const sql = getSql();
-  const systemMessageId = await sql.begin(async (tx) => {
+  const outcome = await sql.begin(async (tx) => {
     const resolved = await requireChannel(tx, context, channelId, { lock: true });
     assertNotDirect(resolved);
     assertCapability(resolved.caps.canManageMembers);
@@ -586,7 +639,7 @@ export const removeChannelMember = async (context: AccessContext, channelId: str
     )[0]?.display_name;
     return await removeMembership(tx, context, resolved, userId, name ?? null);
   });
-  await afterMemberRemoved(context, channelId, userId, systemMessageId);
+  await afterMemberRemoved(context, channelId, userId, outcome);
   return { ok: true as const };
 };
 
@@ -725,6 +778,11 @@ export const updateChannelMember = async (
     if (role === "admin" && access !== "submit") {
       throw new AppError("CHANNEL_ADMIN_REQUIRES_SUBMIT", "Channel admins always have send access.", 400);
     }
+    // Granting or revoking the admin role is for channel admins and superadmins only — holders of
+    // channel.manage_members cannot promote themselves (or anyone) to admin (SEC-API-02).
+    if (role !== target.role && !resolved.caps.canManageAdmins) {
+      throw new AppError("CHANNEL_ADMIN_ONLY", "Chỉ quản trị viên kênh mới cấp hoặc thu hồi quyền quản trị kênh.", 403);
+    }
     if (target.role === "admin" && role !== "admin") {
       await assertAdminRemains(tx, context, channelId, userId);
     }
@@ -858,4 +916,170 @@ export const openDirectConversation = async (
     });
   }
   return { created: outcome.created, channel };
+};
+
+// System-level membership --------------------------------------------------------------------------
+
+/** Acts as `actorId` for system-initiated changes: names system messages and events, grants nothing. */
+const systemActorContext = async (sql: QuerySql, organizationId: string, actorId: string): Promise<AccessContext> => {
+  const row = (
+    await sql<{ display_name: string; email: string | null; slug: string; name: string }[]>`
+      SELECT au.display_name, au.email, o.slug, o.name
+      FROM public.app_users au
+      JOIN public.organizations o ON o.id = ${organizationId}
+      WHERE au.id = ${actorId}
+    `
+  )[0];
+  if (!row) {
+    throw new AppError("CHAT_SYSTEM_ACTOR_INVALID", "Người thực hiện không hợp lệ.", 400);
+  }
+  return {
+    user: { id: actorId, displayName: row.display_name, email: row.email },
+    organization: { id: organizationId, slug: row.slug, name: row.name },
+    role: { id: actorId, organizationId, key: "system", name: "system", permissions: [] },
+    hasFullOrganizationAuthority: false,
+    mustChangePassword: false,
+    productionRoles: []
+  };
+};
+
+/**
+ * System-level membership sync for channels owned by another module (e.g. production job chats follow the
+ * people working on the job). Adds / removes members WITHOUT the actor's channel capabilities — the calling
+ * module has already authorized the business action — but with the usual system messages ("X added Y"),
+ * domain events, realtime hints, room evictions and inbox purges. Named, non-archived channels only; DMs
+ * never change. Added people must be active organization members. Returns who actually changed.
+ */
+export const setSystemChannelMembers = async (input: {
+  organizationId: string;
+  channelId: string;
+  add?: string[];
+  remove?: string[];
+  /** Shown as the author of the system messages ("<actor> added …"). */
+  actorId: string;
+  access?: "view" | "submit";
+}): Promise<{ addedIds: string[]; removedIds: string[] }> => {
+  const sql = getSql();
+  const add = uniqueIds(input.add ?? []);
+  const remove = uniqueIds(input.remove ?? []).filter((id) => !add.includes(id));
+  if (add.length === 0 && remove.length === 0) {
+    return { addedIds: [], removedIds: [] };
+  }
+  const context = await systemActorContext(sql, input.organizationId, input.actorId);
+  const channelId = input.channelId;
+
+  const outcome = await sql.begin(async (tx) => {
+    const channel = (
+      await tx<Parameters<typeof toChannelInfo>[0][]>`
+        SELECT ${channelInfoColumnsSql(tx)} FROM public.channels c
+        WHERE c.id = ${channelId} AND c.organization_id = ${input.organizationId} AND c.deleted_at IS NULL
+        FOR UPDATE OF c
+      `
+    )[0];
+    if (!channel) {
+      throw channelNotFound();
+    }
+    if (isDirectKind(channel.kind)) {
+      throw new AppError("CHAT_DM_IMMUTABLE", "Direct conversations cannot be changed.", 409);
+    }
+    if (channel.archived_at !== null) {
+      throw new AppError("CHANNEL_ARCHIVED", "This channel is archived and read-only.", 409);
+    }
+
+    const names = await requireActiveOrgMembers(tx, context, add);
+    const addedIds =
+      add.length === 0
+        ? []
+        : (
+            await tx<{ user_id: string }[]>`
+              INSERT INTO public.channel_members (organization_id, channel_id, user_id, access, role, last_read_seq, added_by)
+              SELECT ${input.organizationId}::uuid, ${channelId}::uuid, u.user_id, ${input.access ?? "submit"}, 'member',
+                     ${channel.last_message_seq}::bigint, ${input.actorId}::uuid
+              FROM unnest(${add}::uuid[]) AS u(user_id)
+              ON CONFLICT (organization_id, channel_id, user_id) WHERE deleted_at IS NULL DO NOTHING
+              RETURNING user_id
+            `
+          ).map((row) => row.user_id);
+    const removedIds =
+      remove.length === 0
+        ? []
+        : (
+            await tx<{ user_id: string }[]>`
+              UPDATE public.channel_members SET deleted_at = now(), deleted_by = ${input.actorId}
+              WHERE organization_id = ${input.organizationId} AND channel_id = ${channelId}
+                AND user_id = ANY(${remove}::uuid[]) AND deleted_at IS NULL
+              RETURNING user_id
+            `
+          ).map((row) => row.user_id);
+
+    const messageIds: string[] = [];
+    const events: DomainEventInput[] = [];
+    if (addedIds.length > 0) {
+      const message = await insertSystemMessage(
+        tx,
+        context,
+        channelId,
+        { type: "members_added", actorId: input.actorId, userIds: addedIds },
+        addedIds.map((id) => names.get(id) ?? "someone")
+      );
+      messageIds.push(message.id);
+      // New members start caught up.
+      await advanceReadMarkers(tx, context, channelId, addedIds, message.seq);
+      events.push(
+        channelEvent(context, "chat.channel.member_added", channelId, { channelKind: channel.kind, userIds: addedIds, addedBy: input.actorId })
+      );
+    }
+    if (removedIds.length > 0) {
+      const removedNames = await tx<{ display_name: string }[]>`
+        SELECT display_name FROM public.app_users WHERE id = ANY(${removedIds}::uuid[]) ORDER BY display_name
+      `;
+      messageIds.push(
+        (
+          await insertSystemMessage(
+            tx,
+            context,
+            channelId,
+            { type: "member_removed", actorId: input.actorId, userIds: removedIds },
+            removedNames.map((row) => row.display_name)
+          )
+        ).id
+      );
+      events.push(channelEvent(context, "chat.channel.member_removed", channelId, { userIds: removedIds, removedBy: input.actorId }));
+    }
+    await enqueueDomainEvents(tx, events);
+    return { addedIds, removedIds, messageIds };
+  });
+
+  await publishMessages(sql, context, channelId, outcome.messageIds);
+  const info = (
+    await sql<Parameters<typeof toChannelInfo>[0][]>`
+      SELECT ${channelInfoColumnsSql(sql)} FROM public.channels c WHERE c.organization_id = ${input.organizationId} AND c.id = ${channelId}
+    `
+  )[0];
+  const channel = info ? toChannelInfo(info) : null;
+  if (outcome.addedIds.length > 0) {
+    publishChannelEvent({
+      kind: "joined",
+      channelId,
+      channel,
+      userIds: outcome.addedIds,
+      actorId: input.actorId,
+      toRoom: true,
+      toUsers: outcome.addedIds
+    });
+  }
+  if (outcome.removedIds.length > 0) {
+    publishChannelEvent({
+      kind: "left",
+      channelId,
+      channel,
+      userIds: outcome.removedIds,
+      actorId: input.actorId,
+      toRoom: true,
+      toUsers: outcome.removedIds
+    });
+    evictUsersFromRoom(outcome.removedIds, channelRoom(channelId));
+    await purgeNotificationsFor({ organizationId: input.organizationId, userIds: outcome.removedIds, channelId });
+  }
+  return { addedIds: outcome.addedIds, removedIds: outcome.removedIds };
 };

@@ -2,6 +2,15 @@ import { z } from "zod";
 
 import { createCursorPageSchema, PageInfoSchema } from "./pagination.js";
 import { RichTextDocSchema } from "./rich-text.js";
+import {
+  FileNameSchema,
+  hasBidiControls,
+  isVisiblyBlank,
+  MimeTypeSchema,
+  SafeMultilineSchema,
+  SafeSearchSchema,
+  textRuleMessages
+} from "./schemas.js";
 import { SignedStorageUrlSchema, UserRefSchema } from "./work.js";
 
 /**
@@ -28,6 +37,11 @@ export const ChannelAccessSchema = z.enum(["view", "submit"]);
 export type ChannelAccess = z.infer<typeof ChannelAccessSchema>;
 export const ChannelRoleSchema = z.enum(["member", "admin"]);
 export type ChannelRole = z.infer<typeof ChannelRoleSchema>;
+/**
+ * Per-channel inbox level (BUG-WK-06): "all" = @mentions + replies in threads you take part in (default),
+ * "mentions" = @mentions only, "none" = nothing from this channel. Clients use it for toasts too
+ * (toast every new message only for "all").
+ */
 export const NotifyLevelSchema = z.enum(["all", "mentions", "none"]);
 export type NotifyLevel = z.infer<typeof NotifyLevelSchema>;
 
@@ -46,7 +60,9 @@ export const chatLimits = {
   pageMax: 100,
   sidebarMax: 500,
   /** Mention badge counts are capped; clients render "99+". */
-  mentionCountCap: 100
+  mentionCountCap: 100,
+  /** Unread counts (deleted messages excluded) are capped; clients render "999+". */
+  unreadCountCap: 1000
 } as const;
 
 // Text fields --------------------------------------------------------------------------------------
@@ -54,7 +70,10 @@ export const chatLimits = {
 // eslint-disable-next-line no-control-regex -- rejecting control characters is intended
 const controlChars = /[\u0000-\u001f\u007f]/;
 
-/** Display name: trimmed, inner whitespace collapsed, leading "#" dropped, 1-80 chars, no control chars. */
+/**
+ * Display name: trimmed, inner whitespace collapsed, leading "#" dropped, 1-80 chars, no control chars, no
+ * bidi overrides (a name must read as what it is), not invisible-only.
+ */
 export const ChannelNameSchema = z
   .string()
   .transform((value) => value.replace(/\s+/g, " ").trim().replace(/^#+\s*/, ""))
@@ -64,9 +83,11 @@ export const ChannelNameSchema = z
       .min(1)
       .max(chatLimits.channelNameMax)
       .refine((value) => !controlChars.test(value), "Channel name contains invalid characters.")
+      .refine((value) => !hasBidiControls(value), textRuleMessages.bidi)
+      .refine((value) => !isVisiblyBlank(value), textRuleMessages.blank)
   );
 
-const OptionalText = (max: number) => z.string().trim().max(max).nullable().optional();
+const OptionalText = (max: number) => SafeMultilineSchema(max).nullable().optional();
 
 // Reactions: unicode emoji sequences or :shortcode: -----------------------------------------------
 
@@ -87,7 +108,32 @@ export const isValidReactionEmoji = (value: string) => {
   return emojiSequencePattern.test(value) && emojiAnchorPattern.test(value);
 };
 
-export const ReactionEmojiSchema = z.string().refine(isValidReactionEmoji, "Invalid emoji.");
+const variationSelector16 = /\ufe0f/g;
+const textDefaultEmoji = /^(?:\p{Extended_Pictographic}|[#*0-9])$/u;
+const emojiPresentation = /^\p{Emoji_Presentation}$/u;
+const emojiModifier = /^\p{Emoji_Modifier}$/u;
+
+/**
+ * One spelling per emoji (WK-63): "❤" and "❤️" (with or without variation selector 16) are the same
+ * reaction. Every VS16 is dropped, then re-added after each code point that renders as text by default
+ * (unless a skin-tone modifier follows) — the fully-qualified form keyboards produce.
+ */
+export const normalizeReactionEmoji = (value: string) => {
+  if (emojiShortcodePattern.test(value)) {
+    return value;
+  }
+  const codePoints = [...value.replace(variationSelector16, "")];
+  return codePoints
+    .map((codePoint, index) => {
+      const next = codePoints[index + 1];
+      const needsSelector =
+        textDefaultEmoji.test(codePoint) && !emojiPresentation.test(codePoint) && !(next && emojiModifier.test(next));
+      return needsSelector ? `${codePoint}\ufe0f` : codePoint;
+    })
+    .join("");
+};
+
+export const ReactionEmojiSchema = z.string().refine(isValidReactionEmoji, "Invalid emoji.").transform(normalizeReactionEmoji);
 
 // Channels -----------------------------------------------------------------------------------------
 
@@ -132,6 +178,8 @@ export const ChannelCapabilitiesSchema = z.object({
   canArchive: z.boolean(),
   canDelete: z.boolean(),
   canManageMembers: z.boolean(),
+  /** May make someone a channel admin, demote an admin, or remove an admin (channel admins, superadmins). */
+  canManageAdmins: z.boolean().default(false),
   canModerate: z.boolean(),
   canJoin: z.boolean(),
   canLeave: z.boolean()
@@ -145,7 +193,7 @@ export const ChatChannelCollectionSchema = z.object({ items: z.array(ChatChannel
 export type ChatChannelCollection = z.infer<typeof ChatChannelCollectionSchema>;
 
 export const ChannelBrowseQuerySchema = z.object({
-  q: z.string().trim().max(80).optional(),
+  q: SafeSearchSchema(80).optional(),
   /** Superadmins only: also list private channels they are not a member of (for management). */
   includePrivate: z
     .enum(["true", "false"])
@@ -197,7 +245,7 @@ export const ChatChannelMemberSchema = z.object({
 export type ChatChannelMember = z.infer<typeof ChatChannelMemberSchema>;
 
 export const ChannelMemberQuerySchema = z.object({
-  q: z.string().trim().max(120).optional(),
+  q: SafeSearchSchema(120).optional(),
   cursor: z.string().max(500).optional(),
   limit: z.coerce.number().int().min(1).max(chatLimits.pageMax).default(50)
 });
@@ -386,8 +434,8 @@ export type ReadState = z.infer<typeof ReadStateSchema>;
 
 export const ChatUploadRequestSchema = z
   .object({
-    fileName: z.string().trim().min(1).max(255),
-    mimeType: z.string().trim().min(3).max(255),
+    fileName: FileNameSchema,
+    mimeType: MimeTypeSchema,
     sizeBytes: z.number().int().min(1).max(chatLimits.attachmentBytesMax)
   })
   .strict();
@@ -411,7 +459,7 @@ export type ChatAttachmentUrlCollection = z.infer<typeof ChatAttachmentUrlCollec
 // Search & mentions --------------------------------------------------------------------------------
 
 export const ChatSearchQuerySchema = z.object({
-  q: z.string().trim().min(2).max(200),
+  q: SafeSearchSchema(200, 2),
   channelId: Id.optional(),
   cursor: z.string().max(500).optional(),
   limit: z.coerce.number().int().min(1).max(50).default(20)
@@ -442,6 +490,13 @@ export const ChatSearchPageSchema = createCursorPageSchema(ChatSearchHitSchema);
 export type ChatSearchPage = z.infer<typeof ChatSearchPageSchema>;
 
 export const ChatOkSchema = z.object({ ok: z.literal(true) });
+
+/**
+ * GET /chat/settings — organization chat settings for the composer. `attachmentsEnabled` false (the admin
+ * switch "chat_attachments_enabled", PD-013): uploads and messages with files answer 403 CHAT_ATTACHMENTS_DISABLED.
+ */
+export const ChatSettingsSchema = z.object({ attachmentsEnabled: z.boolean() });
+export type ChatSettings = z.infer<typeof ChatSettingsSchema>;
 
 // Realtime payloads (see contracts/realtime.ts) ----------------------------------------------------
 

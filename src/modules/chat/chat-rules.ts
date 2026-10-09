@@ -8,7 +8,7 @@ import type {
 } from "../../contracts/chat.js";
 import { chatLimits, isDirectKind } from "../../contracts/chat.js";
 import { AppError } from "../../lib/app-error.js";
-import { decodeCursor, encodeCursor } from "../../lib/db-types.js";
+import { decodeCursor, decodeTimeCursor, encodeCursor, encodeTimeCursor, invalidCursor, isUuid } from "../../lib/db-types.js";
 
 /** Pure chat rules (no I/O) so they can be unit tested in isolation. */
 
@@ -76,6 +76,7 @@ export const computeChannelCapabilities = (input: CapabilityInput): ChannelCapab
       canArchive: false,
       canDelete: false,
       canManageMembers: false,
+      canManageAdmins: false,
       canModerate: false,
       canJoin: false,
       canLeave: false
@@ -102,6 +103,9 @@ export const computeChannelCapabilities = (input: CapabilityInput): ChannelCapab
     canArchive: canUpdate,
     canDelete: elevated || permissions.delete,
     canManageMembers,
+    // Granting / revoking the channel admin role (or removing an admin) needs an admin of the channel or a
+    // superadmin: channel.manage_members alone must not self-promote (SEC-API-02).
+    canManageAdmins: elevated,
     canModerate: canRead && canManageMembers,
     canJoin: !isMember && kind === "public" && !archived,
     canLeave: isMember
@@ -165,23 +169,8 @@ export const resolveHistoryWindow = (query: MessageHistoryQuery): HistoryWindow 
 
 // Cursors -----------------------------------------------------------------------------------------
 
-const pgTimestampPattern = /^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(\.\d{1,6})?(Z|[+-]\d{2}(:?\d{2})?)$/;
-const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-
 /** Keyset cursor over (timestamp with full microsecond precision as text, uuid). */
-export const encodeTimeCursor = (timestampText: string, id: string) => encodeCursor([timestampText, id]);
-
-export const decodeTimeCursor = (cursor: string | undefined): { at: string; id: string } | null => {
-  if (!cursor) {
-    return null;
-  }
-  const values = decodeCursor(cursor, 2);
-  const [at, id] = values ?? [];
-  if (typeof at !== "string" || typeof id !== "string" || !pgTimestampPattern.test(at) || !uuidPattern.test(id)) {
-    throw new AppError("INVALID_CURSOR", "The cursor is invalid.", 400);
-  }
-  return { at, id };
-};
+export { decodeTimeCursor, encodeTimeCursor };
 
 /** Keyset cursor over (sort text, uuid), e.g. member lists and channel browse. */
 export const encodeNameCursor = (name: string, id: string) => encodeCursor([name, id]);
@@ -192,8 +181,8 @@ export const decodeNameCursor = (cursor: string | undefined): { name: string; id
   }
   const values = decodeCursor(cursor, 2);
   const [name, id] = values ?? [];
-  if (typeof name !== "string" || name.length > 400 || typeof id !== "string" || !uuidPattern.test(id)) {
-    throw new AppError("INVALID_CURSOR", "The cursor is invalid.", 400);
+  if (typeof name !== "string" || name.length > 400 || name.includes("\u0000") || !isUuid(id)) {
+    throw invalidCursor();
   }
   return { name, id };
 };

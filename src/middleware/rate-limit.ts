@@ -108,12 +108,21 @@ export const createLoginRateLimit = () =>
     ...redisStore("login")
   });
 
-/** Wrong current-password guesses on change-password, per signed-in user. */
+/** Marks a change-password request whose current password was wrong (counted by the limiter below). */
+export const markPasswordGuessFailed = (res: Response) => {
+  res.locals.passwordGuessFailed = true;
+};
+
+/**
+ * Wrong current-password guesses on change-password, per signed-in user. Only those count: a too-short or
+ * reused new password (validation errors) does not lock the user out (WK-38).
+ */
 export const createPasswordChangeRateLimit = () =>
   rateLimit({
     windowMs: 15 * 60 * 1000,
     limit: 5,
     skipSuccessfulRequests: true,
+    requestWasSuccessful: (_req, res) => res.locals.passwordGuessFailed !== true,
     standardHeaders: "draft-8",
     legacyHeaders: false,
     keyGenerator: (req) => `pwd:${(req as Partial<AuthenticatedRequest>).auth?.id ?? clientIp(req)}`,

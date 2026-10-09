@@ -2,7 +2,7 @@ import { Permission } from "../../contracts/permissions.js";
 import type { TrashedTask } from "../../contracts/search.js";
 import { getSql } from "../../db/client.js";
 import { AppError } from "../../lib/app-error.js";
-import { decodeCursor, encodeCursor, toIso, type QuerySql } from "../../lib/db-types.js";
+import { decodeTimeCursor, encodeTimeCursor, timestampParamSql, timestampTextSql, toIso, type QuerySql } from "../../lib/db-types.js";
 import { logger } from "../../lib/logger.js";
 import { removeObjects } from "../../lib/storage.js";
 import { publishToRoom } from "../../realtime/publisher.js";
@@ -36,19 +36,24 @@ export const listTrash = async (
   input: { projectId?: string | undefined; cursor?: string | undefined; limit: number }
 ) => {
   assertPermission(context, Permission.TaskView);
+  const cursor = decodeTimeCursor(input.cursor);
+  // Trash is project content: project.view is required and archived projects are out of reach (SEC-API-12).
+  if (!hasPermission(context, Permission.ProjectView)) {
+    return { items: [], pageInfo: { hasMore: false, nextCursor: null } };
+  }
   const sql = getSql();
   if (input.projectId) {
     await assertProjectAccess(context, input.projectId, "view", sql);
   }
-  const cursor = decodeCursor(input.cursor, 2);
-  const rows = await sql<TrashRow[]>`
+  const rows = await sql<(TrashRow & { cursor_at: string })[]>`
     SELECT t.id, p.key || '-' || t.number AS task_key, t.title, t.project_id, p.name AS project_name, t.list_id, l.name AS list_name,
-      t.deleted_at, p.visibility, pm.access_level,
+      t.deleted_at, ${timestampTextSql(sql, () => sql`t.deleted_at`)} AS cursor_at, p.visibility, pm.access_level,
       (SELECT count(*)::int FROM public.tasks d
         WHERE d.organization_id = t.organization_id AND d.parent_task_id = t.id AND d.deleted_at = t.deleted_at) AS subtask_count,
       (SELECT ${userJsonSql(sql)} FROM public.app_users au WHERE au.id = t.deleted_by) AS deleted_by
     FROM public.tasks t
-    JOIN public.projects p ON p.id = t.project_id AND p.organization_id = t.organization_id AND p.deleted_at IS NULL
+    JOIN public.projects p ON p.id = t.project_id AND p.organization_id = t.organization_id
+      AND p.deleted_at IS NULL AND p.archived_at IS NULL
     JOIN public.lists l ON l.id = t.list_id AND l.organization_id = t.organization_id
     LEFT JOIN public.project_memberships pm
       ON pm.organization_id = p.organization_id AND pm.project_id = p.id AND pm.user_id = ${context.user.id}
@@ -59,8 +64,7 @@ export const listTrash = async (
       AND (parent.id IS NULL OR parent.deleted_at IS NULL OR parent.deleted_at <> t.deleted_at)
       AND ${visibleProjectsPredicate(sql, context)}
       AND (${input.projectId ?? null}::uuid IS NULL OR t.project_id = ${input.projectId ?? null}::uuid)
-      AND (${cursor ? String(cursor[0]) : null}::timestamptz IS NULL
-        OR (t.deleted_at, t.id) < (${cursor ? String(cursor[0]) : null}::timestamptz, ${cursor ? String(cursor[1]) : null}::uuid))
+      ${cursor ? sql`AND (t.deleted_at, t.id) < (${timestampParamSql(sql, cursor.at)}, ${cursor.id}::uuid)` : sql``}
     ORDER BY t.deleted_at DESC, t.id DESC
     LIMIT ${input.limit + 1}
   `;
@@ -88,7 +92,7 @@ export const listTrash = async (
     items,
     pageInfo: {
       hasMore: rows.length > input.limit,
-      nextCursor: rows.length > input.limit && last ? encodeCursor([last.deleted_at.toISOString(), last.id]) : null
+      nextCursor: rows.length > input.limit && last ? encodeTimeCursor(last.cursor_at, last.id) : null
     }
   };
 };
@@ -141,34 +145,73 @@ export const restoreTask = async (context: AccessContext, taskId: string) => {
       }
       throw error;
     });
+
+    // A subtask lives in its parent's list. Moves only carry live rows, so the parent may have changed lists
+    // while this subtree sat in the trash: the restored subtree follows its parent (BUG-WK-11).
+    let targetListId = root.list_id;
+    if (root.parent_task_id) {
+      const parent = (
+        await tx<{ deleted: boolean; list_id: string }[]>`
+          SELECT deleted_at IS NOT NULL AS deleted, list_id FROM public.tasks
+          WHERE id = ${root.parent_task_id} AND organization_id = ${context.organization.id}
+        `
+      )[0];
+      if (!parent || parent.deleted) {
+        throw new AppError("RESTORE_PARENT_DELETED", "Hãy khôi phục công việc cha trước.", 409);
+      }
+      targetListId = parent.list_id;
+    }
     const list = (
-      await tx<{ ok: boolean }[]>`
-        SELECT (archived_at IS NULL AND deleted_at IS NULL) AS ok FROM public.lists WHERE id = ${root.list_id}
+      await tx<{ ok: boolean; name: string }[]>`
+        SELECT (archived_at IS NULL AND deleted_at IS NULL) AS ok, name FROM public.lists
+        WHERE id = ${targetListId} AND organization_id = ${context.organization.id}
       `
     )[0];
     if (!list?.ok) {
-      throw new AppError("RESTORE_LIST_UNAVAILABLE", "The task's list is archived. Restore the list first.", 409);
-    }
-    if (root.parent_task_id) {
-      const parent = (await tx<{ ok: boolean }[]>`SELECT deleted_at IS NULL AS ok FROM public.tasks WHERE id = ${root.parent_task_id}`)[0];
-      if (!parent?.ok) {
-        throw new AppError("RESTORE_PARENT_DELETED", "Restore the parent task first.", 409);
-      }
+      throw new AppError(
+        "RESTORE_LIST_UNAVAILABLE",
+        `Danh sách "${list?.name ?? ""}" đã được lưu trữ. Hãy khôi phục danh sách (Dự án → Danh sách đã lưu trữ) trước.`,
+        409
+      );
     }
 
     const nodes = await deletedSubtree(tx, context, root);
-    const workflow = await loadEffectiveWorkflow(tx, context.organization.id, root.project_id, root.list_id);
+    const workflow = await loadEffectiveWorkflow(tx, context.organization.id, root.project_id, targetListId);
+    const sourceWorkflow =
+      targetListId === root.list_id ? workflow : await loadEffectiveWorkflow(tx, context.organization.id, root.project_id, root.list_id);
     const initial = workflow.items.find((item) => item.isInitial) ?? workflow.items[0];
-    const valid = new Set(workflow.items.map((item) => item.id));
+    const mapStatus = (statusId: string) => {
+      const current = workflow.items.find((item) => item.id === statusId);
+      if (current || !initial) {
+        return current ?? null;
+      }
+      // Other list (same key) or a status removed while the task sat in the trash → initial status.
+      const key = sourceWorkflow.items.find((item) => item.id === statusId)?.key;
+      return workflow.items.find((item) => item.key === key) ?? initial;
+    };
+    // Parents first: the parent-scope trigger checks every restored row against its (already restored) parent.
     for (const node of nodes) {
-      // Statuses removed while the task sat in the trash fall back to the initial status.
-      const statusId = valid.has(node.status_id) || !initial ? node.status_id : initial.id;
+      const status = mapStatus(node.status_id);
+      const statusId = status?.id ?? node.status_id;
       await tx`
-        UPDATE public.tasks SET deleted_at = NULL, deleted_by = NULL, status_id = ${statusId}, updated_by = ${context.user.id}
+        UPDATE public.tasks
+        SET deleted_at = NULL, deleted_by = NULL, list_id = ${targetListId}, status_id = ${statusId},
+            completed_at = CASE
+              WHEN ${statusId} = status_id::text THEN completed_at
+              WHEN ${status?.isDone ?? false} THEN coalesce(completed_at, now())
+              ELSE NULL
+            END,
+            updated_by = ${context.user.id}
         WHERE id = ${node.id} AND organization_id = ${context.organization.id}
       `;
     }
-    await insertActivities(tx, context, [{ taskId, action: "TASK_RESTORED", newValue: { subtaskCount: nodes.length - 1 } }]);
+    await insertActivities(tx, context, [
+      {
+        taskId,
+        action: "TASK_RESTORED",
+        newValue: { subtaskCount: nodes.length - 1, ...(targetListId !== root.list_id ? { listId: targetListId } : {}) }
+      }
+    ]);
     return (await selectTaskSummaries(tx, context, [taskId]))[0]!;
   });
 
@@ -193,6 +236,12 @@ export const purgeTask = async (context: AccessContext, taskId: string) => {
     await assertProjectAccess(context, root.project_id, "manage", tx);
     const nodes = await deletedSubtree(tx, context, root);
     const ids = nodes.map((node) => node.id);
+    // Subtasks trashed on their own earlier (another deletion instant) are separate trash items: they are
+    // detached and stay restorable as top-level tasks instead of blocking the purge (WK-27).
+    await tx`
+      UPDATE public.tasks SET parent_task_id = NULL, updated_by = ${context.user.id}
+      WHERE organization_id = ${context.organization.id} AND parent_task_id = ANY(${ids}::uuid[]) AND NOT (id = ANY(${ids}::uuid[]))
+    `;
     const files = await tx<{ storage_path: string }[]>`
       SELECT storage_path FROM public.task_attachments WHERE organization_id = ${context.organization.id} AND task_id = ANY(${ids}::uuid[])
     `;

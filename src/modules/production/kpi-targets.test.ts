@@ -13,6 +13,15 @@ describe("parseTargetNumber", () => {
     expect(parseTargetNumber("0")).toBe(0);
   });
 
+  it("PR-25: accepts Vietnamese (2.472,5) and English (2,472.5) grouped decimals", () => {
+    expect(parseTargetNumber("2.472,5")).toBe(2472.5);
+    expect(parseTargetNumber("1.234.567,25")).toBeNull(); // over 1 000 000
+    expect(parseTargetNumber("12.472,25")).toBe(12472.25);
+    expect(parseTargetNumber("2,472.5")).toBe(2472.5);
+    expect(parseTargetNumber("2.472,555")).toBeNull();
+    expect(parseTargetNumber("2.47,5")).toBeNull();
+  });
+
   it("rejects empty, negative, non-numeric, more than 2 decimals or absurd values", () => {
     for (const bad of ["", "abc", "-5", "1.234.5", "1.2345", "2e3", "1000001"]) {
       expect(parseTargetNumber(bad), bad).toBeNull();

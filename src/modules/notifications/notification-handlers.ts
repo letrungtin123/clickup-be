@@ -2,7 +2,7 @@ import { getSql } from "../../db/client.js";
 import { logger } from "../../lib/logger.js";
 import type { DomainEventEnvelope } from "../events/outbox.js";
 import { productionNotificationHandlers } from "../production/notifications.js";
-import { deliverNotifications } from "./notifications.service.js";
+import { deliverNotifications, refreshNotificationExcerpts, removeNotificationsAbout } from "./notifications.service.js";
 
 type TaskInfo = {
   id: string;
@@ -63,6 +63,17 @@ export const filterProjectViewers = async (organizationId: string, projectId: st
 };
 
 const str = (value: unknown) => (typeof value === "string" ? value : null);
+
+/** A comment deleted before its event was handled notifies nobody (it would quote deleted text). */
+const commentAlive = async (organizationId: string, commentId: string | null) => {
+  if (!commentId) {
+    return true;
+  }
+  const rows = await getSql()<{ ok: number }[]>`
+    SELECT 1 AS ok FROM public.task_comments WHERE id = ${commentId} AND organization_id = ${organizationId} AND deleted_at IS NULL
+  `;
+  return rows.length > 0;
+};
 const strArray = (value: unknown) => (Array.isArray(value) ? value.filter((entry): entry is string => typeof entry === "string") : []);
 
 const taskTarget = (task: TaskInfo) => ({
@@ -105,17 +116,33 @@ const loadChatMessage = async (event: DomainEventEnvelope, channelId: string, me
   return row && row.text !== null ? row : null;
 };
 
-/** Private conversations only notify current members; public channels may notify any org member. */
-const currentMembers = async (event: DomainEventEnvelope, channelId: string, userIds: string[]) => {
+type NotifyLevel = "all" | "mentions" | "none";
+
+/**
+ * Channel notify levels (BUG-WK-06), per member: "all" = @mentions + replies in threads they take part in,
+ * "mentions" = @mentions only, "none" = nothing. Returns the users whose level is in `levels`; with
+ * `nonMembers` people who are not in the channel (public-channel mentions) count as the default "all".
+ */
+const withNotifyLevel = async (
+  event: DomainEventEnvelope,
+  channelId: string,
+  userIds: string[],
+  levels: NotifyLevel[],
+  options: { nonMembers: boolean }
+) => {
   if (userIds.length === 0) {
     return [];
   }
-  const rows = await getSql()<{ user_id: string }[]>`
-    SELECT user_id FROM public.channel_members
+  const rows = await getSql()<{ user_id: string; notify_level: NotifyLevel }[]>`
+    SELECT user_id, notify_level FROM public.channel_members
     WHERE organization_id = ${event.organizationId} AND channel_id = ${channelId}
       AND user_id = ANY(${userIds}::uuid[]) AND deleted_at IS NULL
   `;
-  return rows.map((row) => row.user_id);
+  const levelOf = new Map(rows.map((row) => [row.user_id, row.notify_level]));
+  return userIds.filter((id) => {
+    const level = levelOf.get(id);
+    return level === undefined ? options.nonMembers : levels.includes(level);
+  });
 };
 
 const notifyChatMentions = async (event: DomainEventEnvelope, mentioned: string[]) => {
@@ -129,10 +156,9 @@ const notifyChatMentions = async (event: DomainEventEnvelope, mentioned: string[
     return;
   }
   // Public channels may notify non-members, but only people whose role can see channels at all.
-  const recipients =
-    chat.kind === "public"
-      ? await filterByPermission(event.organizationId, mentioned, "channel.view")
-      : await currentMembers(event, channelId, mentioned);
+  // Private conversations only notify current members. Members who muted the channel ("none") get nothing.
+  const eligible = chat.kind === "public" ? await filterByPermission(event.organizationId, mentioned, "channel.view") : mentioned;
+  const recipients = await withNotifyLevel(event, channelId, eligible, ["all", "mentions"], { nonMembers: chat.kind === "public" });
   await deliverNotifications({
     organizationId: event.organizationId,
     recipientIds: recipients,
@@ -147,7 +173,10 @@ const notifyChatMentions = async (event: DomainEventEnvelope, mentioned: string[
   });
 };
 
-/** A thread reply notifies the root author and earlier repliers (minus anyone already @mentioned). */
+/**
+ * A thread reply notifies the root author and earlier repliers (minus anyone already @mentioned) who are
+ * still members and keep the channel on "all".
+ */
 const notifyThreadParticipants = async (event: DomainEventEnvelope) => {
   const channelId = str(event.payload.channelId);
   const messageId = str(event.payload.messageId) ?? event.aggregateId;
@@ -170,7 +199,7 @@ const notifyThreadParticipants = async (event: DomainEventEnvelope) => {
   const candidates = participants.map((row) => row.author_user_id).filter((id) => !mentioned.has(id));
   await deliverNotifications({
     organizationId: event.organizationId,
-    recipientIds: await currentMembers(event, channelId, candidates),
+    recipientIds: await withNotifyLevel(event, channelId, candidates, ["all"], { nonMembers: false }),
     type: "chat.thread_replied",
     actorUserId: str(event.payload.authorId) ?? event.actorUserId,
     title: chat.name ?? "Direct message",
@@ -207,7 +236,8 @@ const handlers: Record<string, Handler> = {
 
   "task.mentioned": async (event) => {
     const task = await loadTask(event.organizationId, event.aggregateId ?? "");
-    if (!task) {
+    const commentId = str(event.payload.commentId);
+    if (!task || (commentId && !(await commentAlive(event.organizationId, commentId)))) {
       return;
     }
     const recipients = await filterProjectViewers(event.organizationId, task.project_id, strArray(event.payload.userIds));
@@ -228,7 +258,7 @@ const handlers: Record<string, Handler> = {
 
   "task.comment.created": async (event) => {
     const task = await loadTask(event.organizationId, event.aggregateId ?? "");
-    if (!task) {
+    if (!task || !(await commentAlive(event.organizationId, str(event.payload.commentId)))) {
       return;
     }
     const mentioned = new Set(strArray(event.payload.mentionedUserIds));
@@ -320,8 +350,49 @@ const handlers: Record<string, Handler> = {
   },
 
   "chat.message.updated": async (event) => {
-    // Only people newly mentioned by an edit are notified.
+    // Existing inbox entries quote the new text (BUG-WK-05); only people newly mentioned by the edit are notified.
+    const messageId = str(event.payload.messageId) ?? event.aggregateId;
+    if (messageId) {
+      const current = (
+        await getSql()<{ text: string; deleted: boolean }[]>`
+          SELECT body_text AS text, deleted_at IS NOT NULL AS deleted FROM public.messages
+          WHERE id = ${messageId} AND organization_id = ${event.organizationId}
+        `
+      )[0];
+      if (!current || current.deleted) {
+        await removeNotificationsAbout({ organizationId: event.organizationId, messageId });
+        return;
+      }
+      await refreshNotificationExcerpts({ organizationId: event.organizationId, messageId, excerpt: current.text });
+    }
     await notifyChatMentions(event, strArray(event.payload.addedMentionUserIds));
+  },
+
+  "chat.message.deleted": async (event) => {
+    // Deleted messages leave no trace in anyone's inbox (BUG-WK-05).
+    await removeNotificationsAbout({ organizationId: event.organizationId, messageId: str(event.payload.messageId) ?? event.aggregateId });
+  },
+
+  "task.comment.updated": async (event) => {
+    const commentId = str(event.payload.commentId);
+    if (!commentId) {
+      return;
+    }
+    const current = (
+      await getSql()<{ text: string; deleted: boolean }[]>`
+        SELECT body_text AS text, deleted_at IS NOT NULL AS deleted FROM public.task_comments
+        WHERE id = ${commentId} AND organization_id = ${event.organizationId}
+      `
+    )[0];
+    if (!current || current.deleted) {
+      await removeNotificationsAbout({ organizationId: event.organizationId, commentIds: [commentId] });
+      return;
+    }
+    await refreshNotificationExcerpts({ organizationId: event.organizationId, commentId, excerpt: current.text.slice(0, 280) });
+  },
+
+  "task.comment.deleted": async (event) => {
+    await removeNotificationsAbout({ organizationId: event.organizationId, commentIds: strArray(event.payload.commentIds) });
   },
 
   "chat.channel.member_added": async (event) => {

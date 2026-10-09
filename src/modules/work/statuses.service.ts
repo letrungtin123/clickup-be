@@ -125,6 +125,15 @@ export const replaceWorkflow = async (
     if (new Set(names).size !== names.length) {
       throw new AppError("WORKFLOW_DUPLICATE_NAME", "Status names must be unique.", 400);
     }
+    // One entry per existing status: a repeated id would be written twice and bypass the checks above (BUG-WK-08).
+    const ids = input.statuses.flatMap((status) => (status.id ? [status.id.toLowerCase()] : []));
+    if (new Set(ids).size !== ids.length) {
+      throw new AppError("WORKFLOW_DUPLICATE_STATUS", "Mỗi trạng thái chỉ được xuất hiện một lần trong quy trình.", 400);
+    }
+    const remapped = input.remap.map((entry) => entry.fromStatusId.toLowerCase());
+    if (new Set(remapped).size !== remapped.length) {
+      throw new AppError("WORKFLOW_INVALID_REMAP", "Mỗi trạng thái bị xoá chỉ được chuyển tới một trạng thái.", 400);
+    }
     for (const entry of input.remap) {
       if (entry.toIndex >= input.statuses.length) {
         throw new AppError("WORKFLOW_INVALID_REMAP", "A status mapping points to a missing status.", 400);
@@ -264,6 +273,18 @@ export const replaceWorkflow = async (
         UPDATE public.task_statuses SET deleted_at = now(), deleted_by = ${context.user.id}
         WHERE id = ANY(${removed}::uuid[])
       `;
+    }
+
+    // The stored result must be a valid workflow whatever the request looked like.
+    const final = await loadScopeStatuses(tx, organizationId, scope, projectId, listId);
+    const valid =
+      final.length > 0 &&
+      final[0]?.category === "active" &&
+      final[0]?.is_initial === true &&
+      final.filter((status) => status.is_initial).length === 1 &&
+      final.some((status) => status.category !== "active");
+    if (!valid) {
+      throw new AppError("WORKFLOW_INVALID", "Quy trình không hợp lệ: cần trạng thái đầu là trạng thái mở và ít nhất một trạng thái hoàn thành.", 400);
     }
   });
 

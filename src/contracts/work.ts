@@ -2,11 +2,16 @@ import { z } from "zod";
 
 import { createCursorPageSchema } from "./pagination.js";
 import { RichTextDocSchema } from "./rich-text.js";
+import { FileNameSchema, IsoDateInputSchema, MimeTypeSchema, SafeLineSchema, SafeMultilineSchema, SafeSearchSchema } from "./schemas.js";
 
 /** Work management contract (projects, lists, statuses, tasks, comments, attachments). Shared FE/BE. */
 
 const Id = z.string().uuid();
 const IsoDate = z.string().datetime({ offset: true });
+/** Request dates: year 1970–2100 (responses use IsoDate). */
+const IsoDateInput = IsoDateInputSchema;
+
+const atLeastOneField = (value: Record<string, unknown>) => Object.values(value).some((entry) => entry !== undefined);
 
 export const colorTokens = [
   "slate",
@@ -69,20 +74,26 @@ export type List = z.infer<typeof ListSchema>;
 
 export const CreateListRequestSchema = z
   .object({
-    name: z.string().trim().min(1).max(160),
-    description: z.string().trim().max(1000).nullable().optional(),
+    name: SafeLineSchema(160),
+    description: SafeMultilineSchema(1000).nullable().optional(),
     color: ColorTokenSchema.nullable().optional()
   })
   .strict();
 
 export const UpdateListRequestSchema = z
   .object({
-    name: z.string().trim().min(1).max(160).optional(),
-    description: z.string().trim().max(1000).nullable().optional(),
+    name: SafeLineSchema(160).optional(),
+    description: SafeMultilineSchema(1000).nullable().optional(),
     color: ColorTokenSchema.nullable().optional(),
     placement: PlacementSchema.optional()
   })
-  .strict();
+  .strict()
+  .refine(atLeastOneField, { message: "At least one field is required." });
+
+/** GET /projects/:id/archived-lists — lists that can be restored (POST /projects/:id/lists/:listId/restore). */
+export const ArchivedListSchema = ListSchema.extend({ archivedAt: IsoDate });
+export type ArchivedList = z.infer<typeof ArchivedListSchema>;
+export const ArchivedListCollectionSchema = z.object({ items: z.array(ArchivedListSchema) });
 
 // Projects ----------------------------------------------------------------------------------------
 
@@ -125,8 +136,8 @@ export const ProjectKeySchema = z
 export const CreateProjectRequestSchema = z
   .object({
     key: ProjectKeySchema,
-    name: z.string().trim().min(1).max(160),
-    description: z.string().trim().max(1000).nullable().optional(),
+    name: SafeLineSchema(160),
+    description: SafeMultilineSchema(1000).nullable().optional(),
     visibility: ProjectVisibilitySchema.default("private"),
     color: ColorTokenSchema.default("indigo"),
     icon: ProjectIconSchema.nullable().optional()
@@ -134,18 +145,35 @@ export const CreateProjectRequestSchema = z
   .strict();
 export type CreateProjectRequest = z.infer<typeof CreateProjectRequestSchema>;
 
+/**
+ * Changing the key keeps the old one as an alias: old task links (OLD-12) still resolve and the old key is
+ * never given to another project.
+ */
 export const UpdateProjectRequestSchema = z
   .object({
     key: ProjectKeySchema.optional(),
-    name: z.string().trim().min(1).max(160).optional(),
-    description: z.string().trim().max(1000).nullable().optional(),
+    name: SafeLineSchema(160).optional(),
+    description: SafeMultilineSchema(1000).nullable().optional(),
     visibility: ProjectVisibilitySchema.optional(),
     color: ColorTokenSchema.optional(),
     icon: ProjectIconSchema.nullable().optional(),
     placement: PlacementSchema.optional()
   })
-  .strict();
+  .strict()
+  .refine(atLeastOneField, { message: "At least one field is required." });
 export type UpdateProjectRequest = z.infer<typeof UpdateProjectRequestSchema>;
+
+/** GET /projects/archived (project.delete + manage access); POST /projects/:id/restore brings one back. */
+export const ArchivedProjectSchema = z.object({
+  id: Id,
+  key: z.string(),
+  name: z.string(),
+  color: ColorTokenSchema,
+  visibility: ProjectVisibilitySchema,
+  archivedAt: IsoDate
+});
+export type ArchivedProject = z.infer<typeof ArchivedProjectSchema>;
+export const ArchivedProjectCollectionSchema = z.object({ items: z.array(ArchivedProjectSchema) });
 
 export const ProjectMemberSchema = z.object({
   user: UserRefSchema,
@@ -193,7 +221,7 @@ export const ReplaceWorkflowRequestSchema = z
         z
           .object({
             id: Id.optional(),
-            name: z.string().trim().min(1).max(80),
+            name: SafeLineSchema(80),
             category: StatusCategorySchema,
             color: ColorTokenSchema
           })
@@ -303,16 +331,17 @@ export const TaskQuerySchema = z.object({
   priorities: csv(TaskPrioritySchema),
   /** "overdue" and "none" are timezone-independent; date windows (today/this week) come as dueFrom/dueTo from the client. */
   due: z.enum(["overdue", "none"]).optional(),
-  dueFrom: IsoDate.optional(),
-  dueTo: IsoDate.optional(),
+  dueFrom: IsoDateInput.optional(),
+  dueTo: IsoDateInput.optional(),
   includeDone: z
     .enum(["true", "false"])
     .default("true")
     .transform((value) => value === "true"),
-  q: z.string().trim().max(200).optional(),
+  q: SafeSearchSchema(200).optional(),
   sort: TaskSortSchema.default("rank"),
   order: z.enum(["asc", "desc"]).default("asc"),
-  cursor: z.string().max(500).optional(),
+  /** Opaque; title sorts carry the (lower-cased) title, so allow room for long non-ASCII titles. */
+  cursor: z.string().max(2000).optional(),
   limit: z.coerce.number().int().min(1).max(100).default(50)
 });
 export type TaskQuery = z.infer<typeof TaskQuerySchema>;
@@ -328,13 +357,13 @@ export const CreateTaskRequestSchema = z
   .object({
     listId: Id,
     parentTaskId: Id.nullable().optional(),
-    title: z.string().trim().min(1).max(240),
+    title: SafeLineSchema(240),
     description: RichTextDocSchema.nullable().optional(),
     statusId: Id.optional(),
     priority: TaskPrioritySchema.default("normal"),
     assigneeIds: z.array(Id).max(20).default([]),
-    startAt: IsoDate.nullable().optional(),
-    dueAt: IsoDate.nullable().optional(),
+    startAt: IsoDateInput.nullable().optional(),
+    dueAt: IsoDateInput.nullable().optional(),
     placement: PlacementSchema.optional()
   })
   .strict();
@@ -342,12 +371,12 @@ export type CreateTaskRequest = z.infer<typeof CreateTaskRequestSchema>;
 
 export const UpdateTaskRequestSchema = z
   .object({
-    title: z.string().trim().min(1).max(240).optional(),
+    title: SafeLineSchema(240).optional(),
     description: RichTextDocSchema.nullable().optional(),
     statusId: Id.optional(),
     priority: TaskPrioritySchema.optional(),
-    startAt: IsoDate.nullable().optional(),
-    dueAt: IsoDate.nullable().optional(),
+    startAt: IsoDateInput.nullable().optional(),
+    dueAt: IsoDateInput.nullable().optional(),
     assignees: AssigneeChangeSchema.optional()
   })
   .strict()
@@ -424,8 +453,8 @@ export const maxAttachmentBytes = 50 * 1024 * 1024;
 
 export const CreateUploadRequestSchema = z
   .object({
-    fileName: z.string().trim().min(1).max(255),
-    mimeType: z.string().trim().min(3).max(255),
+    fileName: FileNameSchema,
+    mimeType: MimeTypeSchema,
     sizeBytes: z.number().int().min(1).max(maxAttachmentBytes)
   })
   .strict();
@@ -458,7 +487,7 @@ export const TaskKeyLookupSchema = z.object({ id: Id, projectId: Id });
 // Directory ---------------------------------------------------------------------------------------
 
 export const DirectoryQuerySchema = z.object({
-  q: z.string().trim().max(120).optional(),
+  q: SafeSearchSchema(120).optional(),
   projectId: Id.optional(),
   channelId: Id.optional(),
   limit: z.coerce.number().int().min(1).max(50).default(20)
@@ -468,8 +497,8 @@ export const DirectoryCollectionSchema = z.object({ items: z.array(UserRefSchema
 /** "My tasks": tasks assigned to the caller across every project they can still see. */
 export const MyTasksQuerySchema = z.object({
   due: z.enum(["overdue", "none"]).optional(),
-  dueFrom: IsoDate.optional(),
-  dueTo: IsoDate.optional(),
+  dueFrom: IsoDateInput.optional(),
+  dueTo: IsoDateInput.optional(),
   includeDone: z
     .enum(["true", "false"])
     .default("false")

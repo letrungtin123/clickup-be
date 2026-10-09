@@ -1,6 +1,6 @@
 import { z } from "zod";
 
-import { PayModeSchema } from "./production-catalog.js";
+import { PayModeSchema, SafeText } from "./production-catalog.js";
 import { UserRefSchema } from "./work.js";
 
 /**
@@ -68,7 +68,10 @@ export type ScoreSummary = z.infer<typeof ScoreSummarySchema>;
 export const MyScoresQuerySchema = z.object({
   /** Default: the current KPI period. At most 366 days. */
   from: DateOnly.optional(),
-  to: DateOnly.optional()
+  to: DateOnly.optional(),
+  /** Next page of `entries` (pageInfo of the previous response); summary and cards are recomputed. */
+  cursor: SafeText().max(500).optional(),
+  limit: z.coerce.number().int().min(1).max(500).default(100)
 });
 
 /** GET /production/scores/me — own scores (money is always visible to its owner). */
@@ -83,9 +86,14 @@ export const MyScoresSchema = z.object({
     week: ScoreTotalsSchema,
     period: ScoreTotalsSchema.extend({ period: PeriodKeySchema, from: DateOnly, to: DateOnly })
   }),
-  /** Newest first; at most 1000 (summary always covers the whole range). */
+  /**
+   * One page of the range's entries, newest first (keyset by recording time, PERF-09); the summary always
+   * covers the whole range. More pages: pass `nextCursor` as `cursor`.
+   */
   entries: z.array(ScoreEntrySchema),
-  truncated: z.boolean()
+  /** More entries exist after this page (same as nextCursor !== null). */
+  truncated: z.boolean(),
+  nextCursor: z.string().nullable()
 });
 export type MyScores = z.infer<typeof MyScoresSchema>;
 
@@ -121,7 +129,10 @@ export const ScoreForecastSchema = z.object({
   pointsKhoan: z.number(),
   moneyKhoanProvisional: z.number().int(),
   remaining: z.number().nullable(),
-  /** Calendar days left to the close day, today included (0 once the period closed). */
+  /**
+   * Calendar days left to the close day, today and the close day both included (0 once the period closed):
+   * on the close day itself it is 1. `to` is the close day. (PR-24: the one convention for every screen.)
+   */
   daysLeft: z.number().int(),
   /** Of which Monday–Saturday. */
   workingDaysLeft: z.number().int(),
@@ -227,7 +238,7 @@ export const PutKpiTargetsRequestSchema = z
             /** QUARTER: 01/04/07/10; YEAR: 01. A version for the same start replaces it. */
             effectiveFrom: PeriodKeySchema,
             targetPoints: TargetPoints,
-            note: z.string().trim().max(500).optional()
+            note: SafeText().trim().max(500).optional()
           })
           .strict()
       )
@@ -240,7 +251,7 @@ export const KpiTargetCollectionSchema = z.object({ items: z.array(KpiTargetSche
 export const KpiTargetImportRequestSchema = z
   .object({
     /** Columns user_email,target (header required; other columns ignored). */
-    csv: z.string().min(1).max(1_000_000),
+    csv: SafeText().min(1).max(1_000_000),
     period: PeriodKeySchema,
     periodType: KpiPeriodTypeSchema.default("MONTH")
   })
@@ -338,7 +349,7 @@ export const KpiSettlementSchema = z.object({
 export type KpiSettlement = z.infer<typeof KpiSettlementSchema>;
 
 export const RunKpiSettlementRequestSchema = z
-  .object({ period: PeriodKeySchema, reason: z.string().trim().min(3, "Nhập lý do (ít nhất 3 ký tự).").max(500) })
+  .object({ period: PeriodKeySchema, reason: SafeText().trim().min(3, "Nhập lý do (ít nhất 3 ký tự).").max(500) })
   .strict();
 export const KpiSettlementRunResultSchema = z.object({ run: KpiSettlementRunSchema, items: z.array(KpiSettlementSchema) });
 export type KpiSettlementRunResult = z.infer<typeof KpiSettlementRunResultSchema>;

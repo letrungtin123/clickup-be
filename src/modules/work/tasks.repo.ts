@@ -27,8 +27,10 @@ export const taskColumnsSql = (sql: QuerySql) => sql`
     WHERE cm.organization_id = t.organization_id AND cm.task_id = t.id AND cm.deleted_at IS NULL
   ) AS comment_count,
   (
+    -- Task files only: comment files (sent or still in a comment draft) are not task attachments (WK-28).
     SELECT count(*)::int FROM public.task_attachments a
     WHERE a.organization_id = t.organization_id AND a.task_id = t.id AND a.status = 'ready' AND a.deleted_at IS NULL
+      AND a.comment_id IS NULL AND a.purpose = 'task'
   ) AS attachment_count
 `;
 
@@ -78,20 +80,17 @@ export type TaskCore = {
   number: string;
 };
 
-/** Loads an active task inside the caller's organization (optionally locking it). */
+/** Loads an active task (not in the trash, not in an archived list) inside the caller's organization, optionally locked. */
 export const loadTaskCore = async (sql: QuerySql, context: AccessContext, taskId: string, lock = false) => {
-  const rows = lock
-    ? await sql<TaskCore[]>`
-        SELECT id, project_id, list_id, parent_task_id, status_id, title, priority, start_at, due_at, completed_at, created_by, number::text
-        FROM public.tasks
-        WHERE id = ${taskId} AND organization_id = ${context.organization.id} AND deleted_at IS NULL AND archived_at IS NULL
-        FOR UPDATE
-      `
-    : await sql<TaskCore[]>`
-        SELECT id, project_id, list_id, parent_task_id, status_id, title, priority, start_at, due_at, completed_at, created_by, number::text
-        FROM public.tasks
-        WHERE id = ${taskId} AND organization_id = ${context.organization.id} AND deleted_at IS NULL AND archived_at IS NULL
-      `;
+  const rows = await sql<TaskCore[]>`
+    SELECT t.id, t.project_id, t.list_id, t.parent_task_id, t.status_id, t.title, t.priority, t.start_at, t.due_at,
+      t.completed_at, t.created_by, t.number::text
+    FROM public.tasks t
+    JOIN public.lists l ON l.id = t.list_id AND l.organization_id = t.organization_id
+      AND l.archived_at IS NULL AND l.deleted_at IS NULL
+    WHERE t.id = ${taskId} AND t.organization_id = ${context.organization.id} AND t.deleted_at IS NULL AND t.archived_at IS NULL
+    ${lock ? sql`FOR UPDATE OF t` : sql``}
+  `;
   const task = rows[0];
   if (!task) {
     throw new AppError("TASK_NOT_FOUND", "Task was not found.", 404);

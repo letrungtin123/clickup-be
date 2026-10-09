@@ -2,6 +2,8 @@ import { Router, type Router as ExpressRouter } from "express";
 import { z } from "zod";
 
 import {
+  ArchivedListCollectionSchema,
+  ArchivedProjectCollectionSchema,
   AttachmentSchema,
   AttachmentUrlCollectionSchema,
   AttachmentUrlRequestSchema,
@@ -38,6 +40,7 @@ import {
   UploadTicketSchema,
   UpsertProjectMemberRequestSchema
 } from "../../contracts/work.js";
+import { hasControlCharacters } from "../../contracts/schemas.js";
 import { requireSupabaseUser } from "../../middleware/auth.js";
 import { createAttachmentUrls, completeTaskUpload, createTaskUpload, deleteAttachment } from "./attachments.service.js";
 import { searchDirectory } from "./directory.service.js";
@@ -52,9 +55,13 @@ import {
   createList,
   createProject,
   getProject,
+  listArchivedLists,
+  listArchivedProjects,
   listProjectMembers,
   listProjects,
   removeProjectMember,
+  restoreList,
+  restoreProject,
   updateList,
   updateProject,
   upsertProjectMember
@@ -62,10 +69,16 @@ import {
 
 export const createWorkRoutes = (): ExpressRouter => {
   const routes = Router();
-  routes.use(requireSupabaseUser);
+  // Scoped to this module's paths: unknown routes fall through to the 404 handler instead of a 401 (WK-60).
+  routes.use(["/projects", "/tasks", "/attachments", "/directory"], requireSupabaseUser);
 
   // Projects
   routes.get("/projects", handle(async (context) => ProjectCollectionSchema.parse(await listProjects(context))));
+  routes.get("/projects/archived", handle(async (context) => ArchivedProjectCollectionSchema.parse(await listArchivedProjects(context))));
+  routes.post(
+    "/projects/:projectId/restore",
+    handle(async (context, req) => ProjectSchema.parse(await restoreProject(context, param(req, "projectId"))))
+  );
   routes.post(
     "/projects",
     handle(async (context, req) => ProjectSchema.parse(await createProject(context, CreateProjectRequestSchema.parse(req.body))), 201)
@@ -96,10 +109,12 @@ export const createWorkRoutes = (): ExpressRouter => {
     "/projects/:projectId/members/:userId",
     handle(async (context, req) =>
       ProjectMemberSchema.parse(
-        await upsertProjectMember(context, param(req, "projectId"), {
-          userId: param(req, "userId"),
-          ...UpdateProjectMemberRequestSchema.parse(req.body)
-        })
+        await upsertProjectMember(
+          context,
+          param(req, "projectId"),
+          { userId: param(req, "userId"), ...UpdateProjectMemberRequestSchema.parse(req.body) },
+          "update"
+        )
       )
     )
   );
@@ -128,6 +143,14 @@ export const createWorkRoutes = (): ExpressRouter => {
   routes.delete(
     "/projects/:projectId/lists/:listId",
     handle(async (context, req) => await archiveList(context, param(req, "projectId"), param(req, "listId")))
+  );
+  routes.get(
+    "/projects/:projectId/archived-lists",
+    handle(async (context, req) => ArchivedListCollectionSchema.parse(await listArchivedLists(context, param(req, "projectId"))))
+  );
+  routes.post(
+    "/projects/:projectId/lists/:listId/restore",
+    handle(async (context, req) => ListSchema.parse(await restoreList(context, param(req, "projectId"), param(req, "listId"))))
   );
 
   // Status workflows (?listId= for a list's effective workflow)
@@ -161,7 +184,7 @@ export const createWorkRoutes = (): ExpressRouter => {
   routes.get("/tasks/mine", handle(async (context, req) => TaskPageSchema.parse(await listMyTasks(context, MyTasksQuerySchema.parse(req.query)))));
   routes.get(
     "/tasks/by-key/:key",
-    handle(async (context, req) => TaskKeyLookupSchema.parse(await lookupTaskByKey(context, z.string().max(40).parse(req.params.key))))
+    handle(async (context, req) => TaskKeyLookupSchema.parse(await lookupTaskByKey(context, TaskKeyParamSchema.parse(req.params.key))))
   );
   routes.get("/tasks/:taskId", handle(async (context, req) => TaskDetailSchema.parse(await getTaskDetail(context, param(req, "taskId")))));
   routes.patch(
@@ -249,3 +272,6 @@ const TimelineQuerySchema = z.object({
   cursor: z.string().max(500).optional(),
   limit: z.coerce.number().int().min(1).max(100).default(30)
 });
+
+/** "PRJ-12" keys: short plain text only. */
+const TaskKeyParamSchema = z.string().max(40).refine((value) => !hasControlCharacters(value));

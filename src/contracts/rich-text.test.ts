@@ -95,3 +95,40 @@ describe("sanitizeRichText", () => {
     expect(() => sanitizeRichText({ type: "nope" }, commentLimits)).toThrow(RichTextError);
   });
 });
+
+describe("sanitizeRichText hardening", () => {
+  const otherId = "4a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d";
+  const paragraph = (...content: unknown[]) => ({ type: "doc", content: [{ type: "paragraph", content }] });
+
+  it("drops control characters (NUL is not storable) but keeps tabs and line breaks", () => {
+    const nul = String.fromCharCode(0);
+    const bell = String.fromCharCode(7);
+    const { text, doc } = sanitizeRichText(paragraph({ type: "text", text: `a${nul}b${bell}c\td` }), commentLimits);
+    expect(text).toBe("abc\td");
+    expect(JSON.stringify(doc)).not.toContain(`${String.fromCharCode(92)}u0000`);
+  });
+
+  it("uses server-side mention labels: no spoofed names (SEC-API-10)", () => {
+    const labels = new Map([[userId, "Minh Nguyễn"]]);
+    const { doc, text, mentions } = sanitizeRichText(
+      paragraph({ type: "mention", attrs: { id: userId, label: "CEO" } }, { type: "mention", attrs: { id: otherId, label: "Giám đốc" } }),
+      commentLimits,
+      { mentionLabels: labels }
+    );
+    expect(mentions).toEqual([userId]);
+    expect(text).toBe("@Minh Nguyễn@Giám đốc");
+    expect(doc.content?.[0]?.content).toEqual([
+      { type: "mention", attrs: { id: userId, label: "Minh Nguyễn" } },
+      // Not a person of the organization: plain text, not a mention chip.
+      { type: "text", text: "@Giám đốc" }
+    ]);
+  });
+
+  it("counts mention labels and line breaks toward the stored text limit (WK-24)", () => {
+    const limits = { ...commentLimits, maxTextLength: 50 };
+    const mentionsOnly = Array.from({ length: 10 }, () => ({ type: "mention", attrs: { id: userId, label: "x".repeat(10) } }));
+    expect(() => sanitizeRichText(paragraph(...mentionsOnly), limits)).toThrow(RichTextError);
+    const manyParagraphs = { type: "doc", content: Array.from({ length: 30 }, () => ({ type: "paragraph", content: [{ type: "text", text: "a" }] })) };
+    expect(() => sanitizeRichText(manyParagraphs, limits)).toThrow(RichTextError);
+  });
+});

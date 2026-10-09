@@ -202,25 +202,25 @@ export const deleteKpiTarget = async (context: AccessContext, targetId: string) 
 /**
  * POST /production/kpi-targets/import — CSV user_email,target for one period. All-or-nothing: any bad
  * line (format, duplicate, unknown member) is reported with its line number and nothing is written.
+ * Unknown emails are reported together with the format errors of the same file (PR-25), line by line.
  */
 export const importKpiTargets = async (context: AccessContext, input: In<typeof KpiTargetImportRequestSchema>): Promise<KpiTargetImportResult> => {
   assertProductionAdmin(context);
   assertAligned(input.periodType, input.period);
   const organizationId = org(context);
   const { rows, errors } = parseKpiTargetCsv(input.csv);
-  if (errors.length > 0) {
-    return { ok: false, imported: 0, errors };
-  }
   const sql = getSql();
   const emails = rows.map((row) => row.email);
   const users = new Map(
-    (
-      await sql<{ email: string; id: string }[]>`
-        SELECT lower(au.email) AS email, au.id FROM public.app_users au
-        JOIN public.organization_memberships om ON om.user_id = au.id AND om.organization_id = ${organizationId} AND om.deleted_at IS NULL
-        WHERE au.deleted_at IS NULL AND lower(au.email) = ANY(${emails}::text[])
-      `
-    ).map((row) => [row.email, row.id])
+    emails.length === 0
+      ? []
+      : (
+          await sql<{ email: string; id: string }[]>`
+            SELECT lower(au.email) AS email, au.id FROM public.app_users au
+            JOIN public.organization_memberships om ON om.user_id = au.id AND om.organization_id = ${organizationId} AND om.deleted_at IS NULL
+            WHERE au.deleted_at IS NULL AND lower(au.email) = ANY(${emails}::text[])
+          `
+        ).map((row) => [row.email, row.id])
   );
   for (const row of rows) {
     if (!users.has(row.email)) {
@@ -228,7 +228,7 @@ export const importKpiTargets = async (context: AccessContext, input: In<typeof 
     }
   }
   if (errors.length > 0) {
-    return { ok: false, imported: 0, errors };
+    return { ok: false, imported: 0, errors: errors.sort((a, b) => a.line - b.line) };
   }
   await sql.begin(async (tx) => {
     await upsertTargets(

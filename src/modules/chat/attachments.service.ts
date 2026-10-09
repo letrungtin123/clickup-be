@@ -6,18 +6,21 @@ import { getSql } from "../../db/client.js";
 import { AppError } from "../../lib/app-error.js";
 import { logger } from "../../lib/logger.js";
 import {
+  baseMime,
   createSignedDownloadUrl,
   createSignedUploadUrl,
   getObjectInfo,
-  isBlockedMimeType,
+  isAllowedUploadType,
   removeObjects,
   sanitizeFileName,
-  storageSafeSegment
+  storageSafeSegment,
+  uploadTypeRejected
 } from "../../lib/storage.js";
 import type { AccessContext } from "../access/access-context.js";
 import { assertCanPost, loadChannel, requireChannel } from "./chat-access.js";
 import { isInlineImage, toAttachment } from "./chat-mappers.js";
 import { consumeChatQuota } from "./chat-rate-limit.js";
+import { assertChatAttachmentsEnabled } from "./chat-settings.js";
 
 /** Chat files follow the owning channel's authorization (product §28, §50). */
 
@@ -26,16 +29,16 @@ const uploadTtlMs = 2 * 60 * 60 * 1000;
 const maxUnsentPerHour = 50;
 
 const notFound = () => new AppError("CHAT_ATTACHMENT_NOT_FOUND", "Attachment was not found.", 404);
-const baseMime = (mimeType: string) => mimeType.toLowerCase().split(";")[0]!.trim();
 
 /** Step 1: authorize (submit access), record a pending attachment, return a signed direct-upload URL. */
 export const createChatUpload = async (context: AccessContext, channelId: string, input: ChatUploadRequest): Promise<ChatUploadTicket> => {
   const mimeType = baseMime(input.mimeType);
-  if (isBlockedMimeType(mimeType)) {
-    throw new AppError("CHAT_ATTACHMENT_TYPE_BLOCKED", "This file type is not allowed.", 400);
+  if (!isAllowedUploadType(mimeType)) {
+    throw uploadTypeRejected("CHAT_ATTACHMENT_TYPE_BLOCKED");
   }
   const sql = getSql();
   assertCanPost(await requireChannel(sql, context, channelId));
+  await assertChatAttachmentsEnabled(sql, context.organization.id);
   await consumeChatQuota("upload", context.user.id);
 
   // Bound abandoned uploads per user.
@@ -111,6 +114,7 @@ export const completeChatUpload = async (context: AccessContext, attachmentId: s
     return toAttachment(row);
   }
   assertCanPost(resolved);
+  await assertChatAttachmentsEnabled(getSql(), context.organization.id);
 
   const info = await getObjectInfo(row.storage_path);
   if (!info || info.size === null) {
@@ -124,13 +128,14 @@ export const completeChatUpload = async (context: AccessContext, attachmentId: s
     await discard(context, row);
     throw new AppError("CHAT_ATTACHMENT_TOO_LARGE", "The uploaded file is larger than allowed.", 400);
   }
-  // Trust what storage will actually serve: it decides inline rendering vs download.
+  // Storage serves the Content-Type sent with the upload (it decides inline rendering vs download): it must be
+  // the declared, allowed type (SEC-API-01).
   const storedType = info.contentType ? baseMime(info.contentType) : null;
-  if (storedType && isBlockedMimeType(storedType)) {
+  if (!storedType || storedType !== baseMime(row.mime_type) || !isAllowedUploadType(storedType)) {
     await discard(context, row);
-    throw new AppError("CHAT_ATTACHMENT_TYPE_BLOCKED", "This file type is not allowed.", 400);
+    throw new AppError("CHAT_ATTACHMENT_TYPE_MISMATCH", "Loại tệp đã tải lên không khớp với loại đã khai báo.", 400);
   }
-  const mimeType = storedType && storedType.length >= 3 ? storedType : row.mime_type;
+  const mimeType = storedType;
 
   await getSql()`
     UPDATE public.message_attachments

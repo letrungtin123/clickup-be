@@ -161,6 +161,22 @@ describe("report SQL builder", () => {
     expect(query.text).toContain("LEFT JOIN production.projects p");
   });
 
+  it("PR-17: the KPI period of score entries follows the CURRENT close day, not the stored period_month", () => {
+    const query = build({ dimensions: ["period"], measures: ["points", "task_count"] });
+    expect(query.text).toMatch(/date_trunc\('month', \(e\.business_day - \$\d+::int\) \+ interval '1 month'\)/);
+    expect(query.text).not.toContain("period_month");
+    expect(query.params).toContain(25);
+  });
+
+  it("PR-09: jobState filters both sources on the job's archive state; OPEN means not Done and not closed", () => {
+    const query = build({ dimensions: ["job"], measures: ["late_count", "points"], taskDate: "DEADLINE", filters: { taskState: "OPEN", jobState: "ACTIVE" } });
+    expect(query.text).toContain("JOIN production.jobs j ON j.organization_id = e.organization_id AND j.id = e.job_id");
+    expect(query.text.match(/j\.archived_at IS NULL/g)).toHaveLength(2);
+    expect(query.text).toContain("t.done_at IS NULL AND t.closed_at IS NULL");
+    const archived = build({ measures: ["task_count"], filters: { jobState: "ARCHIVED" } });
+    expect(archived.text).toContain("j.archived_at IS NOT NULL");
+  });
+
   it("KPI period dimension binds the close day; totals-only reports have no GROUP BY", () => {
     const query = build({ dimensions: ["period"], measures: ["task_count"] });
     expect(query.text).toMatch(/date_trunc\('month', \(\(t\.done_at AT TIME ZONE \$\d+::text\)::date - \$\d+::int\) \+ interval '1 month'\)/);
@@ -255,5 +271,20 @@ describe("report permissions", () => {
     expect(errorCode(() => assertReportAllowed(contextWith(["LEADER"]), pointsByTeam, false))).toBeNull();
     expect(errorCode(() => assertReportAllowed(contextWith(["LEADER"]), config({ dimensions: ["user"], measures: ["task_count"] }), false))).toBeNull();
     expect(errorCode(() => assertReportAllowed(contextWith(["ADMIN"]), pointsByUser, false))).toBeNull();
+  });
+
+  it("PR-11: private scores — no points by job either (a job is often one person), nor through job / tag filters", () => {
+    const leader = contextWith(["LEADER"]);
+    const job = "55555555-5555-4555-8555-555555555555";
+    expect(errorCode(() => assertReportAllowed(leader, config({ dimensions: ["job"], measures: ["points"] }), false))).toEqual({ code: "SCORES_PRIVATE", status: 403 });
+    expect(errorCode(() => assertReportAllowed(leader, config({ dimensions: ["team"], measures: ["points_khoan"], filters: { job: [job] } }), false))).toEqual({
+      code: "SCORES_PRIVATE",
+      status: 403
+    });
+    expect(errorCode(() => assertReportAllowed(leader, config({ measures: ["points"], filters: { tag: [tag] } }), false))).toEqual({ code: "SCORES_PRIVATE", status: 403 });
+    // Public board, task measures, and Admins are unaffected.
+    expect(errorCode(() => assertReportAllowed(leader, config({ dimensions: ["job"], measures: ["points"] }), true))).toBeNull();
+    expect(errorCode(() => assertReportAllowed(leader, config({ dimensions: ["job"], measures: ["late_count"] }), false))).toBeNull();
+    expect(errorCode(() => assertReportAllowed(contextWith(["ADMIN"]), config({ dimensions: ["job"], measures: ["points"] }), false))).toBeNull();
   });
 });

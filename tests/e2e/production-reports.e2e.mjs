@@ -51,7 +51,9 @@ const fx = {
   later: randomUUID(),
   qtyTask: randomUUID(),
   qcFailTask: randomUUID(),
-  fastTask: randomUUID()
+  fastTask: randomUUID(),
+  archivedJob: randomUUID(),
+  archivedLate: randomUUID()
 };
 // 20 tasks done by MEMBER_B in May 2019: #1–#2 FB_WRONG (week of 06/05), #11–#13 is_late (week of 13/05),
 // #14 done after its deadline but NOT flagged late (only the flag counts), #18–#20 on the Khoán shift.
@@ -64,7 +66,7 @@ const oldTasks = Array.from({ length: 20 }, (_, index) => ({
   doneAfterDeadline: index === 13,
   khoan: index >= 17
 }));
-const allTaskIds = [...oldTasks.map((task) => task.id), fx.overdue, fx.dueSoon, fx.later, fx.qtyTask, fx.qcFailTask, fx.fastTask];
+const allTaskIds = [...oldTasks.map((task) => task.id), fx.overdue, fx.dueSoon, fx.later, fx.qtyTask, fx.qcFailTask, fx.fastTask, fx.archivedLate];
 const taskIdList = allTaskIds.map((id) => `'${id}'`).join(",");
 const lookup = `
   (SELECT id FROM production.processes WHERE organization_id = '${orgId}' AND name = 'Normal Retouch') AS normal,
@@ -97,7 +99,7 @@ const cleanup = () => {
     DELETE FROM production.tasks WHERE id IN (${taskIdList});
     DELETE FROM production.feedbacks WHERE id = '${fx.feedback}';
     DELETE FROM production.entity_tags WHERE tag_id IN ('${fx.tag}', '${fx.otherTag}');
-    DELETE FROM production.jobs WHERE id IN ('${fx.oldJob}', '${fx.liveJob}', '${fx.formulaJob}');
+    DELETE FROM production.jobs WHERE id IN ('${fx.oldJob}', '${fx.liveJob}', '${fx.formulaJob}', '${fx.archivedJob}');
     DELETE FROM production.projects WHERE id = '${fx.project}';
     DELETE FROM production.clients WHERE id = '${fx.client}';
     DELETE FROM production.tags WHERE id IN ('${fx.tag}', '${fx.otherTag}');
@@ -145,6 +147,9 @@ try {
       ('${fx.oldJob}', '${orgId}', '${fx.project}', 'E2ERP${stamp} may', '${leaderId}', '2019-05-25T18:00:00+07:00', 400, '${leaderId}'),
       ('${fx.liveJob}', '${orgId}', '${fx.project}', 'E2ERP${stamp} live', '${leaderId}', now() + interval '1 day', 100, '${leaderId}'),
       ('${fx.formulaJob}', '${orgId}', '${fx.project}', '=HYPERLINK("http://x") E2ERP${stamp}', '${adminId}', now() + interval '2 days', 5, '${adminId}');
+    -- An archived job with a late open task: in neither the "Job đang trễ" card nor its report (PR-09).
+    INSERT INTO production.jobs (id, organization_id, project_id, code, leader_id, deadline, total_images, created_by, archived_at)
+    VALUES ('${fx.archivedJob}', '${orgId}', '${fx.project}', 'E2ERP${stamp} archived', '${leaderId}', now() - interval '1 day', 5, '${leaderId}', now());
     INSERT INTO production.entity_tags (organization_id, entity, entity_id, tag_id) VALUES ('${orgId}', 'JOB', '${fx.oldJob}', '${fx.tag}');
     INSERT INTO production.feedbacks (id, organization_id, job_id, type, note, created_by, status)
     VALUES ('${fx.feedback}', '${orgId}', '${fx.oldJob}', 'WRONG', 'E2E', '${adminId}', 'RESOLVED');
@@ -183,6 +188,11 @@ try {
       ('${fx.qcFailTask}', 5, 5, now() - interval '30 hours', now() + interval '1 day', now() - interval '25 hours', 'C', false, 2),
       ('${fx.fastTask}', 6, 6, now() - interval '20 hours', now() + interval '1 day', now() - interval '20 hours' + interval '2 minutes', 'C', false, 0)
     ) AS v(id, qa, qd, assigned, deadline, done, st, late, fails);
+    INSERT INTO production.tasks (id, organization_id, job_id, assignee_id, qc_id, process_id, shift_id, qty_assigned,
+      assigned_at, deadline, status_id, is_late, late_notified_deadline, created_by)
+    SELECT '${fx.archivedLate}', '${orgId}', '${fx.archivedJob}', '${staffId}', '${leaderId}', l.normal, l.official, 3,
+      now() - interval '3 days', now() - interval '2 days', l.processing, true, now() - interval '2 days', '${leaderId}'
+    FROM (SELECT ${lookup}) l;
     INSERT INTO production.task_logs (organization_id, task_id, job_id, user_id, action, from_value, to_value, created_at) VALUES
       ('${orgId}', '${fx.qtyTask}', '${fx.liveJob}', '${staffId}', 'STATUS', '{"code":"PROCESSING"}', '{"code":"DONE","qtyDone":10}', now() - interval '26 hours'),
       ('${orgId}', '${fx.qtyTask}', '${fx.liveJob}', '${leaderId}', 'QTY', '{"qtyDone":10}', '{"qtyDone":8}', now() - interval '25 hours');
@@ -267,6 +277,10 @@ try {
   ok("scores private → LEADER cannot see points per person", r.status === 403 && r.body.error.code === "SCORES_PRIVATE");
   r = await query(leader, { dimensions: ["team"], measures: ["points"], ...may });
   ok("scores private → team totals still available", r.status === 200);
+  r = await query(leader, { dimensions: ["job"], measures: ["points"], ...may });
+  ok("PR-11: scores private → no points per job for a LEADER either", r.status === 403 && r.body.error.code === "SCORES_PRIVATE");
+  r = await query(leader, { dimensions: ["job"], measures: ["task_count"], ...may });
+  ok("PR-11: … task measures per job stay available", r.status === 200);
   await admin.call("PATCH", "/production/settings", { scoresPublic: originalSettings.scoresPublic });
 
   // Saved reports
@@ -279,6 +293,17 @@ try {
   ok("leader cannot save a money report", r.status === 403);
   r = await leader.call("POST", "/production/reports/saved", { name: `E2E pin ${stamp}`, config: savedConfig, pinned: true });
   ok("leader cannot pin", r.status === 403);
+  // PR-20: a shared report with money is the Admins' only
+  r = await admin.call("POST", "/production/reports/saved", { name: `E2E money ${stamp}`, config: { dimensions: ["user"], measures: ["points", "money_khoan"], ...may }, shared: true });
+  const moneyReport = r.body;
+  if (moneyReport?.id) savedIds.push(moneyReport.id);
+  ok("PR-20: admin shares a money report (flagged adminOnly)", r.status === 201 && moneyReport.shared === true && moneyReport.adminOnly === true, JSON.stringify(r.body?.error ?? ""));
+  r = await leader.call("GET", "/production/reports/saved");
+  ok("PR-20: … not listed for a LEADER", r.status === 200 && !r.body.items.some((item) => item.id === moneyReport.id) && r.body.items.every((item) => item.adminOnly === false));
+  r = await leader.call("GET", `/production/reports/saved/${moneyReport.id}`);
+  ok("PR-20: … nor openable (404)", r.status === 404);
+  r = await admin.call("GET", "/production/reports/saved");
+  ok("PR-20: … listed for Admins", r.body.items?.some((item) => item.id === moneyReport.id && item.adminOnly));
   r = await admin.call("GET", "/production/reports/saved");
   ok("private report hidden from others", r.status === 200 && !r.body.items.some((item) => item.id === mine.id));
   r = await admin.call("GET", `/production/reports/saved/${mine.id}`);
@@ -322,6 +347,18 @@ try {
   ok("admin dashboard: late job listed", cards?.lateJobs.items.some((item) => item.job.id === fx.liveJob && item.lateTaskCount >= 1));
   ok("admin dashboard: pinned saved report", r.body.pinned?.some((item) => item.id === mine.id));
   ok("admin dashboard: KPI buckets", cards?.kpiAttainment.buckets.length === 4 && cards.kpiAttainment.members >= cards.kpiAttainment.withoutTarget);
+  // PR-09: "Job đang trễ" and the report it opens agree (same definition; archived jobs in neither)
+  r = await query(admin, cards.lateJobs.config);
+  const lateRows = (r.body.rows ?? []).filter((item) => item.late_count > 0);
+  ok(
+    "PR-09: the late-jobs card equals its report (jobs with late tasks, late task count)",
+    r.status === 200 && r.body.totals.late_count === cards.lateJobs.taskCount && lateRows.length === cards.lateJobs.jobCount && cards.lateJobs.items.every((item) => lateRows.some((row) => row.job === item.job.id && row.late_count === item.lateTaskCount)),
+    `${r.body.totals?.late_count}/${cards.lateJobs.taskCount} ${lateRows.length}/${cards.lateJobs.jobCount}`
+  );
+  ok(
+    "PR-09: archived jobs are in neither",
+    !cards.lateJobs.items.some((item) => item.job.id === fx.archivedJob) && !(r.body.rows ?? []).some((item) => item.job === fx.archivedJob) && cards.lateJobs.items.some((item) => item.job.id === fx.liveJob)
+  );
   r = await query(admin, cards.fbRateByUser.config);
   ok("a card's config reproduces it", r.status === 200 && JSON.stringify(r.body.rows) === JSON.stringify(cards.fbRateByUser.result.rows));
   r = await leader.call("GET", "/production/dashboard/admin");
@@ -422,12 +459,31 @@ try {
   x = await download(admin, "GET", "/production/kpi/export?from=2019-05");
   ok("KPI export validates its query", x.status === 400);
 
+  // PR-17: the report's KPI period follows the CURRENT close day — like the board and the settlement
+  await admin.call("PATCH", "/production/settings", { kpiCloseDay: 10 });
+  r = await query(admin, { dimensions: ["period"], measures: ["points", "task_count"], ...may });
+  const byPeriod = Object.fromEntries((r.body.rows ?? []).map((item) => [item.period, item]));
+  ok(
+    "PR-17: close day 10 → May 6–10 in 2019-05, May 13–17 in 2019-06, for scores and tasks alike",
+    r.status === 200 && byPeriod["2019-05"]?.points === 125 && byPeriod["2019-05"].task_count === 10 && byPeriod["2019-06"]?.points === 105 && byPeriod["2019-06"].task_count === 10,
+    JSON.stringify(r.body.rows)
+  );
+  const boardJune = (await admin.call("GET", "/production/scores/board?period=2019-06")).body;
+  r = await query(admin, { dimensions: ["period", "user"], measures: ["points"], ...may });
+  const juneStaff = r.body.rows?.find((item) => item.period === "2019-06" && item.user === staffId);
+  ok("PR-17: … the same figure as the board's period", juneStaff?.points === boardJune.items?.find((item) => item.user.id === staffId)?.pointsOfficial && juneStaff.points === 105, JSON.stringify(juneStaff));
+  await admin.call("PATCH", "/production/settings", { kpiCloseDay: originalSettings.kpiCloseDay });
+
   // Saved report delete
   r = await leader.call("DELETE", `/production/reports/saved/${mine.id}`);
   ok("owner deletes", r.status === 200 && r.body.deleted);
 } finally {
   if (admin && originalSettings) {
-    await admin.call("PATCH", "/production/settings", { scoresPublic: originalSettings.scoresPublic, moneyPublic: originalSettings.moneyPublic });
+    await admin.call("PATCH", "/production/settings", {
+      scoresPublic: originalSettings.scoresPublic,
+      moneyPublic: originalSettings.moneyPublic,
+      kpiCloseDay: originalSettings.kpiCloseDay
+    });
   }
   cleanup();
 }

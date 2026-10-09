@@ -41,7 +41,13 @@ const listItemType: Record<string, "listItem" | "taskItem" | undefined> = {
 };
 const markTypes = new Set(["bold", "italic", "strike", "underline", "code", "link"]);
 const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-const safeHref = /^(https?:\/\/|mailto:)[^\s<>"']{1,2000}$/i;
+// eslint-disable-next-line no-control-regex -- control characters are rejected in links
+const safeHref = /^(https?:\/\/|mailto:)[^\s<>"'\u0000-\u001f\u007f]{1,2000}$/i;
+/** Control characters other than tab / line breaks are dropped (NUL is not storable in PostgreSQL text/jsonb). */
+// eslint-disable-next-line no-control-regex -- stripping control characters is intended
+const strayControlCharacters = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g;
+// eslint-disable-next-line no-control-regex -- stripping control characters is intended
+const labelControlCharacters = /[\u0000-\u001f\u007f\u202a-\u202e\u2066-\u2069]/g;
 
 export type SanitizeLimits = { maxTextLength: number; maxNodes: number; maxDepth: number; maxMentions: number };
 
@@ -56,12 +62,20 @@ export class RichTextError extends Error {
   }
 }
 
-type SanitizeResult = { doc: RichTextDoc; text: string; mentions: string[] };
+export type SanitizeResult = { doc: RichTextDoc; text: string; mentions: string[] };
+
+export type SanitizeOptions = {
+  /**
+   * Server-side mention labels (user id → current display name). When given, every mention label comes
+   * from here (clients cannot spoof "@CEO"), and mentions of ids missing from the map become plain text.
+   */
+  mentionLabels?: ReadonlyMap<string, string>;
+};
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
 
-export const sanitizeRichText = (input: unknown, limits: SanitizeLimits): SanitizeResult => {
+export const sanitizeRichText = (input: unknown, limits: SanitizeLimits, options: SanitizeOptions = {}): SanitizeResult => {
   if (!isRecord(input) || input.type !== "doc") {
     throw new RichTextError("Document must be a rich text doc.");
   }
@@ -108,7 +122,7 @@ export const sanitizeRichText = (input: unknown, limits: SanitizeLimits): Saniti
     const type = raw.type;
 
     if (type === "text") {
-      const text = typeof raw.text === "string" ? raw.text : "";
+      const text = typeof raw.text === "string" ? raw.text.replace(strayControlCharacters, "") : "";
       if (text.length === 0) {
         return null;
       }
@@ -132,13 +146,23 @@ export const sanitizeRichText = (input: unknown, limits: SanitizeLimits): Saniti
       if (!uuidPattern.test(id)) {
         return null;
       }
-      const label = typeof attrs.label === "string" ? attrs.label.slice(0, 160) : "";
-      mentions.add(id.toLowerCase());
+      const userId = id.toLowerCase();
+      const clientLabel = typeof attrs.label === "string" ? attrs.label.replace(labelControlCharacters, "").slice(0, 160) : "";
+      if (options.mentionLabels && !options.mentionLabels.has(userId)) {
+        // Not a person of this organization: keep what the user typed, as plain text.
+        const text = `@${clientLabel}`;
+        textLength += text.length;
+        textParts.push(text);
+        return { type: "text", text };
+      }
+      const label = options.mentionLabels?.get(userId)?.slice(0, 160) ?? clientLabel;
+      mentions.add(userId);
       if (mentions.size > limits.maxMentions) {
         throw new RichTextError("Too many mentions.");
       }
+      textLength += label.length + 1;
       textParts.push(`@${label}`);
-      return { type, attrs: { id: id.toLowerCase(), label } };
+      return { type, attrs: { id: userId, label } };
     }
 
     if (inline || !blockTypes.has(type)) {
@@ -285,6 +309,10 @@ export const sanitizeRichText = (input: unknown, limits: SanitizeLimits): Saniti
     .join("")
     .replace(/\n{3,}/g, "\n\n")
     .trim();
+  // The stored plain text (mention labels and line breaks included) is what the database limits (WK-24).
+  if (text.length > limits.maxTextLength) {
+    throw new RichTextError("Nội dung quá dài.");
+  }
 
   return { doc: { type: "doc", content }, text, mentions: [...mentions] };
 };

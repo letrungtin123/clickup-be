@@ -153,6 +153,24 @@ try {
   ok("entry has task link, owner sees own money", khoanEntry?.task.id === fx.tB2 && khoanEntry.task.jobCode === `E2ESC${stamp} job` && khoanEntry.money === 150000 && khoanEntry.period === "2020-03");
   ok("byDay covers every day of the range", s.byDay.length === 29 && s.byDay.find((d) => d.day === "2020-03-05").pointsOfficial === -6);
   ok("byProject (worker qty 10 − 2 + 10)", s.byProject.length === 1 && s.byProject[0].qty === 18 && s.byProject[0].pointsKhoan === 30);
+  // PERF-09: entries are paged with a keyset (summary still covers the whole range)
+  const allIds = (r.body.entries ?? []).map((e) => e.id);
+  const pagedIds = [];
+  let cursor = null;
+  let pages = 0;
+  do {
+    r = await staff.call("GET", `/production/scores/me?from=2020-02-26&to=2020-03-25&limit=1${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`);
+    pagedIds.push(...(r.body.entries ?? []).map((e) => e.id));
+    cursor = r.body.nextCursor;
+    pages += 1;
+  } while (cursor && pages < 10);
+  ok(
+    "entries paged one by one: every entry once, same order, summary unchanged",
+    pages === 4 && JSON.stringify(pagedIds) === JSON.stringify(allIds) && r.body.summary.pointsOfficial === 26 && r.body.truncated === false,
+    `${pages} ${JSON.stringify(pagedIds)}`
+  );
+  r = await staff.call("GET", "/production/scores/me?from=2020-02-26&to=2020-03-25&cursor=bm9wZQ");
+  ok("bad entries cursor → 400 (PR-16)", r.status === 400 && r.body.error.code === "INVALID_CURSOR");
   r = await staff.call("GET", "/production/scores/me");
   ok("default range = current period, with today/week/period cards", r.status === 200 && r.body.from <= r.body.today && r.body.today <= r.body.to && typeof r.body.cards.week.pointsOfficial === "number" && r.body.cards.period.period.length === 7);
   r = await staff.call("GET", "/production/scores/me?from=2020-03-10&to=2020-02-01");
@@ -211,16 +229,20 @@ try {
     csv: `user_email,target\n${email("MEMBER_B")},2.600\nnobody.${stamp.toLowerCase()}@nowhere.test,100\n${email("MEMBER_B").toUpperCase()},2400\n${email("MEMBER_A")},abc\n`,
     period: "2020-04"
   });
-  ok("bad CSV: format errors by line, nothing written", r.status === 200 && r.body.ok === false && r.body.errors.map((e) => e.line).join() === "4,5", JSON.stringify(r.body));
+  // PR-25: unknown emails are reported together with the format errors of the same file, in line order.
+  ok("bad CSV: format errors and unknown emails by line, nothing written", r.status === 200 && r.body.ok === false && r.body.errors.map((e) => e.line).join() === "3,4,5", JSON.stringify(r.body));
   r = await admin.call("POST", "/production/kpi-targets/import", { csv: `user_email,target\n${email("MEMBER_B")},2600\nnobody.${stamp.toLowerCase()}@nowhere.test,100\n`, period: "2020-04" });
   ok("unknown email reported by line, nothing written", r.body.ok === false && r.body.errors.map((e) => e.line).join() === "3", JSON.stringify(r.body));
   r = await admin.call("GET", "/production/kpi-targets?year=2020");
   ok("rejected imports left targets untouched", row(r.body, staffId).months[3].targetPoints === 100 && !row(r.body, staffId).months[3].explicit);
-  r = await admin.call("POST", "/production/kpi-targets/import", { csv: `user_email,target\n${email("MEMBER_B")},2.600\n${email("MEMBER_A")},"1,848"\n`, period: "2020-04" });
+  r = await admin.call("POST", "/production/kpi-targets/import", { csv: `user_email,target\n${email("MEMBER_B")},2.600\n${email("MEMBER_A")},"1.848,5"\n`, period: "2020-04" });
   ok("valid import", r.body.ok === true && r.body.imported === 2, JSON.stringify(r.body));
   r = await admin.call("GET", "/production/kpi-targets?year=2020");
   staffRow = row(r.body, staffId);
-  ok("imported versions effective from 2020-04", staffRow.months[3].targetPoints === 2600 && staffRow.months[3].explicit && row(r.body, leaderId).months[3].targetPoints === 1848);
+  ok(
+    "imported versions effective from 2020-04 (Vietnamese decimal \"1.848,5\", PR-25)",
+    staffRow.months[3].targetPoints === 2600 && staffRow.months[3].explicit && row(r.body, leaderId).months[3].targetPoints === 1848.5
+  );
   r = await admin.call("POST", "/production/kpi-targets/import", { csv: "user_email,target\na@b.co,1\n", period: "2020-05", periodType: "YEAR" });
   ok("YEAR import must start in January (400)", r.status === 400);
   r = await leader.call("POST", "/production/kpi-targets/import", { csv: `user_email,target\n${email("MEMBER_B")},1\n`, period: "2020-04" });
@@ -277,6 +299,22 @@ try {
   ok("scores_public off → ADMIN still sees the board", r.status === 200 && find(r.body, staffId)?.pointsOfficial === 26);
   r = await staff.call("GET", "/production/scores/me?from=2020-02-26&to=2020-03-25");
   ok("personal scores stay available when the board is private", r.status === 200 && r.body.summary.pointsOfficial === 26);
+
+  // PR-11: task score rows while scores are private — own rows only, except for ADMIN and the job's leader
+  const owners = (body) => [...new Set((body.items ?? []).map((item) => `${item.role}:${item.user.id}`))].sort().join();
+  r = await staff.call("GET", `/production/scores/task/${fx.tB1}`);
+  ok(
+    "private scores: the worker sees only own rows of the task (not the QC's)",
+    r.status === 200 && owners(r.body) === `WORKER:${staffId}` && r.body.totals.length === 1,
+    owners(r.body)
+  );
+  r = await leader.call("GET", `/production/scores/task/${fx.tB1}`);
+  ok("private scores: the job leader sees every row", r.status === 200 && owners(r.body) === [`QC:${leaderId}`, `WORKER:${staffId}`].sort().join(), owners(r.body));
+  r = await admin.call("GET", `/production/scores/task/${fx.tB1}`);
+  ok("private scores: ADMIN sees every row", r.status === 200 && r.body.items.length === 4);
+  await admin.call("PATCH", "/production/settings", { scoresPublic: true });
+  r = await staff.call("GET", `/production/scores/task/${fx.tB1}`);
+  ok("public scores: the worker sees the QC's points too", r.status === 200 && owners(r.body) === [`QC:${leaderId}`, `WORKER:${staffId}`].sort().join());
 } finally {
   await admin.call("PATCH", "/production/settings", { scoresPublic: originalSettings.scoresPublic, moneyPublic: originalSettings.moneyPublic });
   cleanup();

@@ -1,5 +1,6 @@
 import { Permission } from "../../contracts/permissions.js";
-import { descriptionLimits, RichTextError, sanitizeRichText, type RichTextDoc } from "../../contracts/rich-text.js";
+import { descriptionLimits, RichTextError, type RichTextDoc } from "../../contracts/rich-text.js";
+import { sanitizeWithMentionLabels } from "../../lib/mentions.js";
 import type {
   CreateTaskRequest,
   MoveTaskRequest,
@@ -38,9 +39,9 @@ import {
 
 const maxDepth = 7;
 
-const sanitizeDescription = (doc: unknown) => {
+const sanitizeDescription = async (sql: QuerySql, context: AccessContext, doc: unknown) => {
   try {
-    return sanitizeRichText(doc, descriptionLimits);
+    return await sanitizeWithMentionLabels(sql, context.organization.id, doc, descriptionLimits);
   } catch (error) {
     if (error instanceof RichTextError) {
       throw new AppError("INVALID_RICH_TEXT", error.message, 400);
@@ -50,6 +51,38 @@ const sanitizeDescription = (doc: unknown) => {
 };
 
 const isoOrNull = (value: Date | null) => (value ? toIso(value) : null);
+
+/** JSON with sorted object keys: jsonb reorders keys, so documents are compared canonically. */
+const canonicalJson = (value: unknown): string => {
+  if (Array.isArray(value)) {
+    return `[${value.map(canonicalJson).join(",")}]`;
+  }
+  if (value !== null && typeof value === "object") {
+    const entries = Object.entries(value as Record<string, unknown>)
+      .filter(([, entry]) => entry !== undefined)
+      .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+    return `{${entries.map(([key, entry]) => `${JSON.stringify(key)}:${canonicalJson(entry)}`).join(",")}}`;
+  }
+  return JSON.stringify(value);
+};
+
+/** Mention ids of a stored rich text document. */
+const collectMentionIds = (node: unknown, found: string[] = []): string[] => {
+  if (Array.isArray(node)) {
+    node.forEach((child) => collectMentionIds(child, found));
+  } else if (node !== null && typeof node === "object") {
+    const record = node as { type?: unknown; attrs?: { id?: unknown }; content?: unknown };
+    if (record.type === "mention" && typeof record.attrs?.id === "string") {
+      found.push(record.attrs.id.toLowerCase());
+    }
+    collectMentionIds(record.content, found);
+  }
+  return found;
+};
+
+/** Same instant? ("…T00:00:00Z" and "…T00:00:00.000Z" are one value: no "changed" activity for a no-op save, WK-31.) */
+const sameInstant = (a: string | null | undefined, b: string | null | undefined) =>
+  (a ?? null) === null || (b ?? null) === null ? (a ?? null) === (b ?? null) : new Date(a!).getTime() === new Date(b!).getTime();
 
 const assertDates = (startAt: string | null | undefined, dueAt: string | null | undefined) => {
   if (startAt && dueAt && new Date(dueAt).getTime() < new Date(startAt).getTime()) {
@@ -235,7 +268,7 @@ export const getTaskDetail = async (context: AccessContext, taskId: string, sql:
         (SELECT ${userJsonSql(sql)} FROM public.app_users au WHERE au.id = a.uploaded_by) AS uploaded_by
       FROM public.task_attachments a
       WHERE a.organization_id = ${context.organization.id} AND a.task_id = ${taskId}
-        AND a.comment_id IS NULL AND a.status = 'ready' AND a.deleted_at IS NULL
+        AND a.comment_id IS NULL AND a.purpose = 'task' AND a.status = 'ready' AND a.deleted_at IS NULL
       ORDER BY a.created_at DESC, a.id DESC
       LIMIT 100
     `
@@ -265,25 +298,47 @@ export const getTaskDetail = async (context: AccessContext, taskId: string, sql:
   };
 };
 
+/**
+ * Resolves "KEY-12" (current or former project key, WK-35). Every failure is the same 404 — without
+ * task.view too — so the endpoint never tells which keys exist (SEC-API-11).
+ */
 export const lookupTaskByKey = async (context: AccessContext, key: string) => {
+  const notFound = () => new AppError("TASK_NOT_FOUND", "Task was not found.", 404);
   const match = /^([A-Za-z][A-Za-z0-9]{1,11})-(\d{1,12})$/.exec(key.trim());
-  if (!match) {
-    throw new AppError("TASK_NOT_FOUND", "Task was not found.", 404);
+  if (!match || !hasPermission(context, Permission.TaskView)) {
+    throw notFound();
   }
+  const projectKey = match[1]!.toUpperCase();
   const sql = getSql();
   const row = (
     await sql<{ id: string; project_id: string }[]>`
       SELECT t.id, t.project_id FROM public.tasks t
       JOIN public.projects p ON p.id = t.project_id AND p.organization_id = t.organization_id
-      WHERE t.organization_id = ${context.organization.id} AND p.key = ${match[1]!.toUpperCase()}
+      WHERE t.organization_id = ${context.organization.id}
         AND p.deleted_at IS NULL AND t.number = ${Number(match[2])} AND t.deleted_at IS NULL
+        AND (
+          p.key = ${projectKey}
+          OR p.id = (
+            SELECT a.project_id FROM public.project_key_aliases a
+            WHERE a.organization_id = ${context.organization.id} AND a.key = ${projectKey}
+            LIMIT 1
+          )
+        )
+      ORDER BY (p.key = ${projectKey}) DESC
       LIMIT 1
     `
   )[0];
   if (!row) {
-    throw new AppError("TASK_NOT_FOUND", "Task was not found.", 404);
+    throw notFound();
   }
-  await authorizeTask(sql, context, row.id, "view");
+  try {
+    await authorizeTask(sql, context, row.id, "view");
+  } catch (error) {
+    if (error instanceof AppError && (error.statusCode === 403 || error.statusCode === 404)) {
+      throw notFound();
+    }
+    throw error;
+  }
   return { id: row.id, projectId: row.project_id };
 };
 
@@ -295,8 +350,8 @@ export const createTask = async (context: AccessContext, projectId: string, inpu
     assertPermission(context, Permission.TaskAssign);
   }
   assertDates(input.startAt, input.dueAt);
-  const description = input.description ? sanitizeDescription(input.description) : null;
   const sql = getSql();
+  const description = input.description ? await sanitizeDescription(sql, context, input.description) : null;
 
   const created = await sql.begin(async (tx) => {
     await assertProjectAccess(context, projectId, "submit", tx);
@@ -433,14 +488,23 @@ export const updateTask = async (context: AccessContext, taskId: string, input: 
   if (assigneeAdd.length > 0 || assigneeRemove.length > 0) {
     assertPermission(context, Permission.TaskAssign);
   }
-  const description = input.description ? sanitizeDescription(input.description) : null;
   const sql = getSql();
+  const description = input.description ? await sanitizeDescription(sql, context, input.description) : null;
 
   const result = await sql.begin(async (tx) => {
     const { task } = await authorizeTask(tx, context, taskId, "submit", true);
     const nextStart = input.startAt !== undefined ? input.startAt : isoOrNull(task.start_at);
     const nextDue = input.dueAt !== undefined ? input.dueAt : isoOrNull(task.due_at);
     assertDates(nextStart, nextDue);
+    const previousDescription = input.description !== undefined
+      ? (
+          await tx<{ description_json: Record<string, unknown> | null }[]>`
+            SELECT description_json FROM public.tasks WHERE id = ${taskId} AND organization_id = ${context.organization.id}
+          `
+        )[0]?.description_json ?? null
+      : null;
+    const descriptionChanged =
+      input.description !== undefined && canonicalJson(previousDescription ?? {}) !== canonicalJson(description?.doc ?? {});
 
     const activities: ActivityInput[] = [];
     const events: DomainEventInput[] = [];
@@ -456,11 +520,23 @@ export const updateTask = async (context: AccessContext, taskId: string, input: 
       }
     }
 
-    // Spec §10: reassigning completed work reopens it to the workflow's initial status.
+    // Spec §10: reassigning completed work to someone new reopens it to the workflow's initial status.
+    // Re-adding a current assignee changes nothing and must not reopen the task (WK-20).
     const added = assigneeAdd.length > 0 ? await assertAssignable(tx, context, task.project_id, assigneeAdd) : [];
     const removed = [...new Set(assigneeRemove)].filter((id) => !added.includes(id));
+    const currentAssignees = new Set(
+      added.length > 0
+        ? (
+            await tx<{ assignee_user_id: string }[]>`
+              SELECT assignee_user_id FROM public.task_assignees
+              WHERE organization_id = ${context.organization.id} AND task_id = ${taskId} AND removed_at IS NULL
+            `
+          ).map((row) => row.assignee_user_id)
+        : []
+    );
+    const reallyAdded = added.filter((id) => !currentAssignees.has(id));
     let reopened = false;
-    if (added.length > 0 && task.completed_at && (nextStatus?.isDone ?? true) && input.statusId === undefined) {
+    if (reallyAdded.length > 0 && task.completed_at && (nextStatus?.isDone ?? true) && input.statusId === undefined) {
       const initial = workflow.items.find((item) => item.isInitial) ?? workflow.items[0];
       if (initial && !initial.isDone) {
         nextStatus = initial;
@@ -491,19 +567,22 @@ export const updateTask = async (context: AccessContext, taskId: string, input: 
     if (input.title !== undefined && input.title !== task.title) {
       activities.push({ taskId, action: "TASK_TITLE_CHANGED", previousValue: { title: task.title }, newValue: { title: input.title } });
     }
-    if (input.description !== undefined) {
+    if (descriptionChanged) {
       activities.push({ taskId, action: "TASK_DESCRIPTION_CHANGED" });
-      if (description && description.mentions.length > 0) {
-        events.push(await mentionEvent(tx, context, task.project_id, taskId, input.title ?? task.title, description.mentions, "description"));
+      // Only people newly mentioned by this edit are notified.
+      const previouslyMentioned = new Set(collectMentionIds(previousDescription));
+      const newMentions = (description?.mentions ?? []).filter((id) => !previouslyMentioned.has(id));
+      if (newMentions.length > 0) {
+        events.push(await mentionEvent(tx, context, task.project_id, taskId, input.title ?? task.title, newMentions, "description"));
       }
     }
     if (input.priority !== undefined && input.priority !== task.priority) {
       activities.push({ taskId, action: "TASK_PRIORITY_CHANGED", previousValue: { priority: task.priority }, newValue: { priority: input.priority } });
     }
-    if (input.startAt !== undefined && input.startAt !== isoOrNull(task.start_at)) {
+    if (input.startAt !== undefined && !sameInstant(input.startAt, isoOrNull(task.start_at))) {
       activities.push({ taskId, action: "TASK_START_DATE_CHANGED", previousValue: { startAt: isoOrNull(task.start_at) }, newValue: { startAt: input.startAt } });
     }
-    if (input.dueAt !== undefined && input.dueAt !== isoOrNull(task.due_at)) {
+    if (input.dueAt !== undefined && !sameInstant(input.dueAt, isoOrNull(task.due_at))) {
       activities.push({ taskId, action: "TASK_DUE_DATE_CHANGED", previousValue: { dueAt: isoOrNull(task.due_at) }, newValue: { dueAt: input.dueAt } });
       events.push({ ...base, type: "task.due_changed", payload: { projectId: task.project_id, title: input.title ?? task.title, dueAt: input.dueAt } });
     }

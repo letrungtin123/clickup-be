@@ -13,6 +13,7 @@ import { toIso } from "../../lib/db-types.js";
 import type { AccessContext } from "../access/access-context.js";
 import { assertProductionAdmin, assertProductionRole, isProductionAdmin } from "./access.js";
 import { loadSettings } from "./catalog.service.js";
+import { loadWorkflowModel } from "./jobs.repo.js";
 import { getKpiReport } from "./kpi-settlement.service.js";
 import { executeReport } from "./reports.js";
 import { listPinnedReports } from "./saved-reports.service.js";
@@ -89,11 +90,15 @@ export const getLeaderDashboard = async (context: AccessContext, query: { leader
     JOIN production.statuses s ON s.organization_id = t.organization_id AND s.id = t.status_id
     JOIN public.app_users ua ON ua.id = t.assignee_id
     LEFT JOIN public.app_users uq ON uq.id = t.qc_id
-    WHERE t.organization_id = ${organizationId} AND t.done_at IS NULL ${window}
+    WHERE t.organization_id = ${organizationId} AND t.done_at IS NULL AND t.closed_at IS NULL ${window}
       AND j.archived_at IS NULL ${scope}
     ORDER BY t.deadline, t.number
     LIMIT ${taskListLimit}
   `;
+  // Workload statuses resolved to ids so the open-task partial index applies (PERF-10).
+  const workflow = await loadWorkflowModel(sql, organizationId);
+  const notStarted = workflow.statuses.filter((status) => status.code === "ASSIGNED").map((status) => status.id);
+  const processing = workflow.statuses.filter((status) => status.code === "PROCESSING").map((status) => status.id);
   const [late, dueSoon, counts, workload] = await Promise.all([
     openTasks(sql`AND t.deadline < ${now}`),
     openTasks(sql`AND t.deadline >= ${now} AND t.deadline < ${dueSoonUntil}`),
@@ -101,7 +106,7 @@ export const getLeaderDashboard = async (context: AccessContext, query: { leader
       SELECT count(*) FILTER (WHERE t.deadline < ${now})::int AS late, count(*) FILTER (WHERE t.deadline >= ${now})::int AS due_soon
       FROM production.tasks t
       JOIN production.jobs j ON j.organization_id = t.organization_id AND j.id = t.job_id
-      WHERE t.organization_id = ${organizationId} AND t.done_at IS NULL AND t.deadline < ${dueSoonUntil}
+      WHERE t.organization_id = ${organizationId} AND t.done_at IS NULL AND t.closed_at IS NULL AND t.deadline < ${dueSoonUntil}
         AND j.archived_at IS NULL ${scope}
     `,
     sql<
@@ -121,17 +126,20 @@ export const getLeaderDashboard = async (context: AccessContext, query: { leader
       }[]
     >`
       WITH open_tasks AS (
+        -- Status ids, not codes: (organization_id, status_id) serves the scan instead of reading every task
+        -- (PERF-10). Re-work after a QC fail (Processing again, done_at kept) is workload too: no done_at filter.
         SELECT t.assignee_id,
-          coalesce(sum(t.qty_assigned) FILTER (WHERE s.code = 'ASSIGNED'), 0)::int AS qty_not_started,
-          coalesce(sum(t.qty_assigned) FILTER (WHERE s.code = 'PROCESSING'), 0)::int AS qty_processing,
+          coalesce(sum(t.qty_assigned) FILTER (WHERE t.status_id = ANY(${notStarted}::uuid[])), 0)::int AS qty_not_started,
+          coalesce(sum(t.qty_assigned) FILTER (WHERE t.status_id = ANY(${processing}::uuid[])), 0)::int AS qty_processing,
           count(*)::int AS open_tasks
         FROM production.tasks t
-        JOIN production.statuses s ON s.organization_id = t.organization_id AND s.id = t.status_id
-        WHERE t.organization_id = ${organizationId} AND s.code IN ('ASSIGNED', 'PROCESSING')
+        JOIN production.jobs j ON j.organization_id = t.organization_id AND j.id = t.job_id AND j.archived_at IS NULL
+        WHERE t.organization_id = ${organizationId} AND t.status_id = ANY(${[...notStarted, ...processing]}::uuid[])
         GROUP BY t.assignee_id
       ), done_today AS (
         SELECT t.assignee_id, coalesce(sum(t.qty_done), 0)::int AS qty_done_today, count(*)::int AS tasks_done_today
         FROM production.tasks t
+        JOIN production.jobs j ON j.organization_id = t.organization_id AND j.id = t.job_id AND j.archived_at IS NULL
         WHERE t.organization_id = ${organizationId} AND t.done_at >= ${todayStart} AND t.done_at < ${tomorrowStart}
         GROUP BY t.assignee_id
       ), leave_today AS (
@@ -218,15 +226,23 @@ export const getLeaderDashboard = async (context: AccessContext, query: { leader
 
 const config = (input: ReportConfigInput): ReportConfig => ReportConfigSchema.parse(input);
 
-/** The report-builder configs behind the Admin cards (also what a click on a card opens). */
-export const adminCardConfigs = () => ({
+/** Look-back of "Job đang trễ": late open tasks whose deadline fell in the last 366 days (the report's longest range). */
+const lateJobsDays = 366;
+
+/**
+ * The report-builder configs behind the Admin cards (also what a click on a card opens). PR-09: the
+ * "Job đang trễ" card and its config share one definition — open work (not Done, not closed) flagged late
+ * (`is_late`) of non-archived jobs, deadline within the last 366 days up to today; card totals = report totals.
+ */
+export const adminCardConfigs = (today: string) => ({
   pointsToday: config({ dimensions: ["team"], measures: ["points", "points_khoan", "qty_done"], preset: "TODAY", view: { type: "BAR", rows: ["team"] } }),
   lateJobs: config({
     dimensions: ["job"],
     measures: ["late_count", "task_count"],
     taskDate: "DEADLINE",
-    filters: { taskState: "OPEN" },
-    preset: "LAST_30_DAYS",
+    filters: { taskState: "OPEN", jobState: "ACTIVE" },
+    from: addDays(today, -(lateJobsDays - 1)),
+    to: today,
     sort: { key: "late_count", direction: "desc" }
   }),
   fbRateByUser: config({
@@ -271,7 +287,9 @@ export const getAdminDashboard = async (context: AccessContext): Promise<AdminDa
   const today = businessDay(now);
   const closeDay = settings.kpiCloseDay;
   const period = periodOfDay(today, closeDay);
-  const configs = adminCardConfigs();
+  const configs = adminCardConfigs(today);
+  const lateFrom = startOfBusinessDay(configs.lateJobs.from!);
+  const lateTo = startOfBusinessDay(addDays(configs.lateJobs.to!, 1));
   const run = (cardConfig: ReportConfig) => executeReport(sql, organizationId, cardConfig, { today, closeDay });
 
   const [pointsToday, fbRateByUser, fbRateByClient, productivityByShift, lateJobs, kpi, pinned] = await Promise.all([
@@ -301,7 +319,8 @@ export const getAdminDashboard = async (context: AccessContext): Promise<AdminDa
       JOIN production.jobs j ON j.organization_id = t.organization_id AND j.id = t.job_id
       JOIN production.projects p ON p.organization_id = j.organization_id AND p.id = j.project_id
       JOIN public.app_users u ON u.id = j.leader_id
-      WHERE t.organization_id = ${organizationId} AND t.done_at IS NULL AND t.deadline < ${now} AND j.archived_at IS NULL
+      WHERE t.organization_id = ${organizationId} AND t.is_late AND t.done_at IS NULL AND t.closed_at IS NULL
+        AND t.deadline >= ${lateFrom} AND t.deadline < ${lateTo} AND j.archived_at IS NULL
       GROUP BY j.id, p.code, u.id
       ORDER BY min(t.deadline), j.code
       LIMIT 50

@@ -1,14 +1,15 @@
 import { Permission } from "../../contracts/permissions.js";
-import { commentLimits, RichTextError, sanitizeRichText, type RichTextDoc } from "../../contracts/rich-text.js";
+import { commentLimits, RichTextError, type RichTextDoc } from "../../contracts/rich-text.js";
 import type { Comment, CreateCommentRequest, ProjectAccessLevel, TimelineItem, TimelinePage } from "../../contracts/work.js";
 import { getSql } from "../../db/client.js";
 import { AppError } from "../../lib/app-error.js";
-import { decodeCursor, encodeCursor, toIso, type QuerySql } from "../../lib/db-types.js";
+import { decodeTimeCursor, encodeTimeCursor, timestampParamSql, timestampTextSql, toIso, type QuerySql } from "../../lib/db-types.js";
 import { logger } from "../../lib/logger.js";
+import { sanitizeWithMentionLabels } from "../../lib/mentions.js";
 import { inlineImageTypes, removeObjects } from "../../lib/storage.js";
 import { publishToRoom } from "../../realtime/publisher.js";
 import type { AccessContext } from "../access/access-context.js";
-import { assertPermission, projectLevelAtLeast } from "../access/resource-access.js";
+import { assertPermission, hasPermission, projectLevelAtLeast } from "../access/resource-access.js";
 import { enqueueDomainEvents, type DomainEventInput } from "../events/outbox.js";
 import { attachmentDeleteRule, toActivity, toAttachment, toUserRef, type ActivityRow, type AttachmentRow, type UserRefJson } from "./mappers.js";
 import { authorizeTask, mentionEvent } from "./tasks.service.js";
@@ -68,9 +69,9 @@ const commentSelect = (sql: QuerySql) => sql`
   ) AS attachments
 `;
 
-const sanitizeComment = (doc: unknown) => {
+const sanitizeComment = async (sql: QuerySql, context: AccessContext, doc: unknown) => {
   try {
-    const result = sanitizeRichText(doc, commentLimits);
+    const result = await sanitizeWithMentionLabels(sql, context.organization.id, doc, commentLimits);
     if (result.text.length === 0) {
       throw new AppError("COMMENT_EMPTY", "Comment cannot be empty.", 400);
     }
@@ -93,19 +94,17 @@ export const getTimeline = async (
   input: { cursor?: string | undefined; limit: number }
 ): Promise<TimelinePage> => {
   const sql = getSql();
+  const cursor = decodeTimeCursor(input.cursor);
   const { access } = await authorizeTask(sql, context, taskId, "view");
-  const cursor = decodeCursor(input.cursor, 2);
-  if (input.cursor && !cursor) {
-    throw new AppError("INVALID_CURSOR", "The pagination cursor is invalid.", 400);
-  }
+  // Microsecond-exact keyset (BUG-WK-12): rows sharing a millisecond are neither skipped nor repeated.
   const before = cursor
-    ? sql`AND (x.created_at, x.id) < (${String(cursor[0])}::timestamptz, ${String(cursor[1])}::uuid)`
+    ? sql`AND (x.created_at, x.id) < (${timestampParamSql(sql, cursor.at)}, ${cursor.id}::uuid)`
     : sql``;
   const limit = input.limit;
 
   const [comments, activity] = await Promise.all([
-    sql<CommentRow[]>`
-      SELECT ${commentSelect(sql)}
+    sql<(CommentRow & { cursor_at: string })[]>`
+      SELECT ${commentSelect(sql)}, ${timestampTextSql(sql, () => sql`c.created_at`)} AS cursor_at
       FROM public.task_comments c
       CROSS JOIN LATERAL (SELECT c.created_at, c.id) x
       WHERE c.organization_id = ${context.organization.id} AND c.task_id = ${taskId}
@@ -113,8 +112,9 @@ export const getTimeline = async (
       ORDER BY c.created_at DESC, c.id DESC
       LIMIT ${limit + 1}
     `,
-    sql<ActivityRow[]>`
+    sql<(ActivityRow & { cursor_at: string })[]>`
       SELECT e.id, e.task_id, e.action, e.previous_value, e.created_at,
+        ${timestampTextSql(sql, () => sql`e.created_at`)} AS cursor_at,
         -- Assignment events target a user: expose who, so the UI can name them.
         CASE WHEN e.target_type = 'user' AND coalesce(e.new_value, 'null'::jsonb) = 'null'::jsonb
           THEN jsonb_build_object('userId', e.target_id,
@@ -131,17 +131,21 @@ export const getTimeline = async (
     `
   ]);
 
-  const merged: { at: Date; id: string; item: TimelineItem }[] = [
-    ...comments.map((row) => ({ at: row.created_at, id: row.id, item: { kind: "comment" as const, comment: toComment(row, context, access.level) } })),
-    ...activity.map((row) => ({ at: row.created_at, id: row.id, item: { kind: "activity" as const, activity: toActivity(row) } }))
-  ].sort((a, b) => b.at.getTime() - a.at.getTime() || (a.id < b.id ? 1 : a.id > b.id ? -1 : 0));
+  // Same order as SQL: (created_at, id) DESC. The cursor texts are fixed-width UTC ISO with microseconds, so
+  // they compare like the timestamps; uuids compare like PostgreSQL (lowercase hex).
+  const descending = (a: { at: string; id: string }, b: { at: string; id: string }) =>
+    a.at < b.at ? 1 : a.at > b.at ? -1 : a.id < b.id ? 1 : a.id > b.id ? -1 : 0;
+  const merged: { at: string; id: string; item: TimelineItem }[] = [
+    ...comments.map((row) => ({ at: row.cursor_at, id: row.id, item: { kind: "comment" as const, comment: toComment(row, context, access.level) } })),
+    ...activity.map((row) => ({ at: row.cursor_at, id: row.id, item: { kind: "activity" as const, activity: toActivity(row) } }))
+  ].sort(descending);
 
   const page = merged.slice(0, limit);
   const last = page[page.length - 1];
   const hasMore = merged.length > limit;
   return {
     items: page.map((entry) => entry.item),
-    pageInfo: { hasMore, nextCursor: hasMore && last ? encodeCursor([last.at.toISOString(), last.id]) : null }
+    pageInfo: { hasMore, nextCursor: hasMore && last ? encodeTimeCursor(last.at, last.id) : null }
   };
 };
 
@@ -179,8 +183,8 @@ const publishTimeline = (projectId: string, taskId: string, actorId: string) => 
 
 export const createComment = async (context: AccessContext, taskId: string, input: CreateCommentRequest): Promise<Comment> => {
   assertPermission(context, Permission.TaskComment);
-  const body = sanitizeComment(input.body);
   const sql = getSql();
+  const body = await sanitizeComment(sql, context, input.body);
 
   const result = await sql.begin(async (tx) => {
     const { task, access } = await authorizeTask(tx, context, taskId, "submit");
@@ -209,7 +213,7 @@ export const createComment = async (context: AccessContext, taskId: string, inpu
 
     if (input.attachmentIds.length > 0) {
       const attached = await tx<{ id: string }[]>`
-        UPDATE public.task_attachments SET comment_id = ${created.id}
+        UPDATE public.task_attachments SET comment_id = ${created.id}, purpose = 'comment'
         WHERE organization_id = ${context.organization.id} AND task_id = ${taskId}
           AND id = ANY(${input.attachmentIds}::uuid[]) AND uploaded_by = ${context.user.id}
           AND comment_id IS NULL AND status = 'ready' AND deleted_at IS NULL
@@ -266,8 +270,8 @@ export const createComment = async (context: AccessContext, taskId: string, inpu
 
 export const updateComment = async (context: AccessContext, taskId: string, commentId: string, doc: unknown): Promise<Comment> => {
   assertPermission(context, Permission.TaskComment);
-  const body = sanitizeComment(doc);
   const sql = getSql();
+  const body = await sanitizeComment(sql, context, doc);
   const result = await sql.begin(async (tx) => {
     // Editing can add mentions (notifications): same bar as commenting.
     const { task, access } = await authorizeTask(tx, context, taskId, "submit");
@@ -286,36 +290,83 @@ export const updateComment = async (context: AccessContext, taskId: string, comm
           mentioned_user_ids = ${mentionedIds}::uuid[], edited_at = now()
       WHERE id = ${commentId} AND organization_id = ${context.organization.id}
     `;
+    const events: DomainEventInput[] = [
+      {
+        // Inbox entries quoting this comment refresh their excerpt.
+        organizationId: context.organization.id,
+        type: "task.comment.updated",
+        aggregateType: "task",
+        aggregateId: taskId,
+        actorUserId: context.user.id,
+        payload: { projectId: task.project_id, commentId, excerpt: body.text.slice(0, 280) }
+      }
+    ];
     if (mention && newlyMentioned.length > 0) {
       mention.payload.userIds = newlyMentioned;
-      await enqueueDomainEvents(tx, [mention]);
+      events.push(mention);
     }
+    await enqueueDomainEvents(tx, events);
     return { projectId: task.project_id, comment: toComment(await loadComment(tx, context, taskId, commentId), context, access.level) };
   });
   publishTimeline(result.projectId, taskId, context.user.id);
   return result.comment;
 };
 
+/**
+ * Deleting a comment (SEC-API-06): authors delete their own comment (task.comment + submit access); people who
+ * manage the project (task.update + manage access) may delete anyone's. A top-level comment takes its replies
+ * along — only when every live reply is the caller's own, or the caller manages the project; otherwise other
+ * people's replies (and their files) are protected and the request is refused.
+ */
 export const deleteComment = async (context: AccessContext, taskId: string, commentId: string) => {
   const sql = getSql();
   const result = await sql.begin(async (tx) => {
     const { task, access } = await authorizeTask(tx, context, taskId, "view");
     const comment = await loadComment(tx, context, taskId, commentId);
     const isAuthor = comment.author_user_id === context.user.id;
-    if (!(isAuthor && projectLevelAtLeast(access.level, "submit")) && !projectLevelAtLeast(access.level, "manage")) {
+    const canModerate = projectLevelAtLeast(access.level, "manage") && hasPermission(context, Permission.TaskUpdate);
+    const canDeleteOwn = isAuthor && projectLevelAtLeast(access.level, "submit") && hasPermission(context, Permission.TaskComment);
+    if (!canDeleteOwn && !canModerate) {
       throw new AppError("FORBIDDEN", "You cannot delete this comment.", 403);
+    }
+    if (!canModerate) {
+      const others = await tx<{ n: number }[]>`
+        SELECT count(*)::int AS n FROM public.task_comments
+        WHERE organization_id = ${context.organization.id} AND parent_comment_id = ${commentId}
+          AND deleted_at IS NULL AND author_user_id <> ${context.user.id}
+      `;
+      if ((others[0]?.n ?? 0) > 0) {
+        throw new AppError(
+          "COMMENT_HAS_OTHER_REPLIES",
+          "Bình luận này có trả lời của người khác; chỉ người quản lý dự án mới xoá được cả chuỗi.",
+          409
+        );
+      }
     }
     const removed = await tx<{ id: string }[]>`
       UPDATE public.task_comments SET deleted_at = now(), deleted_by = ${context.user.id}
-      WHERE organization_id = ${context.organization.id} AND (id = ${commentId} OR parent_comment_id = ${commentId}) AND deleted_at IS NULL
+      WHERE organization_id = ${context.organization.id} AND task_id = ${taskId}
+        AND (id = ${commentId} OR parent_comment_id = ${commentId}) AND deleted_at IS NULL
       RETURNING id
     `;
+    const removedIds = removed.map((row) => row.id);
     // Files of deleted comments stop being downloadable and their objects are removed.
     const files = await tx<{ storage_path: string }[]>`
       UPDATE public.task_attachments SET deleted_at = now(), deleted_by = ${context.user.id}
-      WHERE organization_id = ${context.organization.id} AND comment_id = ANY(${removed.map((row) => row.id)}::uuid[]) AND deleted_at IS NULL
+      WHERE organization_id = ${context.organization.id} AND comment_id = ANY(${removedIds}::uuid[]) AND deleted_at IS NULL
       RETURNING storage_path
     `;
+    await enqueueDomainEvents(tx, [
+      {
+        // Inbox entries quoting these comments are removed.
+        organizationId: context.organization.id,
+        type: "task.comment.deleted",
+        aggregateType: "task",
+        aggregateId: taskId,
+        actorUserId: context.user.id,
+        payload: { projectId: task.project_id, commentIds: removedIds }
+      }
+    ]);
     return { projectId: task.project_id, paths: files.map((file) => file.storage_path) };
   });
   if (result.paths.length > 0) {

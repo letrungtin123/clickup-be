@@ -1,5 +1,6 @@
 import { z } from "zod";
 
+import { SafeText } from "./production-catalog.js";
 import { ProductionStatusRefSchema } from "./production-jobs.js";
 import { PeriodKeySchema } from "./production-scores.js";
 import { UserRefSchema } from "./work.js";
@@ -22,7 +23,10 @@ import { UserRefSchema } from "./work.js";
  *  - `team` is the person's current team; `status` the task's current status; `month` the calendar
  *    month and `period` the KPI period (26 → 25 with settings.kpiCloseDay); `week` starts on Monday.
  *  - money_khoan is ADMIN only (403 otherwise). When settings.scoresPublic is off, non-admins cannot
- *    break points down by person.
+ *    break points down by person: no `user` or `job` dimension and no `user` / `job` / `tag` filter with
+ *    point measures (PR-11).
+ *  - `period` is the KPI period of the day under the CURRENT close day (like the board and the settlement),
+ *    for score and task measures alike (PR-17).
  */
 
 const Id = z.string().uuid();
@@ -88,16 +92,16 @@ export const reportMeasureInfo: Record<ReportMeasure, { label: string; source: "
   points: { label: "Điểm", source: "SCORES", format: "points", adminOnly: false },
   points_khoan: { label: "Điểm khoán", source: "SCORES", format: "points", adminOnly: false },
   money_khoan: { label: "Tiền khoán (VND)", source: "SCORES", format: "money", adminOnly: true },
-  qty_done: { label: "Số tấm done", source: "TASKS", format: "images", adminOnly: false },
+  qty_done: { label: "Số tấm đã xong", source: "TASKS", format: "images", adminOnly: false },
   qty_assigned: { label: "Số tấm giao", source: "TASKS", format: "images", adminOnly: false },
   task_count: { label: "Số task", source: "TASKS", format: "count", adminOnly: false },
   late_count: { label: "Task trễ", source: "TASKS", format: "count", adminOnly: false },
   late_rate: { label: "Tỉ lệ trễ", source: "TASKS", format: "percent", adminOnly: false },
   fb_wrong_count: { label: "Task FB sai", source: "TASKS", format: "count", adminOnly: false },
   fb_rate: { label: "Tỉ lệ FB", source: "TASKS", format: "percent", adminOnly: false },
-  qc_fail_count: { label: "Lần QC fail", source: "TASKS", format: "count", adminOnly: false },
-  qc_fail_rate: { label: "Tỉ lệ QC fail", source: "TASKS", format: "percent", adminOnly: false },
-  avg_hours_done: { label: "Giờ TB giao → Done", source: "TASKS", format: "hours", adminOnly: false },
+  qc_fail_count: { label: "Lần QC trả lại", source: "TASKS", format: "count", adminOnly: false },
+  qc_fail_rate: { label: "Tỉ lệ QC trả lại", source: "TASKS", format: "percent", adminOnly: false },
+  avg_hours_done: { label: "Giờ TB từ giao đến xong", source: "TASKS", format: "hours", adminOnly: false },
   ot_hours: { label: "Giờ OT", source: "TASKS", format: "hours", adminOnly: false },
   qty_per_worker_day: { label: "Tấm/người/ngày", source: "TASKS", format: "decimal", adminOnly: false }
 };
@@ -124,8 +128,10 @@ export const ReportFiltersSchema = z
     tag: z.array(Id).min(1).max(50).optional(),
     /** SCORES measures only: worker and/or QC entries. */
     scoreRole: z.array(z.enum(["WORKER", "QC"])).min(1).max(2).optional(),
-    /** TASKS measures only: not Done yet (OPEN) or Done (DONE). */
-    taskState: z.enum(["OPEN", "DONE"]).optional()
+    /** TASKS measures only: open work (not Done and not closed, OPEN) or Done (DONE). */
+    taskState: z.enum(["OPEN", "DONE"]).optional(),
+    /** Jobs not archived (ACTIVE) or archived ones only (ARCHIVED); both when absent. */
+    jobState: z.enum(["ACTIVE", "ARCHIVED"]).optional()
   })
   .strict();
 export type ReportFilters = z.infer<typeof ReportFiltersSchema>;
@@ -233,7 +239,7 @@ export const ReportExportRequestSchema = z
   .object({
     config: ReportConfigSchema,
     /** Shown in the config sheet (e.g. the saved report name). */
-    name: z.string().trim().min(1).max(120).optional()
+    name: SafeText().trim().min(1).max(120).optional()
   })
   .strict();
 
@@ -250,6 +256,8 @@ export const SavedReportSchema = z.object({
   /** On the Admin dashboard (ADMIN only; implies shared). */
   pinned: z.boolean(),
   pinOrder: z.number().int(),
+  /** Uses an Admin-only measure (money): listed and runnable for Admins only (PR-20). */
+  adminOnly: z.boolean(),
   /** Owner: edit / delete. ADMIN: delete, pin. */
   canEdit: z.boolean(),
   canDelete: z.boolean(),
@@ -262,8 +270,8 @@ export const SavedReportCollectionSchema = z.object({ items: z.array(SavedReport
 
 export const CreateSavedReportRequestSchema = z
   .object({
-    name: z.string().trim().min(1).max(120),
-    description: z.string().trim().max(1000).nullable().optional(),
+    name: SafeText().trim().min(1).max(120),
+    description: SafeText().trim().max(1000).nullable().optional(),
     config: ReportConfigSchema,
     shared: z.boolean().default(false),
     pinned: z.boolean().default(false),
@@ -274,8 +282,8 @@ export type CreateSavedReportRequest = z.infer<typeof CreateSavedReportRequestSc
 
 export const UpdateSavedReportRequestSchema = z
   .object({
-    name: z.string().trim().min(1).max(120).optional(),
-    description: z.string().trim().max(1000).nullable().optional(),
+    name: SafeText().trim().min(1).max(120).optional(),
+    description: SafeText().trim().max(1000).nullable().optional(),
     config: ReportConfigSchema.optional(),
     shared: z.boolean().optional(),
     pinned: z.boolean().optional(),
@@ -379,7 +387,7 @@ export const AnomalyListSchema = z.object({
 export type AnomalyList = z.infer<typeof AnomalyListSchema>;
 
 export const ReviewAnomalyRequestSchema = z
-  .object({ kind: AnomalyKindSchema, key: AnomalyKeySchema, note: z.string().trim().max(500).optional() })
+  .object({ kind: AnomalyKindSchema, key: AnomalyKeySchema, note: SafeText().trim().max(500).optional() })
   .strict();
 export const UnreviewAnomalyRequestSchema = z.object({ kind: AnomalyKindSchema, key: AnomalyKeySchema }).strict();
 export const AnomalyReviewResultSchema = z.object({ kind: AnomalyKindSchema, key: z.string(), reviewedAt: IsoDate.nullable() });

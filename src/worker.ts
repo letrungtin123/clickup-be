@@ -1,4 +1,4 @@
-import { closeDatabase } from "./db/client.js";
+import { closeDatabase, configureDatabase } from "./db/client.js";
 import { startOutboxRelay } from "./jobs/outbox-relay.js";
 import { startWorkerConsumers } from "./jobs/registry.js";
 import { closeAmqp, getAmqpConnection } from "./lib/amqp.js";
@@ -10,6 +10,8 @@ import { closeRedis } from "./lib/redis.js";
  * (notifications, reminders). Deploy alongside the API; any number of instances is safe.
  */
 const main = async () => {
+  // Smaller pool and longer statement limit than the API (DB_POOL_MAX / DB_STATEMENT_TIMEOUT_MS override).
+  configureDatabase({ role: "worker" });
   await getAmqpConnection();
   const stopRelay = startOutboxRelay();
   const stopConsumers = await startWorkerConsumers();

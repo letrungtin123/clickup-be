@@ -1,9 +1,98 @@
 import { z } from "zod";
 
+import { PageInfoSchema } from "./pagination.js";
 import { permissionValues } from "./permissions.js";
 export const OpaqueIdSchema = z.string().uuid();
 
 export const IsoDateTimeSchema = z.string().datetime({ offset: true });
+
+// Text input rules (shared by every request schema) ------------------------------------------------
+
+// eslint-disable-next-line no-control-regex -- detecting control characters is intended
+const controlCharacters = /[\u0000-\u001f\u007f]/;
+// eslint-disable-next-line no-control-regex -- detecting control characters is intended
+const controlCharactersExceptBreaks = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/;
+/** Bidirectional overrides / isolates: they make names read differently from what they are. */
+const bidiControls = /[\u202a-\u202e\u2066-\u2069]/;
+/** Characters that render as nothing (zero-width, word joiner, BOM, fillers). */
+const invisibleCharacters = /[\u00ad\u115f\u1160\u180e\u200b-\u200f\u2060-\u2064\u3164\ufeff\uffa0]/g;
+
+export const textRuleMessages = {
+  control: "Không được chứa ký tự điều khiển.",
+  bidi: "Không được chứa ký tự đảo chiều văn bản.",
+  blank: "Không được để trống.",
+  year: "Năm phải nằm trong khoảng 1970–2100.",
+  mime: "Loại tệp không hợp lệ."
+} as const;
+
+export const hasControlCharacters = (value: string, allowLineBreaks = false) =>
+  (allowLineBreaks ? controlCharactersExceptBreaks : controlCharacters).test(value);
+export const hasBidiControls = (value: string) => bidiControls.test(value);
+/** True when nothing visible remains once whitespace and invisible characters are removed. */
+export const isVisiblyBlank = (value: string) => value.replace(invisibleCharacters, "").trim().length === 0;
+
+/** Single-line name or title: trimmed, no control or bidi characters, not visually empty. */
+export const SafeLineSchema = (max: number, min = 1) =>
+  z
+    .string()
+    .trim()
+    .min(min)
+    .max(max)
+    .refine((value) => !hasControlCharacters(value), textRuleMessages.control)
+    .refine((value) => !hasBidiControls(value), textRuleMessages.bidi)
+    .refine((value) => min === 0 || !isVisiblyBlank(value), textRuleMessages.blank);
+
+/** Multi-line plain text (descriptions): line breaks and tabs allowed, other control characters not. */
+export const SafeMultilineSchema = (max: number) =>
+  z
+    .string()
+    .trim()
+    .max(max)
+    .refine((value) => !hasControlCharacters(value, true), textRuleMessages.control);
+
+/** Free-text search input. */
+export const SafeSearchSchema = (max: number, min = 0) =>
+  z
+    .string()
+    .trim()
+    .min(min)
+    .max(max)
+    .refine((value) => !hasControlCharacters(value), textRuleMessages.control);
+
+/** Client-declared MIME type (`type/subtype`, optional parameters). */
+export const MimeTypeSchema = z
+  .string()
+  .trim()
+  .min(3)
+  .max(255)
+  .refine((value) => !hasControlCharacters(value), textRuleMessages.control)
+  .refine((value) => /^[a-z0-9][a-z0-9!#$&^_.+-]*\/[a-z0-9][a-z0-9!#$&^_.+-]*(\s*;.*)?$/i.test(value), textRuleMessages.mime);
+
+/** File name as sent by the browser (the server sanitizes it further before storing). */
+export const FileNameSchema = z
+  .string()
+  .trim()
+  .min(1)
+  .max(255)
+  .refine((value) => !hasControlCharacters(value), textRuleMessages.control);
+
+/** Date-time input: ISO-8601 with offset, year 1970–2100 (PostgreSQL rejects year 0; far years are typos). */
+export const IsoDateInputSchema = z
+  .string()
+  .datetime({ offset: true })
+  .refine((value) => {
+    const year = Number(value.slice(0, 4));
+    return year >= 1970 && year <= 2100;
+  }, textRuleMessages.year);
+
+/** E-mail addresses as the database accepts them (app_users_email_format_chk). */
+export const AccountEmailSchema = z
+  .string()
+  .trim()
+  .toLowerCase()
+  .max(254)
+  .email()
+  .regex(/^[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}$/i, "Email chỉ được chứa chữ, số và các ký tự . _ % + -");
 
 export const PermissionKeySchema = z.enum(permissionValues);
 
@@ -82,15 +171,15 @@ export const RoleCollectionSchema = z.object({
 
 export const CreateRoleRequestSchema = z.object({
   key: RoleKeySchema,
-  name: z.string().trim().min(1).max(120),
-  description: z.string().trim().max(1000).nullable().optional(),
+  name: SafeLineSchema(120),
+  description: SafeMultilineSchema(1000).nullable().optional(),
   permissions: z.array(PermissionKeySchema).max(permissionValues.length).default([])
 });
 
 export const UpdateRoleRequestSchema = z
   .object({
-    name: z.string().trim().min(1).max(120).optional(),
-    description: z.string().trim().max(1000).nullable().optional()
+    name: SafeLineSchema(120).optional(),
+    description: SafeMultilineSchema(1000).nullable().optional()
   })
   .refine((value) => Object.values(value).some((entry) => entry !== undefined), {
     message: "At least one role field is required."
@@ -113,8 +202,18 @@ export const OrganizationMemberSchema = z.object({
   updatedAt: IsoDateTimeSchema
 });
 
+/** GET /organization/members: optional search / status filter, keyset paging (status, name, id). */
+export const OrganizationMemberQuerySchema = z.object({
+  q: SafeSearchSchema(120).optional(),
+  status: MembershipStatusSchema.optional(),
+  cursor: z.string().max(1000).optional(),
+  limit: z.coerce.number().int().min(1).max(500).default(500)
+});
+export type OrganizationMemberQuery = z.infer<typeof OrganizationMemberQuerySchema>;
+
 export const OrganizationMemberCollectionSchema = z.object({
-  items: z.array(OrganizationMemberSchema)
+  items: z.array(OrganizationMemberSchema),
+  pageInfo: PageInfoSchema.default({ hasMore: false, nextCursor: null })
 });
 
 export const UpdateOrganizationMemberRequestSchema = z
@@ -137,11 +236,19 @@ export const WorkspaceContextSchema = z.object({
   productionRoles: z.array(z.string().min(1).max(20)).default([])
 });
 
+/** bcrypt (GoTrue) only uses the first 72 bytes of a password; GoTrue rejects longer ones. */
+export const passwordMaxBytes = 72;
+const utf8Length = (value: string) => new TextEncoder().encode(value).length;
+
 /** Password policy for user-chosen passwords. */
 export const NewPasswordSchema = z
   .string()
   .min(10, "Password must be at least 10 characters.")
   .max(128)
+  .refine(
+    (value) => utf8Length(value) <= passwordMaxBytes,
+    "Mật khẩu dài tối đa 72 byte (72 ký tự không dấu; mỗi chữ có dấu tính 2–3 byte)."
+  )
   .refine((value) => /[A-Za-z]/.test(value) && /[0-9]/.test(value), "Password must contain letters and numbers.");
 
 export const ChangePasswordRequestSchema = z
@@ -157,10 +264,10 @@ export const ChangePasswordRequestSchema = z
 
 export const CreateOrganizationMemberRequestSchema = z
   .object({
-    email: z.string().trim().toLowerCase().email().max(254),
-    displayName: z.string().trim().min(1).max(160),
+    email: AccountEmailSchema,
+    displayName: SafeLineSchema(160),
     roleId: OpaqueIdSchema,
-    jobTitle: z.string().trim().max(120).nullable().optional()
+    jobTitle: SafeLineSchema(120, 0).nullable().optional()
   })
   .strict();
 
@@ -182,6 +289,17 @@ export const CreatedMemberResponseSchema = TemporaryPasswordResponseSchema.exten
 export const ArchiveResponseSchema = z.object({
   ok: z.literal(true)
 });
+
+/**
+ * POST /auth/socket-ticket: a short-lived (60 s) ticket the SPA sends over its open socket
+ * (`session:refresh`) after refreshing the session, so the socket survives the access-token rotation
+ * without reconnecting. `expiresAt` is the new access token's expiry (seconds since epoch).
+ */
+export const SocketTicketSchema = z.object({
+  ticket: z.string().min(16).max(4000),
+  expiresAt: z.number().int()
+});
+export type SocketTicket = z.infer<typeof SocketTicketSchema>;
 
 export const ProductMetaSchema = z.object({
   name: z.literal("Nesso Work"),

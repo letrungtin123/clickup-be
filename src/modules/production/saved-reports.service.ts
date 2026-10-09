@@ -1,5 +1,6 @@
 import {
   ReportConfigSchema,
+  reportMeasureInfo,
   type CreateSavedReportRequest,
   type ReportConfig,
   type SavedReport,
@@ -19,6 +20,8 @@ import { assertReportAllowed } from "./reports.js";
  * ADMIN and LEADER. Visibility: own reports, plus every shared one. Only the owner edits name / config /
  * sharing; the owner or an ADMIN deletes; only an ADMIN pins (pinning shares the report, unsharing unpins).
  * A config is validated (whitelists + money rule) when saved and again whenever it runs.
+ * PR-20: a report using an Admin-only measure (money) is `adminOnly` — other report users neither list nor
+ * open it (it would only fail with 403 when run), even when an Admin shared it.
  */
 
 const org = (context: AccessContext) => context.organization.id;
@@ -53,6 +56,8 @@ const parseStoredConfig = (row: { id: string; config: unknown }): ReportConfig |
   return parsed.data;
 };
 
+export const isAdminOnlyConfig = (config: Pick<ReportConfig, "measures">) => config.measures.some((measure) => reportMeasureInfo[measure].adminOnly);
+
 const toSavedReport = (row: SavedRow, context: AccessContext): SavedReport | null => {
   const config = parseStoredConfig(row);
   if (!config) {
@@ -60,6 +65,10 @@ const toSavedReport = (row: SavedRow, context: AccessContext): SavedReport | nul
   }
   const own = row.owner_id === context.user.id;
   const admin = isProductionAdmin(context);
+  const adminOnly = isAdminOnlyConfig(config);
+  if (adminOnly && !admin) {
+    return null;
+  }
   return {
     id: row.id,
     name: row.name,
@@ -69,6 +78,7 @@ const toSavedReport = (row: SavedRow, context: AccessContext): SavedReport | nul
     shared: row.shared,
     pinned: row.pinned,
     pinOrder: row.pin_order,
+    adminOnly,
     canEdit: own,
     canDelete: own || admin,
     canPin: admin,
@@ -122,7 +132,12 @@ export const listSavedReports = async (context: AccessContext) => {
 
 export const getSavedReport = async (context: AccessContext, reportId: string) => {
   assertProductionRole(context, "LEADER");
-  const report = toSavedReport(await loadVisible(getSql(), context, reportId), context);
+  const row = await loadVisible(getSql(), context, reportId);
+  const config = parseStoredConfig(row);
+  if (config && isAdminOnlyConfig(config) && !isProductionAdmin(context)) {
+    throw notFound();
+  }
+  const report = toSavedReport(row, context);
   if (!report) {
     throw new AppError("REPORT_CONFIG_OUTDATED", "Cấu hình báo cáo không còn hợp lệ; hãy tạo lại.", 409);
   }

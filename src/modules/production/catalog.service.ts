@@ -29,6 +29,7 @@ import { invalidateAccessContexts, type AccessContext } from "../access/access-c
 import { scheduleGoogleAuthUserProvisioning } from "../auth/google-auth.service.js";
 import { toColor } from "../work/mappers.js";
 import { assertProductionAdmin, assertProductionMember, assertProductionRole, isProductionAdmin, productionRolesOf } from "./access.js";
+import { cachedConfig, invalidateProductionConfig } from "./catalog-cache.js";
 import { deleteCreditRuleVersion, importCreditRules, listRuleHistory, listRulesAt, setCreditRule, startNewVersion } from "./credit-rules.js";
 import { resolveCustomValues, setEntityTags } from "./custom-fields.js";
 import { businessDay, isValidDay } from "./time.js";
@@ -65,7 +66,11 @@ const defaults: ProductionSettings = {
   timezone: "Asia/Ho_Chi_Minh"
 };
 
-export const loadSettings = async (sql: QuerySql, organizationId: string): Promise<ProductionSettings> => {
+/** Production settings of the organization (cached per organization, PERF-14 — see catalog-cache.ts). */
+export const loadSettings = (sql: QuerySql, organizationId: string): Promise<ProductionSettings> =>
+  cachedConfig("settings", organizationId, () => readSettings(sql, organizationId));
+
+const readSettings = async (sql: QuerySql, organizationId: string): Promise<ProductionSettings> => {
   const rows = await sql<{ key: string; value: unknown }[]>`
     SELECT key, value FROM production.settings WHERE organization_id = ${organizationId}
   `;
@@ -100,6 +105,7 @@ export const updateSettings = async (context: AccessContext, input: In<typeof Up
       `;
     }
   });
+  await invalidateProductionConfig(org(context));
   return await loadSettings(sql, org(context));
 };
 
@@ -541,6 +547,7 @@ export const upsertStatus = async (context: AccessContext, id: string | null, in
       FROM production.statuses WHERE organization_id = ${org(context)}
     `;
   }
+  await invalidateProductionConfig(org(context));
   return await getWorkflow(context);
 };
 
@@ -552,6 +559,7 @@ export const reorderStatuses = async (context: AccessContext, ids: string[]) => 
     FROM unnest(${ids}::uuid[]) WITH ORDINALITY AS data(id, position)
     WHERE s.organization_id = ${org(context)} AND s.id = data.id
   `;
+  await invalidateProductionConfig(org(context));
   return await getWorkflow(context);
 };
 
@@ -577,6 +585,7 @@ export const replaceTransitions = async (context: AccessContext, input: In<typeo
       `;
     }
   });
+  await invalidateProductionConfig(org(context));
   return await getWorkflow(context);
 };
 

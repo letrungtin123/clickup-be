@@ -1,5 +1,6 @@
 import { z } from "zod";
 
+import { SafeText } from "./production-catalog.js";
 import { UserRefSchema } from "./work.js";
 
 /**
@@ -87,7 +88,7 @@ export const CreateLeaveRequestSchema = z
     fromDate: DateOnly,
     toDate: DateOnly,
     part: LeavePartSchema.default("FULL_DAY"),
-    note: z.string().trim().max(leaveLimits.noteMaxLength).nullable().optional()
+    note: SafeText().trim().max(leaveLimits.noteMaxLength).nullable().optional()
   })
   .strict();
 export type CreateLeaveRequest = z.infer<typeof CreateLeaveRequestSchema>;
@@ -96,7 +97,7 @@ export type CreateLeaveRequest = z.infer<typeof CreateLeaveRequestSchema>;
 export const DecideLeaveRequestSchema = z
   .object({
     decision: z.enum(["APPROVED", "REJECTED"]),
-    note: z.string().trim().max(leaveLimits.noteMaxLength).nullable().optional()
+    note: SafeText().trim().max(leaveLimits.noteMaxLength).nullable().optional()
   })
   .strict();
 export type DecideLeaveRequest = z.infer<typeof DecideLeaveRequestSchema>;

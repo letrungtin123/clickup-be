@@ -69,6 +69,62 @@ export const isBlockedMimeType = (mimeType: string) => {
   return blockedTypes.has(base) || base.endsWith("+xml");
 };
 
+/**
+ * Upload allowlist (SEC-API-01): everything else is refused. Raster images in `inlineImageTypes` render
+ * inline; every other type (incl. the download-only image formats below) is always served as a download.
+ */
+export const allowedUploadTypes = new Set([
+  // Images (inline)
+  ...inlineImageTypes,
+  // Images (download only): retouch sources and phone photos
+  "image/tiff",
+  "image/bmp",
+  "image/heic",
+  "image/heif",
+  "image/vnd.adobe.photoshop",
+  // Documents
+  "application/pdf",
+  "text/plain",
+  "text/csv",
+  "application/rtf",
+  "application/msword",
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  "application/vnd.ms-excel",
+  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  "application/vnd.ms-powerpoint",
+  "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+  "application/vnd.oasis.opendocument.text",
+  "application/vnd.oasis.opendocument.spreadsheet",
+  "application/vnd.oasis.opendocument.presentation",
+  // Archives
+  "application/zip",
+  "application/x-zip-compressed",
+  // Video
+  "video/mp4",
+  "video/webm",
+  "video/quicktime",
+  "video/x-msvideo",
+  "video/x-matroska",
+  // Audio
+  "audio/mpeg",
+  "audio/mp4",
+  "audio/x-m4a",
+  "audio/aac",
+  "audio/ogg",
+  "audio/wav",
+  "audio/x-wav",
+  "audio/webm"
+]);
+
+export const isAllowedUploadType = (mimeType: string) => {
+  const base = baseMime(mimeType);
+  return allowedUploadTypes.has(base) && !isBlockedMimeType(base);
+};
+
+/** 400 for a type outside the allowlist (each module keeps its established error code). */
+export const uploadTypeRejected = (code = "ATTACHMENT_TYPE_BLOCKED") =>
+  new AppError(code, "Loại tệp này không được hỗ trợ. Hãy nén thành .zip hoặc chọn tệp khác.", 400);
+
 /** Only verified raster images may be rendered inline; everything else is served as a download. */
 export const isInlineImage = (mimeType: string) => inlineImageTypes.has(baseMime(mimeType));
 
@@ -159,22 +215,33 @@ export const removeObjects = async (objectPaths: string[]) => {
   });
 };
 
-/** Keeps names readable while removing path separators and control characters. */
+/** Bidi overrides/isolates/marks and zero-width characters: they disguise names ("gpj.exe" shown as "exe.jpg"). */
+const disguisingCharacters = /[\u00ad\u061c\u200b-\u200f\u202a-\u202e\u2060-\u2064\u2066-\u2069\ufeff]/g;
+
+/** A name that is empty or only dots (".", "..") must never become a path segment. */
+const withoutDotSegments = (value: string) => value.replace(/^[.\s]+/, "").trim();
+
+/** Keeps names readable while removing path separators, control and disguising characters. */
 export const sanitizeFileName = (name: string) => {
-  const cleaned = name
-    .normalize("NFC")
-    // eslint-disable-next-line no-control-regex -- stripping control characters is intended
-    .replace(/[\u0000-\u001f\u007f/\\]+/g, "_")
-    .replace(/^\.+/, "")
-    .trim()
-    .slice(0, 180);
+  const cleaned = withoutDotSegments(
+    name
+      .normalize("NFC")
+      .replace(disguisingCharacters, "")
+      // eslint-disable-next-line no-control-regex -- stripping control characters is intended
+      .replace(/[\u0000-\u001f\u007f/\\]+/g, "_")
+      .trim()
+  ).slice(0, 180);
   return cleaned.length > 0 ? cleaned : "file";
 };
 
-/** Object keys use ASCII only; the display name is kept in the database. */
+/**
+ * Object keys use ASCII only; the display name is kept in the database. Dot segments are stripped again
+ * after the ASCII folding: "́.." (a lone combining mark + dots) would otherwise become "..".
+ */
 export const storageSafeSegment = (name: string) =>
-  sanitizeFileName(name)
-    .normalize("NFD")
-    .replace(/[̀-ͯ]/g, "")
-    .replace(/[^A-Za-z0-9._-]+/g, "-")
-    .slice(0, 120) || "file";
+  withoutDotSegments(
+    sanitizeFileName(name)
+      .normalize("NFD")
+      .replace(/[̀-ͯ]/g, "")
+      .replace(/[^A-Za-z0-9._-]+/g, "-")
+  ).slice(0, 120) || "file";

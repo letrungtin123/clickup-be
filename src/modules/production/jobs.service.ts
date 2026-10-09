@@ -1,6 +1,7 @@
 import type { z } from "zod";
 
 import type {
+  CloseFeedbackRequestSchema,
   CreateFeedbackRequestSchema,
   CreateJobRequest,
   JobDetail,
@@ -11,11 +12,15 @@ import type {
 } from "../../contracts/production-jobs.js";
 import { getSql } from "../../db/client.js";
 import { AppError } from "../../lib/app-error.js";
-import { decodeCursor, encodeCursor, escapeLike, type QuerySql } from "../../lib/db-types.js";
+import { escapeLike, type QuerySql } from "../../lib/db-types.js";
 import type { AccessContext } from "../access/access-context.js";
 import { assertProductionMember, assertProductionRole, hasProductionRole, isProductionAdmin } from "./access.js";
+import { cursorInstantSql, decodeTimeCursor, encodeTimeCursor } from "./cursor.js";
 import { resolveCustomValues, setEntityTags } from "./custom-fields.js";
+import { syncJobChat } from "./job-chat.service.js";
 import {
+  assertJobVisible,
+  canSeeAllJobs,
   jobSelectSql,
   loadMemberRoles,
   loadWorkflowModel,
@@ -30,33 +35,16 @@ import {
   type TaskRow
 } from "./jobs.repo.js";
 import { enqueueProductionEvents, feedbackEvent } from "./notifications.js";
-import { insertTasks, loadJobForTasks, moveTask, publishProductionChange, settleJob } from "./tasks.service.js";
-import { allowedTransitions, statusByCode, statusById, type Workflow } from "./workflow.js";
+import { publishProductionChange } from "./realtime.js";
+import { insertTasks, loadJobForTasks, moveTasks, releaseParkedTasks, settleJob } from "./tasks.service.js";
+import { allowedTransitions, statusByCode, statusById, systemOnlyTargetCodes, type Workflow } from "./workflow.js";
+
+export { assertJobVisible };
 
 type In<T extends z.ZodTypeAny> = z.infer<T>;
 const jobNotFound = () => new AppError("JOB_NOT_FOUND", "Không tìm thấy job.", 404);
 
 const isAccountOrAdmin = (context: AccessContext) => isProductionAdmin(context) || hasProductionRole(context, "ACCOUNT");
-
-/** Account / Leader / Admin see every job; others only jobs where they work or check a task. */
-const canSeeAllJobs = (context: AccessContext) => isProductionAdmin(context) || hasProductionRole(context, "ACCOUNT", "LEADER");
-
-/** 404 unless the caller may see the job (all-jobs roles, its leader, or someone working/checking in it). */
-export const assertJobVisible = async (sql: QuerySql, context: AccessContext, jobId: string) => {
-  if (canSeeAllJobs(context)) {
-    return;
-  }
-  const rows = await sql`
-    SELECT 1 FROM production.jobs j
-    WHERE j.organization_id = ${context.organization.id} AND j.id = ${jobId}
-      AND (j.leader_id = ${context.user.id} OR EXISTS (
-        SELECT 1 FROM production.tasks t WHERE t.organization_id = j.organization_id AND t.job_id = j.id
-          AND (t.assignee_id = ${context.user.id} OR t.qc_id = ${context.user.id})))
-  `;
-  if (rows.length === 0) {
-    throw jobNotFound();
-  }
-};
 
 const assertLeader = async (sql: QuerySql, organizationId: string, leaderId: string) => {
   const roles = (await loadMemberRoles(sql, organizationId, [leaderId])).get(leaderId);
@@ -74,50 +62,65 @@ const assertProject = async (sql: QuerySql, organizationId: string, projectId: s
 
 // Reads ---------------------------------------------------------------------------------------------------
 
+/**
+ * GET /production/jobs. PERF-01: the page of job ids is selected first — straight from
+ * (organization_id, created_at DESC, id DESC) for active jobs, filters applied on the job row — and only
+ * those jobs are aggregated, instead of aggregating every job before sorting and limiting. Keyset on
+ * created_at at full precision (BUG-PR-05).
+ */
 export const listJobs = async (context: AccessContext, query: JobQuery): Promise<JobPage> => {
   assertProductionRole(context, "ACCOUNT", "LEADER");
   const sql = getSql();
   const organizationId = context.organization.id;
-  const cursor = decodeCursor(query.cursor, 2);
-  if (query.cursor && !cursor) {
-    throw new AppError("INVALID_CURSOR", "Con trỏ phân trang không hợp lệ.", 400);
-  }
+  const cursor = decodeTimeCursor(query.cursor);
   const like = query.q ? `%${escapeLike(query.q.toLowerCase())}%` : null;
   const rows = await sql<JobRow[]>`
+    WITH page AS MATERIALIZED (
+      SELECT j.id FROM production.jobs j
+      WHERE j.organization_id = ${organizationId}
+        ${query.includeArchived ? sql`` : sql`AND j.archived_at IS NULL`}
+        ${query.projectId ? sql`AND j.project_id = ${query.projectId}` : sql``}
+        ${query.statusId ? sql`AND j.status_id = ${query.statusId}` : sql``}
+        ${query.leaderId ? sql`AND j.leader_id = ${query.leaderId}` : sql``}
+        ${query.deadlineFrom ? sql`AND j.deadline >= ${query.deadlineFrom}::timestamptz` : sql``}
+        ${query.deadlineTo ? sql`AND j.deadline < ${query.deadlineTo}::timestamptz` : sql``}
+        ${
+          query.late
+            ? sql`AND EXISTS (
+                SELECT 1 FROM production.tasks t WHERE t.organization_id = j.organization_id AND t.job_id = j.id
+                  AND t.is_late AND t.done_at IS NULL AND t.closed_at IS NULL)`
+            : sql``
+        }
+        ${
+          query.tagId
+            ? sql`AND EXISTS (SELECT 1 FROM production.entity_tags et WHERE et.organization_id = j.organization_id AND et.entity = 'JOB' AND et.entity_id = j.id AND et.tag_id = ${query.tagId})`
+            : sql``
+        }
+        ${like ? sql`AND public.immutable_unaccent(lower(j.code || ' ' || coalesce(j.name, ''))) LIKE public.immutable_unaccent(${like})` : sql``}
+        ${cursor ? sql`AND (j.created_at, j.id) < (${cursorInstantSql(sql, cursor.at)}, ${cursor.id}::uuid)` : sql``}
+      ORDER BY j.created_at DESC, j.id DESC
+      LIMIT ${query.limit + 1}
+    )
     ${jobSelectSql(sql)}
-    WHERE j.organization_id = ${organizationId}
-      ${query.includeArchived ? sql`` : sql`AND j.archived_at IS NULL`}
-      ${query.projectId ? sql`AND j.project_id = ${query.projectId}` : sql``}
-      ${query.statusId ? sql`AND j.status_id = ${query.statusId}` : sql``}
-      ${query.leaderId ? sql`AND j.leader_id = ${query.leaderId}` : sql``}
-      ${query.deadlineFrom ? sql`AND j.deadline >= ${query.deadlineFrom}::timestamptz` : sql``}
-      ${query.deadlineTo ? sql`AND j.deadline < ${query.deadlineTo}::timestamptz` : sql``}
-      ${query.late ? sql`AND coalesce(agg.late_task_count, 0) > 0` : sql``}
-      ${
-        query.tagId
-          ? sql`AND EXISTS (SELECT 1 FROM production.entity_tags et WHERE et.organization_id = j.organization_id AND et.entity = 'JOB' AND et.entity_id = j.id AND et.tag_id = ${query.tagId})`
-          : sql``
-      }
-      ${like ? sql`AND public.immutable_unaccent(lower(j.code || ' ' || coalesce(j.name, ''))) LIKE public.immutable_unaccent(${like})` : sql``}
-      ${cursor ? sql`AND (j.created_at, j.id) < (${String(cursor[0])}::timestamptz, ${String(cursor[1])}::uuid)` : sql``}
+    WHERE j.organization_id = ${organizationId} AND j.id IN (SELECT id FROM page)
     ORDER BY j.created_at DESC, j.id DESC
-    LIMIT ${query.limit + 1}
   `;
   const page = rows.slice(0, query.limit);
   const last = page[page.length - 1];
   return {
     items: page.map(toJobSummary),
-    pageInfo: { hasMore: rows.length > query.limit, nextCursor: rows.length > query.limit && last ? encodeCursor([last.created_at.toISOString(), last.id]) : null }
+    pageInfo: { hasMore: rows.length > query.limit, nextCursor: rows.length > query.limit && last ? encodeTimeCursor(last.created_cursor, last.id) : null }
   };
 };
 
+/** Job-level moves: every non-override, note-free move the caller may apply (never into FEEDBACK, BUG-PR-01). */
 const bulkActions = (workflow: Workflow, context: AccessContext, tasks: TaskRow[]) => {
   const counts = new Map<string, number>();
   for (const task of tasks) {
     for (const option of allowedTransitions(workflow, task.status_id, relationOf(context, task))) {
       const target = statusById(workflow, option.toStatusId);
       // Bulk moves never need per-task input: no notes (QC fail, overrides) and no Done quantities.
-      if (!target || option.override || option.requiresNote || target.countsDone) {
+      if (!target || option.override || option.requiresNote || target.countsDone || systemOnlyTargetCodes.has(target.code)) {
         continue;
       }
       counts.set(target.id, (counts.get(target.id) ?? 0) + 1);
@@ -155,6 +158,7 @@ export const getJobDetail = async (context: AccessContext, jobId: string, sql: Q
       canEdit: !archived && (manage || isAccountOrAdmin(context)),
       canSplit: !archived && manage,
       canFeedback: !archived && isAccountOrAdmin(context) && taskRows.some((task) => task.status_code === "DELIVERING"),
+      canCloseFeedback: !archived && isAccountOrAdmin(context) && feedbackRows.some((feedback) => feedback.status !== "RESOLVED"),
       canArchive: isAccountOrAdmin(context),
       bulkActions: archived ? [] : bulkActions(workflow, context, taskRows)
     }
@@ -196,7 +200,7 @@ export const updateJob = async (context: AccessContext, jobId: string, input: Up
   assertProductionMember(context);
   const organizationId = context.organization.id;
   const sql = getSql();
-  await sql.begin(async (tx) => {
+  const previousLeader = await sql.begin(async (tx) => {
     const job = (
       await tx<{ leader_id: string; custom_values: Record<string, unknown>; archived_at: Date | null }[]>`
         SELECT leader_id, custom_values, archived_at FROM production.jobs WHERE organization_id = ${organizationId} AND id = ${jobId} FOR UPDATE
@@ -245,8 +249,12 @@ export const updateJob = async (context: AccessContext, jobId: string, input: Up
     if (input.tagIds) {
       await setEntityTags(tx, organizationId, "JOB", jobId, input.tagIds);
     }
+    return job.leader_id;
   });
-  publishProductionChange(organizationId, jobId, [], "job", context.user.id);
+  publishProductionChange(organizationId, jobId, [], "job", context.user.id, [previousLeader]);
+  if (input.leaderId !== undefined && input.leaderId !== previousLeader) {
+    await syncJobChat(context, jobId);
+  }
   return await getJobDetail(context, jobId);
 };
 
@@ -263,23 +271,23 @@ export const transitionJob = async (context: AccessContext, jobId: string, input
     if (!target?.active || target.countsDone) {
       throw new AppError("TRANSITION_NOT_ALLOWED", "Không thể chuyển cả job sang trạng thái này.", 400);
     }
+    if (systemOnlyTargetCodes.has(target.code)) {
+      throw new AppError("TRANSITION_NOT_ALLOWED", `Chỉ hệ thống chuyển task sang "${target.name}" — dùng "Ghi feedback" trên job.`, 400);
+    }
     const ids = (
       await tx<{ id: string }[]>`SELECT id FROM production.tasks WHERE organization_id = ${organizationId} AND job_id = ${jobId} ORDER BY created_at FOR UPDATE`
     ).map((row) => row.id);
-    const movedIds: string[] = [];
-    for (const task of await selectTasks(tx, organizationId, ids)) {
+    const eligible = (await selectTasks(tx, organizationId, ids)).filter((task) => {
       const option = allowedTransitions(workflow, task.status_id, relationOf(context, task)).find((item) => item.toStatusId === target.id);
-      if (!option || option.override || option.requiresNote) {
-        continue;
-      }
-      await moveTask(tx, organizationId, workflow, task, target, context.user.id, input.note?.trim() || null);
-      movedIds.push(task.id);
-    }
-    if (movedIds.length === 0) {
+      return option !== undefined && !option.override && !option.requiresNote;
+    });
+    if (eligible.length === 0) {
       throw new AppError("NOTHING_TO_MOVE", `Không có task nào bạn chuyển được sang "${target.name}".`, 409);
     }
+    // One UPDATE + one history insert for the whole job (PERF-15).
+    await moveTasks(tx, organizationId, workflow, eligible, target, context.user.id, input.note?.trim() || null);
     await settleJob(tx, organizationId, workflow, jobId);
-    return movedIds;
+    return eligible.map((task) => task.id);
   });
   publishProductionChange(organizationId, jobId, moved, "tasks", context.user.id);
   return { moved: moved.length, job: await getJobDetail(context, jobId) };
@@ -316,12 +324,18 @@ export const createFeedback = async (context: AccessContext, jobId: string, inpu
       INSERT INTO production.feedbacks (organization_id, job_id, source_task_id, type, note, created_by)
       VALUES (${organizationId}, ${jobId}, ${input.sourceTaskId ?? null}, ${input.type}, ${input.note}, ${context.user.id})
     `;
-    for (const task of await selectTasks(tx, organizationId, ids)) {
-      await moveTask(tx, organizationId, workflow, task, feedback, context.user.id, `Feedback ${input.type === "WRONG" ? "sai" : "yêu cầu thêm"}: ${input.note}`.slice(0, 5000));
-    }
+    await moveTasks(
+      tx,
+      organizationId,
+      workflow,
+      await selectTasks(tx, organizationId, ids),
+      feedback,
+      context.user.id,
+      `Feedback ${input.type === "WRONG" ? "sai" : "yêu cầu thêm"}: ${input.note}`.slice(0, 5000)
+    );
     await settleJob(tx, organizationId, workflow, jobId);
     await enqueueProductionEvents(tx, [
-      feedbackEvent(organizationId, jobId, context.user.id, { type: input.type, note: input.note, sourceTaskId: input.sourceTaskId ?? null })
+      feedbackEvent(organizationId, jobId, context.user.id, { type: input.type, note: input.note, sourceTaskId: input.sourceTaskId ?? null, taskIds: ids })
     ]);
     return ids;
   });
@@ -362,7 +376,46 @@ export const reassignFeedback = async (context: AccessContext, feedbackId: strin
     return { jobId: feedback.job_id, ...created };
   });
   publishProductionChange(organizationId, result.jobId, result.ids, "feedback", context.user.id);
+  await syncJobChat(context, result.jobId);
   const workflow = await loadWorkflowModel(sql, organizationId);
   const rows = await selectTasks(sql, organizationId, result.ids);
   return { tasks: rows.map((row) => toProductionTask(row, workflow, relationOf(context, row))), warnings: result.warnings };
+};
+
+/**
+ * "Đóng feedback, không cần làm lại" (BUG-PR-02, Account / Admin): resolves an open feedback with a note
+ * (resolution CLOSED). Once no feedback of the job is open, the tasks parked in FEEDBACK (and re-done FB
+ * tasks already Checked) return to Complete so the job can be delivered again. Re-done tasks still in
+ * progress keep their own flow (the Leader completes them as usual).
+ */
+export const closeFeedback = async (context: AccessContext, feedbackId: string, input: In<typeof CloseFeedbackRequestSchema>) => {
+  assertProductionRole(context, "ACCOUNT");
+  const organizationId = context.organization.id;
+  const sql = getSql();
+  const note = input.note.trim();
+  const result = await sql.begin(async (tx) => {
+    const found = (await tx<{ job_id: string }[]>`SELECT job_id FROM production.feedbacks WHERE organization_id = ${organizationId} AND id = ${feedbackId}`)[0];
+    if (!found) {
+      throw new AppError("FEEDBACK_NOT_FOUND", "Không tìm thấy feedback.", 404);
+    }
+    // Lock order: job, then its rows.
+    await loadJobForTasks(tx, organizationId, found.job_id, true);
+    const feedback = (
+      await tx<{ status: string }[]>`SELECT status FROM production.feedbacks WHERE organization_id = ${organizationId} AND id = ${feedbackId} FOR UPDATE`
+    )[0]!;
+    if (feedback.status === "RESOLVED") {
+      throw new AppError("FEEDBACK_RESOLVED", "Feedback này đã xử lý xong.", 409);
+    }
+    await tx`
+      UPDATE production.feedbacks
+      SET status = 'RESOLVED', resolution = 'CLOSED', resolved_at = now(), resolved_by = ${context.user.id}, resolution_note = ${note}
+      WHERE organization_id = ${organizationId} AND id = ${feedbackId}
+    `;
+    const workflow = await loadWorkflowModel(tx, organizationId);
+    const released = await releaseParkedTasks(tx, organizationId, workflow, found.job_id, context.user.id, `Đóng feedback, không cần làm lại: ${note}`.slice(0, 5000));
+    await settleJob(tx, organizationId, workflow, found.job_id);
+    return { jobId: found.job_id, released };
+  });
+  publishProductionChange(organizationId, result.jobId, result.released, "feedback", context.user.id);
+  return await getJobDetail(context, result.jobId);
 };

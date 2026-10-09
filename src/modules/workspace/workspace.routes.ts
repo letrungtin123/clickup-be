@@ -10,6 +10,7 @@ import {
   CreateRoleRequestSchema,
   OpaqueIdSchema,
   OrganizationMemberCollectionSchema,
+  OrganizationMemberQuerySchema,
   OrganizationMemberSchema,
   PermissionCollectionSchema,
   RoleCollectionSchema,
@@ -19,8 +20,10 @@ import {
   UpdateRoleRequestSchema,
   WorkspaceContextSchema
 } from "../../contracts/schemas.js";
+import { getSql } from "../../db/client.js";
+import { AppError } from "../../lib/app-error.js";
 import { requireSupabaseUser, type AuthenticatedRequest } from "../../middleware/auth.js";
-import { createPasswordChangeRateLimit } from "../../middleware/rate-limit.js";
+import { createPasswordChangeRateLimit, markPasswordGuessFailed } from "../../middleware/rate-limit.js";
 import { clearAuthCookies, setAuthCookies } from "../auth/auth.cookies.js";
 import { signInWithPassword } from "../auth/supabase-auth.service.js";
 import { setAuthUserBanned } from "../auth/supabase-admin.service.js";
@@ -47,7 +50,18 @@ const getAuthenticatedUserId = (req: Request) => {
 
 const resolveActiveContext = async (req: Request) => assertPasswordCurrent(await resolveAccessContext(getAuthenticatedUserId(req)));
 
-workspaceRoutes.use(requireSupabaseUser);
+/** Users whose (non-deleted) membership uses the role. */
+const listRoleHolderIds = async (context: { organization: { id: string } }, roleId: string) =>
+  (
+    await getSql()<{ user_id: string }[]>`
+      SELECT user_id FROM public.organization_memberships
+      WHERE organization_id = ${context.organization.id} AND role_id = ${roleId} AND deleted_at IS NULL
+      LIMIT 10000
+    `
+  ).map((row) => row.user_id);
+
+// Scoped to this module's paths: unknown routes fall through to the 404 handler instead of a 401 (WK-60).
+workspaceRoutes.use(["/workspace", "/permissions", "/roles", "/organization", "/auth/change-password"], requireSupabaseUser);
 
 workspaceRoutes.get("/workspace/context", async (req, res, next) => {
   try {
@@ -121,6 +135,9 @@ workspaceRoutes.patch("/roles/:roleId/permissions", async (req, res, next) => {
     const context = await resolveActiveContext(req);
     const payload = await updateRolePermissions(context, roleId, input);
     await invalidateAccessContexts();
+    // Live room subscriptions were authorized with the old permissions: like a membership change, the
+    // holders of this role reconnect and re-authorize (SEC-API-07).
+    disconnectUsers(await listRoleHolderIds(context, roleId));
     res.json(ManagedRoleSchema.parse(payload));
   } catch (error) {
     next(error);
@@ -129,8 +146,9 @@ workspaceRoutes.patch("/roles/:roleId/permissions", async (req, res, next) => {
 
 workspaceRoutes.get("/organization/members", async (req, res, next) => {
   try {
+    const query = OrganizationMemberQuerySchema.parse(req.query);
     const context = await resolveActiveContext(req);
-    const payload = await listOrganizationMembers(context);
+    const payload = await listOrganizationMembers(context, query);
     res.json(OrganizationMemberCollectionSchema.parse(payload));
   } catch (error) {
     next(error);
@@ -186,7 +204,15 @@ workspaceRoutes.post("/auth/change-password", passwordChangeRateLimit, async (re
     const input = ChangePasswordRequestSchema.parse(req.body);
     const auth = (req as unknown as AuthenticatedRequest).auth;
     const context = await resolveAccessContext(auth.id);
-    await changeOwnPassword(context, auth.sessionId, input);
+    try {
+      await changeOwnPassword(context, auth.sessionId, input);
+    } catch (error) {
+      if (error instanceof AppError && error.code === "CURRENT_PASSWORD_INVALID") {
+        // The only outcome the change-password limiter counts (WK-38).
+        markPasswordGuessFailed(res);
+      }
+      throw error;
+    }
     // A password change ends every session (GoTrue included); sign this browser straight back in
     // with the new password so the user stays signed in with a fresh session.
     let reauthenticate = true;

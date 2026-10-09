@@ -8,7 +8,7 @@ import type {
   ChatReactionEvent,
   ChatReadEvent
 } from "./chat.js";
-import type { NotificationNewEvent, NotificationReadEvent } from "./notifications.js";
+import type { NotificationArchivedEvent, NotificationNewEvent, NotificationReadEvent } from "./notifications.js";
 
 /**
  * Realtime contract shared by the API gateway, the worker, and the SPA.
@@ -40,6 +40,16 @@ export const PresenceQuerySchema = z.object({
 });
 
 export type RealtimeAck = { ok: true } | { ok: false; code: string };
+
+/**
+ * `session:refresh` (client → server, PERF-02): keeps an open socket alive across access-token refreshes.
+ * Protocol: on `session:expiring` (sent ~60 s before the token expires) or after any successful
+ * POST /auth/refresh, the client calls POST /auth/socket-ticket and emits `session:refresh` with the ticket.
+ * ok → the socket now lives until `expiresAt` (seconds); not ok → fall back to disconnect + reconnect
+ * (the handshake reads the new cookie). Sockets that never refresh are disconnected at token expiry.
+ */
+export const SessionRefreshInputSchema = z.object({ ticket: z.string().min(16).max(4000) });
+export type SessionRefreshAck = { ok: true; expiresAt: number } | { ok: false; code: string };
 
 export type TaskChangedEvent = {
   projectId: string;
@@ -106,6 +116,7 @@ export type ServerToClientEvents = {
   "chat:typing": (event: ChatTypingEvent) => void;
   "notification:new": (event: NotificationNewEvent) => void;
   "notification:read": (event: NotificationReadEvent) => void;
+  "notification:archived": (event: NotificationArchivedEvent) => void;
   "access:revoked": (event: { room: RealtimeRoomRef }) => void;
   "session:expiring": (event: { expiresAt: number }) => void;
 };
@@ -116,4 +127,5 @@ export type ClientToServerEvents = {
   "chat:typing": (input: unknown) => void;
   "presence:heartbeat": () => void;
   "presence:query": (input: unknown, ack: (result: { online: string[] }) => void) => void;
+  "session:refresh": (input: unknown, ack: (result: SessionRefreshAck) => void) => void;
 };

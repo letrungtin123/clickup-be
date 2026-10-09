@@ -62,12 +62,24 @@ const rebalance = async (sql: QuerySql, scope: RankScope) => {
   }
 };
 
-/** Computes the rank for a new/moved row. Rebalances the sibling set once if ranks collide. */
+/** Advisory-lock key of one sibling set (table + scope columns, order-independent). */
+export const rankScopeLockKey = (scope: RankScope) =>
+  `rank:${scope.table}:${Object.entries(scope.where)
+    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+    .map(([column, value]) => `${column}=${value ?? "∅"}`)
+    .join(",")}`;
+
+/**
+ * Computes the rank for a new/moved row. Rebalances the sibling set once if ranks collide.
+ * Concurrent placements in the same sibling set are serialized (transaction advisory lock) so two drags
+ * or appends never compute the same rank (WK-25); callers run inside a transaction.
+ */
 export const rankForPlacement = async (
   sql: QuerySql,
   scope: RankScope,
   placement: { afterId?: string | null | undefined; beforeId?: string | null | undefined } | undefined
 ): Promise<string> => {
+  await sql`SELECT pg_advisory_xact_lock(hashtextextended(${rankScopeLockKey(scope)}, 0))`;
   for (let attempt = 0; attempt < 2; attempt += 1) {
     const where = buildWhere(sql, scope);
     let lower: string | null = null;

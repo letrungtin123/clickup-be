@@ -7,6 +7,7 @@ import { corsOrigins, env } from "../config/env.js";
 import {
   PresenceQuerySchema,
   RealtimeRoomRefSchema,
+  SessionRefreshInputSchema,
   TypingInputSchema,
   orgRoom,
   roomName,
@@ -21,7 +22,8 @@ import { logger } from "../lib/logger.js";
 import { getOptionalRedis, getRedisSubscriber } from "../lib/redis.js";
 import { assertPasswordCurrent, resolveAccessContext } from "../modules/access/access-context.js";
 import { accessTokenCookieName } from "../modules/auth/auth.cookies.js";
-import { verifyAccessToken } from "../modules/auth/supabase-auth.service.js";
+import { verifySocketTicket } from "../modules/auth/socket-ticket.js";
+import { isTokenRevoked, verifyAccessToken } from "../modules/auth/supabase-auth.service.js";
 import { sessionRoom, setLocalRealtimeServer } from "./publisher.js";
 import { authorizeRoom, type RoomAccess } from "./room-authorizers.js";
 
@@ -132,13 +134,58 @@ export const attachRealtimeGateway = (httpServer: HttpServer): GatewayServer => 
     ]);
     void touchPresence(socket).catch(() => undefined);
 
-    // Force re-authentication when the access token expires; the client refreshes and reconnects.
-    const msUntilExpiry = socket.data.expiresAt * 1000 - Date.now();
-    const expiryWarning = setTimeout(
-      () => socket.emit("session:expiring", { expiresAt: socket.data.expiresAt }),
-      Math.max(0, msUntilExpiry - 60_000)
-    );
-    const expiryTimer = setTimeout(() => socket.disconnect(true), Math.max(0, msUntilExpiry));
+    // At access-token expiry the socket is disconnected unless the client refreshed it in place
+    // (`session:refresh` with a ticket from POST /auth/socket-ticket, PERF-02); 60 s before, it is warned.
+    let expiryWarning: NodeJS.Timeout | undefined;
+    let expiryTimer: NodeJS.Timeout | undefined;
+    const scheduleExpiry = () => {
+      clearTimeout(expiryWarning);
+      clearTimeout(expiryTimer);
+      const msUntilExpiry = socket.data.expiresAt * 1000 - Date.now();
+      expiryWarning = setTimeout(
+        () => socket.emit("session:expiring", { expiresAt: socket.data.expiresAt }),
+        Math.max(0, msUntilExpiry - 60_000)
+      );
+      expiryTimer = setTimeout(() => socket.disconnect(true), Math.max(0, msUntilExpiry));
+    };
+    scheduleExpiry();
+
+    socket.on("session:refresh", async (rawInput, ack) => {
+      const reply = typeof ack === "function" ? ack : () => undefined;
+      if (!takeToken(socket)) {
+        reply({ ok: false, code: "RATE_LIMITED" });
+        return;
+      }
+      const parsed = SessionRefreshInputSchema.safeParse(rawInput);
+      if (!parsed.success) {
+        reply({ ok: false, code: "INVALID_TICKET" });
+        return;
+      }
+      try {
+        const claims = await verifySocketTicket(parsed.data.ticket);
+        // Same person, same auth session (a new sign-in on this browser reconnects instead).
+        if (claims.userId !== socket.data.userId || (socket.data.sessionId !== null && claims.sessionId !== socket.data.sessionId)) {
+          reply({ ok: false, code: "SESSION_MISMATCH" });
+          return;
+        }
+        if (claims.tokenExpiresAt * 1000 <= Date.now()) {
+          reply({ ok: false, code: "TOKEN_EXPIRED" });
+          return;
+        }
+        if (await isTokenRevoked(claims.userId, claims.sessionId, claims.tokenIssuedAt ?? undefined)) {
+          reply({ ok: false, code: "SESSION_REVOKED" });
+          socket.disconnect(true);
+          return;
+        }
+        // Still an active member allowed to use the app (disabled accounts and pending password changes fail).
+        assertPasswordCurrent(await resolveAccessContext(claims.userId));
+        socket.data.expiresAt = Math.max(socket.data.expiresAt, claims.tokenExpiresAt);
+        scheduleExpiry();
+        reply({ ok: true, expiresAt: socket.data.expiresAt });
+      } catch (error) {
+        reply({ ok: false, code: error instanceof AppError ? error.code : "UNAVAILABLE" });
+      }
+    });
 
     socket.on("room:join", async (rawRoom, ack) => {
       const reply = typeof ack === "function" ? ack : () => undefined;

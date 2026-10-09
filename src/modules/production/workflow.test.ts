@@ -5,7 +5,12 @@ import { AppError } from "../../lib/app-error.js";
 import {
   allowedTransitions,
   assertTransition,
+  computeIsLate,
+  defaultTaskDeadline,
   deriveJobStatus,
+  feedbackTaskDeadline,
+  finishedStatusIds,
+  isQcFail,
   overAllocationWarning,
   systemFollowUp,
   taskLineErrors,
@@ -49,7 +54,8 @@ const workflow: Workflow = {
     { fromStatusId: "CHECKED", toStatusId: "COMPLETE", actors: ["JOB_LEADER"], requiresNote: false },
     { fromStatusId: "COMPLETE", toStatusId: "DELIVERING", actors: ["ACCOUNT"], requiresNote: false },
     { fromStatusId: "DELIVERING", toStatusId: "DELIVERED", actors: ["ACCOUNT"], requiresNote: false },
-    { fromStatusId: "DELIVERING", toStatusId: "FEEDBACK", actors: ["ACCOUNT"], requiresNote: false },
+    // SYSTEM only since BUG-PR-01 ("Ghi feedback" parks the tasks together with the feedback record).
+    { fromStatusId: "DELIVERING", toStatusId: "FEEDBACK", actors: ["SYSTEM"], requiresNote: false },
     { fromStatusId: "FEEDBACK", toStatusId: "COMPLETE", actors: ["SYSTEM", "JOB_LEADER"], requiresNote: false }
   ]
 };
@@ -88,7 +94,7 @@ describe("status transitions (SPEC Phase 2 §2)", () => {
     expect(targets("PROCESSING", assignee)).toEqual(["DONE"]);
     expect(targets("WAITING_QC", who(["QC"], { isQc: true }))).toEqual(["PROCESSING", "CHECKED"]);
     expect(targets("COMPLETE", who(["ACCOUNT"]))).toEqual(["DELIVERING"]);
-    expect(targets("DELIVERING", who(["ACCOUNT"]))).toEqual(["FEEDBACK", "DELIVERED"]);
+    expect(targets("DELIVERING", who(["ACCOUNT"]))).toEqual(["DELIVERED"]);
     // Someone else's task: nothing.
     expect(targets("ASSIGNED", who(["STAFF"]))).toEqual([]);
   });
@@ -106,7 +112,8 @@ describe("status transitions (SPEC Phase 2 §2)", () => {
 
   it("ADMIN may force any move but must give a reason", () => {
     const admin = who(["ADMIN"]);
-    expect(targets("ASSIGNED", admin)).toHaveLength(8);
+    // Every other status except FEEDBACK (system only).
+    expect(targets("ASSIGNED", admin)).toHaveLength(7);
     rejects(() => assertTransition(workflow, "ASSIGNED", "DELIVERED", admin, undefined), "NOTE_REQUIRED");
     expect(assertTransition(workflow, "ASSIGNED", "DELIVERED", admin, "Khách nhận trực tiếp").override).toBe(true);
     // Role-based steps (Account delivers) need no reason; relation-based ones (the assignee's Done) do.
@@ -118,6 +125,86 @@ describe("status transitions (SPEC Phase 2 §2)", () => {
     expect(systemFollowUp(workflow, "DONE", true)?.code).toBe("WAITING_QC");
     expect(systemFollowUp(workflow, "DONE", false)).toBeNull();
     expect(systemFollowUp(workflow, "PROCESSING", true)).toBeNull();
+  });
+});
+
+describe("audit fixes (2026-10-10)", () => {
+  const account = who(["ACCOUNT"]);
+  const admin = who(["ADMIN"]);
+  const jobLeader = who(["LEADER"], { isJobLeader: true });
+
+  it("BUG-PR-01: nobody moves a task into FEEDBACK — not even with a stale ACCOUNT transition row or an ADMIN override", () => {
+    const stale: Workflow = {
+      ...workflow,
+      transitions: workflow.transitions.map((item) => (item.toStatusId === "FEEDBACK" ? { ...item, actors: ["ACCOUNT"] } : item))
+    };
+    expect(allowedTransitions(stale, "DELIVERING", account).map((option) => option.toStatusId)).toEqual(["DELIVERED"]);
+    expect(targets("DELIVERING", admin)).not.toContain("FEEDBACK");
+    expect(targets("ASSIGNED", admin)).not.toContain("FEEDBACK");
+    rejects(() => assertTransition(stale, "DELIVERING", "FEEDBACK", account, undefined), "TRANSITION_NOT_ALLOWED");
+    rejects(() => assertTransition(workflow, "DELIVERING", "FEEDBACK", admin, "lý do"), "TRANSITION_NOT_ALLOWED");
+  });
+
+  it("BUG-PR-02: while the job's feedback is open, tasks leave FEEDBACK only through the system", () => {
+    const open = (relation: TaskRelation) => ({ ...relation, jobHasOpenFeedback: true });
+    expect(targets("FEEDBACK", open(jobLeader))).toEqual([]);
+    expect(targets("FEEDBACK", open(admin))).toEqual([]);
+    rejects(() => assertTransition(workflow, "FEEDBACK", "COMPLETE", open(jobLeader), undefined), "FEEDBACK_OPEN");
+    rejects(() => assertTransition(workflow, "FEEDBACK", "COMPLETE", open(admin), "ép"), "FEEDBACK_OPEN");
+    // No open feedback (e.g. a job parked before the fix): the job leader may release it.
+    expect(targets("FEEDBACK", jobLeader)).toEqual(["COMPLETE"]);
+    // Other tasks of the job keep their flow.
+    expect(targets("ASSIGNED", open(who(["STAFF"], { isAssignee: true })))).toEqual(["PROCESSING"]);
+  });
+
+  it("BUG-PR-04: tasks of an archived job cannot move", () => {
+    const archived = { ...admin, jobArchived: true };
+    expect(targets("ASSIGNED", archived)).toEqual([]);
+    rejects(() => assertTransition(workflow, "COMPLETE", "DELIVERING", archived, undefined), "JOB_ARCHIVED");
+  });
+
+  it("BUG-PR-07: an ADMIN override out of Waiting QC is not a QC fail; the QC's own move is", () => {
+    const waiting = workflow.statuses.find((status) => status.code === "WAITING_QC")!;
+    const processing = workflow.statuses.find((status) => status.code === "PROCESSING")!;
+    const checked = workflow.statuses.find((status) => status.code === "CHECKED")!;
+    expect(isQcFail(waiting, processing, false)).toBe(true);
+    expect(isQcFail(waiting, processing, true)).toBe(false);
+    expect(isQcFail(waiting, checked, false)).toBe(false);
+    expect(isQcFail(processing, { sortOrder: 1 }, false)).toBe(false);
+    // The admin as the task's QC moves as QC (not an override): it counts.
+    const adminQc = who(["ADMIN", "QC"], { isQc: true });
+    expect(assertTransition(workflow, "WAITING_QC", "PROCESSING", adminQc, "Sai màu").override).toBe(false);
+    expect(assertTransition(workflow, "WAITING_QC", "PROCESSING", admin, "Mở lại").override).toBe(true);
+  });
+
+  it("BUG-PR-08: lateness — closed without Done is not late; Done after the deadline is", () => {
+    const deadline = new Date("2026-10-10T10:00:00Z");
+    const now = new Date("2026-10-11T10:00:00Z");
+    expect(computeIsLate({ doneAt: null, closed: false, deadline, now })).toBe(true);
+    expect(computeIsLate({ doneAt: null, closed: true, deadline, now })).toBe(false);
+    expect(computeIsLate({ doneAt: new Date("2026-10-10T11:00:00Z"), closed: true, deadline, now })).toBe(true);
+    expect(computeIsLate({ doneAt: new Date("2026-10-10T09:00:00Z"), closed: false, deadline, now })).toBe(false);
+    expect(computeIsLate({ doneAt: null, closed: false, deadline, now: new Date("2026-10-10T09:59:59Z") })).toBe(false);
+    expect(finishedStatusIds(workflow)).toEqual(["COMPLETE", "DELIVERING", "FEEDBACK", "DELIVERED"]);
+  });
+
+  it("BUG-PR-03: default deadlines — job deadline − buffer; feedback redo tasks never start late", () => {
+    const jobDeadline = new Date("2026-10-10T11:00:00Z");
+    expect(defaultTaskDeadline(jobDeadline, 2).toISOString()).toBe("2026-10-10T09:00:00.000Z");
+    // Job default still ahead: it is used.
+    expect(feedbackTaskDeadline({ jobDeadline, qcBufferHours: 2, now: new Date("2026-10-10T08:00:00Z"), source: null }).toISOString()).toBe(
+      "2026-10-10T09:00:00.000Z"
+    );
+    // Past it: now + the original task's span (assigned → deadline).
+    const source = { assignedAt: new Date("2026-10-08T02:00:00Z"), deadline: new Date("2026-10-08T08:00:00Z") };
+    const now = new Date("2026-10-12T03:00:00Z");
+    expect(feedbackTaskDeadline({ jobDeadline, qcBufferHours: 2, now, source }).toISOString()).toBe("2026-10-12T09:00:00.000Z");
+    // No original task: 24 h; spans are kept between 1 h and 7 days.
+    expect(feedbackTaskDeadline({ jobDeadline, qcBufferHours: 2, now, source: null }).toISOString()).toBe("2026-10-13T03:00:00.000Z");
+    const instant = { assignedAt: now, deadline: now };
+    expect(feedbackTaskDeadline({ jobDeadline, qcBufferHours: 2, now, source: instant }).toISOString()).toBe("2026-10-12T04:00:00.000Z");
+    const long = { assignedAt: new Date("2026-01-01T00:00:00Z"), deadline: new Date("2026-03-01T00:00:00Z") };
+    expect(feedbackTaskDeadline({ jobDeadline, qcBufferHours: 2, now, source: long }).toISOString()).toBe("2026-10-19T03:00:00.000Z");
   });
 });
 

@@ -1,3 +1,5 @@
+import { randomUUID } from "node:crypto";
+
 import type { z } from "zod";
 
 import type {
@@ -12,15 +14,17 @@ import type {
 } from "../../contracts/production-jobs.js";
 import { getSql } from "../../db/client.js";
 import { AppError } from "../../lib/app-error.js";
-import { decodeCursor, encodeCursor, type QuerySql } from "../../lib/db-types.js";
-import { publishToRoom } from "../../realtime/publisher.js";
+import type { QuerySql } from "../../lib/db-types.js";
 import type { AccessContext } from "../access/access-context.js";
-import { assertProductionMember, productionRoom } from "./access.js";
-import { resolveCustomValues, setEntityTags } from "./custom-fields.js";
+import { assertProductionMember } from "./access.js";
+import { cursorInstantSql, decodeTimeCursor, encodeTimeCursor } from "./cursor.js";
+import { loadFieldDefinitions, resolveCustomValues, setEntityTags, validateCustomValues } from "./custom-fields.js";
+import { syncJobChat } from "./job-chat.service.js";
 import {
   canManageTask,
   canViewTask,
   finishedStatusIds,
+  jobArchivedError,
   loadMemberRoles,
   loadTask,
   loadWorkflowModel,
@@ -31,10 +35,15 @@ import {
   type TaskRow
 } from "./jobs.repo.js";
 import { enqueueProductionEvents, taskAssignedEvent, taskQtyEvent, taskStatusEvent } from "./notifications.js";
+import { publishProductionChange } from "./realtime.js";
 import { onTaskQtyChanged, onTaskStatusEntered } from "./scoring-hooks.js";
 import {
   assertTransition,
+  computeIsLate,
+  defaultTaskDeadline,
   deriveJobStatus,
+  feedbackTaskDeadline,
+  isQcFail,
   overAllocationWarning,
   statusByCode,
   statusById,
@@ -43,6 +52,8 @@ import {
   type Workflow,
   type WorkflowStatus
 } from "./workflow.js";
+
+export { publishProductionChange };
 
 type In<T extends z.ZodTypeAny> = z.infer<T>;
 const notFound = () => new AppError("TASK_NOT_FOUND", "Không tìm thấy task.", 404);
@@ -97,18 +108,143 @@ export const insertTaskLogs = async (tx: QuerySql, organizationId: string, logs:
 
 const statusLogValue = (status: WorkflowStatus) => ({ statusId: status.id, code: status.code, name: status.name });
 
-export const publishProductionChange = (organizationId: string, jobId: string, taskIds: string[], kind: "job" | "tasks" | "feedback" | "comment", actorId: string | null) => {
-  publishToRoom(productionRoom(organizationId), "production:changed", { jobId, taskIds, kind, actorId, at: new Date().toISOString() });
-};
-
 // Status engine -----------------------------------------------------------------------------------------
 
 type MoveExtras = { qtyDone?: number | undefined; otHours?: number | undefined; override?: boolean; at?: Date };
 
 /**
- * Applies one status change to a locked task: Done/Checked timestamps and quantity, lateness,
- * QC-fail counter, history row and the scoring hook. Callers validate permissions first.
+ * Applies the same status change to locked tasks (one task, or a job-level bulk move): Done/Checked timestamps
+ * and quantity, closed_at, lateness, QC-fail counter, history rows and the scoring hook. One UPDATE and one
+ * history INSERT for all of them (PERF-15); the scoring hook still runs per task when the target status
+ * records scores. Callers validate permissions first; the result keeps the input order.
  */
+export const moveTasks = async (
+  tx: QuerySql,
+  organizationId: string,
+  workflow: Workflow,
+  tasks: TaskRow[],
+  to: WorkflowStatus,
+  actorId: string | null,
+  note: string | null,
+  extras: MoveExtras = {}
+): Promise<TaskRow[]> => {
+  if (tasks.length === 0) {
+    return [];
+  }
+  const now = extras.at ?? new Date();
+  // Entering Complete or later closes the task (BUG-PR-08); moving back into the pipeline reopens it.
+  const closing = finishedStatusIds(workflow).includes(to.id);
+  const planned = tasks.map((task) => {
+    const from = statusById(workflow, task.status_id);
+    if (!from) {
+      throw new AppError("WORKFLOW_INCOMPLETE", "Trạng thái hiện tại của task không còn tồn tại.", 409);
+    }
+    if (to.code === "WAITING_QC" && !task.qc_id) {
+      throw new AppError("QC_REQUIRED", "Cần gán QC trước khi chuyển sang chờ QC.", 400);
+    }
+    const firstDone = to.countsDone && task.done_at === null;
+    let qtyDone = task.qty_done;
+    let otHours = task.ot_hours === null ? null : Number(task.ot_hours);
+    if (firstDone) {
+      qtyDone = extras.qtyDone ?? task.qty_assigned;
+      if (task.requires_ot_hours) {
+        if (extras.otHours === undefined) {
+          throw new AppError("OT_HOURS_REQUIRED", "Ca OT cần nhập số giờ OT khi Done.", 400);
+        }
+        otHours = extras.otHours;
+      }
+    } else if (extras.qtyDone !== undefined && extras.qtyDone !== task.qty_done) {
+      throw new AppError("QTY_LOCKED", "Số lượng đã chốt ở lần Done đầu tiên; nhờ Leader sửa nếu cần.", 400);
+    }
+    const qcFail = isQcFail(from, to, extras.override === true);
+    const doneAt = task.done_at ?? (to.countsDone ? now : null);
+    const checkedAt = task.checked_at ?? (to.countsChecked ? now : null);
+    const closedAt = closing ? (task.closed_at ?? now) : null;
+    const isLate = computeIsLate({ doneAt, closed: closedAt !== null, deadline: task.deadline, now });
+    return { task, from, firstDone, qtyDone, otHours, qcFail, doneAt, checkedAt, closedAt, isLate };
+  });
+
+  // Existing timestamps are kept by the database (coalesce) so their microseconds survive.
+  await tx`
+    UPDATE production.tasks AS t
+    SET status_id = ${to.id},
+        qty_done = CASE WHEN (m->>'firstDone')::boolean THEN (m->>'qtyDone')::int ELSE t.qty_done END,
+        ot_hours = CASE WHEN (m->>'firstDone')::boolean THEN (m->>'otHours')::numeric ELSE t.ot_hours END,
+        done_at = coalesce(t.done_at, (m->>'doneAt')::timestamptz),
+        checked_at = coalesce(t.checked_at, (m->>'checkedAt')::timestamptz),
+        closed_at = CASE WHEN ${closing} THEN coalesce(t.closed_at, (m->>'closedAt')::timestamptz) ELSE NULL END,
+        is_late = (m->>'isLate')::boolean,
+        qc_fail_count = t.qc_fail_count + (m->>'qcFail')::int,
+        updated_at = now()
+    FROM jsonb_array_elements(${tx.json(
+      planned.map((plan) => ({
+        id: plan.task.id,
+        firstDone: plan.firstDone,
+        qtyDone: plan.qtyDone,
+        otHours: plan.otHours,
+        doneAt: plan.doneAt?.toISOString() ?? null,
+        checkedAt: plan.checkedAt?.toISOString() ?? null,
+        closedAt: plan.closedAt?.toISOString() ?? null,
+        isLate: plan.isLate,
+        qcFail: plan.qcFail ? 1 : 0
+      }))
+    )}) AS m
+    WHERE t.organization_id = ${organizationId} AND t.id = (m->>'id')::uuid
+  `;
+  await insertTaskLogs(
+    tx,
+    organizationId,
+    planned.map((plan) => ({
+      taskId: plan.task.id,
+      jobId: plan.task.job_id,
+      userId: actorId,
+      action: "STATUS" as const,
+      from: statusLogValue(plan.from),
+      to: {
+        ...statusLogValue(to),
+        ...(plan.firstDone ? { qtyDone: plan.qtyDone, ...(plan.otHours !== null ? { otHours: plan.otHours } : {}) } : {}),
+        ...(plan.qcFail ? { qcFail: true } : {}),
+        ...(extras.override ? { override: true } : {})
+      },
+      note,
+      at: now
+    }))
+  );
+  const events = planned.flatMap((plan) => {
+    const enteredWaitingQc = to.code === "WAITING_QC";
+    const enteredChecked = to.countsChecked && plan.task.checked_at === null;
+    return enteredWaitingQc || enteredChecked || plan.qcFail
+      ? [taskStatusEvent(organizationId, plan.task.id, actorId, { toCode: to.code, toName: to.name, enteredWaitingQc, enteredChecked, qcFail: plan.qcFail, note })]
+      : [];
+  });
+  await enqueueProductionEvents(tx, events);
+  if (to.countsDone || to.countsChecked) {
+    for (const plan of planned) {
+      await onTaskStatusEntered(tx, {
+        organizationId,
+        taskId: plan.task.id,
+        // Credit only work that was Done: an ADMIN override skipping Done records no QC credit either.
+        status: { id: to.id, countsDone: to.countsDone, countsChecked: to.countsChecked && plan.doneAt !== null },
+        at: now
+      });
+    }
+  }
+  return planned.map((plan) => ({
+    ...plan.task,
+    status_id: to.id,
+    status_code: to.code,
+    status_name: to.name,
+    qty_done: plan.qtyDone,
+    ot_hours: plan.otHours === null ? null : String(plan.otHours),
+    done_at: plan.doneAt,
+    checked_at: plan.checkedAt,
+    closed_at: plan.closedAt,
+    is_late: plan.isLate,
+    qc_fail_count: plan.task.qc_fail_count + (plan.qcFail ? 1 : 0)
+  }));
+};
+
+/** One task's status change (see moveTasks). */
 export const moveTask = async (
   tx: QuerySql,
   organizationId: string,
@@ -118,84 +254,7 @@ export const moveTask = async (
   actorId: string | null,
   note: string | null,
   extras: MoveExtras = {}
-): Promise<TaskRow> => {
-  const from = statusById(workflow, task.status_id);
-  if (!from) {
-    throw new AppError("WORKFLOW_INCOMPLETE", "Trạng thái hiện tại của task không còn tồn tại.", 409);
-  }
-  if (to.code === "WAITING_QC" && !task.qc_id) {
-    throw new AppError("QC_REQUIRED", "Cần gán QC trước khi chuyển sang chờ QC.", 400);
-  }
-  const now = extras.at ?? new Date();
-  const firstDone = to.countsDone && task.done_at === null;
-  let qtyDone = task.qty_done;
-  let otHours = task.ot_hours === null ? null : Number(task.ot_hours);
-  if (firstDone) {
-    qtyDone = extras.qtyDone ?? task.qty_assigned;
-    if (task.requires_ot_hours) {
-      if (extras.otHours === undefined) {
-        throw new AppError("OT_HOURS_REQUIRED", "Ca OT cần nhập số giờ OT khi Done.", 400);
-      }
-      otHours = extras.otHours;
-    }
-  } else if (extras.qtyDone !== undefined && extras.qtyDone !== task.qty_done) {
-    throw new AppError("QTY_LOCKED", "Số lượng đã chốt ở lần Done đầu tiên; nhờ Leader sửa nếu cần.", 400);
-  }
-  const qcFail = from.code === "WAITING_QC" && to.sortOrder < from.sortOrder;
-  const doneAt = task.done_at ?? (to.countsDone ? now : null);
-  const checkedAt = task.checked_at ?? (to.countsChecked ? now : null);
-  const isLate = doneAt ? doneAt > task.deadline : now > task.deadline;
-
-  await tx`
-    UPDATE production.tasks
-    SET status_id = ${to.id}, qty_done = ${qtyDone}, ot_hours = ${otHours}, done_at = ${doneAt}, checked_at = ${checkedAt},
-        is_late = ${isLate}, qc_fail_count = qc_fail_count + ${qcFail ? 1 : 0}, updated_at = now()
-    WHERE organization_id = ${organizationId} AND id = ${task.id}
-  `;
-  await insertTaskLogs(tx, organizationId, [
-    {
-      taskId: task.id,
-      jobId: task.job_id,
-      userId: actorId,
-      action: "STATUS",
-      from: statusLogValue(from),
-      to: {
-        ...statusLogValue(to),
-        ...(firstDone ? { qtyDone, ...(otHours !== null ? { otHours } : {}) } : {}),
-        ...(qcFail ? { qcFail: true } : {}),
-        ...(extras.override ? { override: true } : {})
-      },
-      note,
-      at: now
-    }
-  ]);
-  const enteredWaitingQc = to.code === "WAITING_QC";
-  const enteredChecked = to.countsChecked && task.checked_at === null;
-  if (enteredWaitingQc || enteredChecked || qcFail) {
-    await enqueueProductionEvents(tx, [
-      taskStatusEvent(organizationId, task.id, actorId, { toCode: to.code, toName: to.name, enteredWaitingQc, enteredChecked, qcFail, note })
-    ]);
-  }
-  await onTaskStatusEntered(tx, {
-    organizationId,
-    taskId: task.id,
-    // Credit only work that was Done: an ADMIN override skipping Done records no QC credit either.
-    status: { id: to.id, countsDone: to.countsDone, countsChecked: to.countsChecked && doneAt !== null },
-    at: now
-  });
-  return {
-    ...task,
-    status_id: to.id,
-    status_code: to.code,
-    status_name: to.name,
-    qty_done: qtyDone,
-    ot_hours: otHours === null ? null : String(otHours),
-    done_at: doneAt,
-    checked_at: checkedAt,
-    is_late: isLate,
-    qc_fail_count: task.qc_fail_count + (qcFail ? 1 : 0)
-  };
-};
+): Promise<TaskRow> => (await moveTasks(tx, organizationId, workflow, [task], to, actorId, note, extras))[0]!;
 
 /** SYSTEM follow-up moves (Done → Waiting QC once a QC is assigned). */
 export const applyFollowUps = async (tx: QuerySql, organizationId: string, workflow: Workflow, task: TaskRow) => {
@@ -204,8 +263,41 @@ export const applyFollowUps = async (tx: QuerySql, organizationId: string, workf
 };
 
 /**
- * After task changes in a job: resolve feedback whose re-done tasks are all checked (source tasks
- * and FB tasks return to Complete), then store the job status derived from its tasks.
+ * Once no feedback of the job is open: the source tasks parked in FEEDBACK and the re-done FB tasks that
+ * reached Checked go back to Complete, so the Account can deliver again. Normal tasks keep their flow.
+ * Returns the moved task ids (none while a feedback is still open).
+ */
+export const releaseParkedTasks = async (
+  tx: QuerySql,
+  organizationId: string,
+  workflow: Workflow,
+  jobId: string,
+  actorId: string | null,
+  note: string
+) => {
+  const stillOpen = await tx<{ count: number }[]>`
+    SELECT count(*)::int AS count FROM production.feedbacks WHERE organization_id = ${organizationId} AND job_id = ${jobId} AND status <> 'RESOLVED'
+  `;
+  if (stillOpen[0]!.count > 0) {
+    return [];
+  }
+  const complete = statusByCode(workflow, "COMPLETE");
+  const checked = workflow.statuses.filter((status) => status.countsChecked).map((status) => status.id);
+  const ids = (
+    await tx<{ id: string }[]>`
+      SELECT id FROM production.tasks WHERE organization_id = ${organizationId} AND job_id = ${jobId}
+        AND (status_id = ${statusByCode(workflow, "FEEDBACK").id}
+          OR (feedback_id IS NOT NULL AND status_id = ANY(${checked}::uuid[])))
+      ORDER BY created_at FOR UPDATE
+    `
+  ).map((row) => row.id);
+  await moveTasks(tx, organizationId, workflow, await selectTasks(tx, organizationId, ids), complete, actorId, note);
+  return ids;
+};
+
+/**
+ * After task changes in a job: resolve feedback whose re-done tasks are all checked (source tasks and FB
+ * tasks return to Complete), then store the job status derived from its tasks.
  */
 export const settleJob = async (tx: QuerySql, organizationId: string, workflow: Workflow, jobId: string) => {
   const ready = await tx<{ id: string }[]>`
@@ -216,28 +308,10 @@ export const settleJob = async (tx: QuerySql, organizationId: string, workflow: 
   `;
   if (ready.length > 0) {
     await tx`
-      UPDATE production.feedbacks SET status = 'RESOLVED', resolved_at = now()
+      UPDATE production.feedbacks SET status = 'RESOLVED', resolution = 'REWORKED', resolved_at = now()
       WHERE organization_id = ${organizationId} AND id = ANY(${ready.map((row) => row.id)}::uuid[])
     `;
-    const stillOpen = await tx<{ count: number }[]>`
-      SELECT count(*)::int AS count FROM production.feedbacks WHERE organization_id = ${organizationId} AND job_id = ${jobId} AND status <> 'RESOLVED'
-    `;
-    if (stillOpen[0]!.count === 0) {
-      const complete = statusByCode(workflow, "COMPLETE");
-      const checked = workflow.statuses.filter((status) => status.countsChecked).map((status) => status.id);
-      // Source tasks parked in FEEDBACK, and re-done FB tasks that reached Checked; normal tasks keep their flow.
-      const ids = (
-        await tx<{ id: string }[]>`
-          SELECT id FROM production.tasks WHERE organization_id = ${organizationId} AND job_id = ${jobId}
-            AND (status_id = ${statusByCode(workflow, "FEEDBACK").id}
-              OR (feedback_id IS NOT NULL AND status_id = ANY(${checked}::uuid[])))
-          ORDER BY created_at FOR UPDATE
-        `
-      ).map((row) => row.id);
-      for (const task of await selectTasks(tx, organizationId, ids)) {
-        await moveTask(tx, organizationId, workflow, task, complete, null, "Feedback đã xử lý xong — trở về Complete.");
-      }
-    }
+    await releaseParkedTasks(tx, organizationId, workflow, jobId, null, "Feedback đã xử lý xong — trở về Complete.");
   }
   const [statusRows, open] = await Promise.all([
     tx<{ status_id: string }[]>`SELECT DISTINCT status_id FROM production.tasks WHERE organization_id = ${organizationId} AND job_id = ${jobId}`,
@@ -264,15 +338,12 @@ export const getProductionTask = async (context: AccessContext, taskId: string, 
   return toProductionTask(task, workflow, relation);
 };
 
-/** Personal board: tasks I work on and/or check, soonest deadline first. */
+/** Personal board: tasks I work on and/or check, soonest deadline first (full-precision keyset, BUG-PR-05). */
 export const listMyProductionTasks = async (context: AccessContext, query: MyProductionTasksQuery): Promise<ProductionTaskPage> => {
   assertProductionMember(context);
   const sql = getSql();
   const organizationId = context.organization.id;
-  const cursor = decodeCursor(query.cursor, 2);
-  if (query.cursor && !cursor) {
-    throw new AppError("INVALID_CURSOR", "Con trỏ phân trang không hợp lệ.", 400);
-  }
+  const cursor = decodeTimeCursor(query.cursor);
   const workflow = await loadWorkflowModel(sql, organizationId);
   const finished = query.includeFinished ? [] : finishedStatusIds(workflow);
   const me = context.user.id;
@@ -282,7 +353,7 @@ export const listMyProductionTasks = async (context: AccessContext, query: MyPro
       AND ${query.role === "assignee" ? sql`t.assignee_id = ${me}` : query.role === "qc" ? sql`t.qc_id = ${me}` : sql`(t.assignee_id = ${me} OR t.qc_id = ${me})`}
       AND NOT (t.status_id = ANY(${finished}::uuid[]))
       AND j.archived_at IS NULL
-      ${cursor ? sql`AND (t.deadline, t.id) > (${String(cursor[0])}::timestamptz, ${String(cursor[1])}::uuid)` : sql``}
+      ${cursor ? sql`AND (t.deadline, t.id) > (${cursorInstantSql(sql, cursor.at)}, ${cursor.id}::uuid)` : sql``}
     ORDER BY t.deadline, t.id
     LIMIT ${query.limit + 1}
   `;
@@ -290,11 +361,11 @@ export const listMyProductionTasks = async (context: AccessContext, query: MyPro
   const last = page[page.length - 1];
   return {
     items: page.map((row) => toProductionTask(row, workflow, relationOf(context, row))),
-    pageInfo: { hasMore: rows.length > query.limit, nextCursor: rows.length > query.limit && last ? encodeCursor([last.deadline.toISOString(), last.id]) : null }
+    pageInfo: { hasMore: rows.length > query.limit, nextCursor: rows.length > query.limit && last ? encodeTimeCursor(last.deadline_cursor, last.id) : null }
   };
 };
 
-/** QC queue: tasks waiting for my check, oldest Done first. */
+/** QC queue: tasks waiting for my check, oldest Done first (archived jobs left out, BUG-PR-04). */
 export const listQcQueue = async (context: AccessContext) => {
   assertProductionMember(context);
   const sql = getSql();
@@ -303,7 +374,7 @@ export const listQcQueue = async (context: AccessContext) => {
   const rows = await sql<TaskRow[]>`
     ${taskSelectSql(sql)}
     WHERE t.organization_id = ${context.organization.id} AND t.qc_id = ${context.user.id}
-      AND t.status_id = ANY(${waiting}::uuid[])
+      AND t.status_id = ANY(${waiting}::uuid[]) AND j.archived_at IS NULL
     ORDER BY t.done_at NULLS LAST, t.id
     LIMIT 500
   `;
@@ -327,7 +398,7 @@ export const loadJobForTasks = async (tx: QuerySql, organizationId: string, jobI
     throw new AppError("JOB_NOT_FOUND", "Không tìm thấy job.", 404);
   }
   if (job.archived_at) {
-    throw new AppError("JOB_ARCHIVED", "Job đã lưu trữ.", 409);
+    throw jobArchivedError();
   }
   return job;
 };
@@ -372,8 +443,10 @@ const assertLines = async (
 };
 
 /**
- * Inserts tasks for a locked job (Phase 2 "Chia task" and feedback "Giao lại"). Returns the new ids and
- * the over-allocation warning, if any (allowed, but logged on each new task).
+ * Inserts tasks for a locked job (Phase 2 "Chia task" and feedback "Giao lại") in one statement (PERF-15).
+ * Returns the new ids in line order and the over-allocation warning, if any (allowed, but logged on each
+ * new task). Default deadlines: job deadline − QC buffer; feedback redo tasks see feedbackTaskDeadline.
+ * A task created already late is flagged late and notified by the next lateness scan (BUG-PR-03).
  */
 export const insertTasks = async (
   tx: QuerySql,
@@ -390,10 +463,17 @@ export const insertTasks = async (
     throw new AppError("WORKFLOW_INCOMPLETE", "Chưa có trạng thái khởi tạo trong cấu hình.", 409);
   }
   const parentIds = [...new Set(lines.map((line) => line.sourceTaskId ?? options.defaultParentId).filter((id): id is string => Boolean(id)))];
+  const parents = new Map<string, { assignedAt: Date; deadline: Date }>();
   if (parentIds.length > 0) {
-    const found = await tx`SELECT id FROM production.tasks WHERE organization_id = ${organizationId} AND job_id = ${job.id} AND id = ANY(${parentIds}::uuid[])`;
+    const found = await tx<{ id: string; assigned_at: Date; deadline: Date }[]>`
+      SELECT id, assigned_at, deadline FROM production.tasks
+      WHERE organization_id = ${organizationId} AND job_id = ${job.id} AND id = ANY(${parentIds}::uuid[])
+    `;
     if (found.length !== parentIds.length) {
       throw new AppError("SOURCE_TASK_INVALID", "Task gốc không thuộc job này.", 400);
+    }
+    for (const row of found) {
+      parents.set(row.id, { assignedAt: row.assigned_at, deadline: row.deadline });
     }
   }
   let warning: string | null = null;
@@ -406,42 +486,72 @@ export const insertTasks = async (
     )[0]!.total;
     warning = overAllocationWarning(job.total_images, assigned, lines.reduce((sum, line) => sum + line.qtyAssigned, 0));
   }
-  const defaultDeadline = new Date(job.deadline.getTime() - job.qc_buffer_hours * 3_600_000);
-  const ids: string[] = [];
-  for (const line of lines) {
-    const customValues = await resolveCustomValues(tx, organizationId, "TASK", line.customValues, { enforceRequired: true });
-    const created = (
-      await tx<{ id: string }[]>`
-        INSERT INTO production.tasks (organization_id, job_id, assignee_id, qc_id, process_id, shift_id, qty_assigned, deadline,
-          status_id, kind, parent_task_id, feedback_id, note, custom_values, created_by, is_late, assigned_at, created_at)
-        VALUES (${organizationId}, ${job.id}, ${line.assigneeId}, ${line.qcId ?? null}, ${line.processId}, ${line.shiftId}, ${line.qtyAssigned},
-          ${line.deadline ? new Date(line.deadline) : defaultDeadline}, ${initial.id}, ${options.kind},
-          ${line.sourceTaskId ?? options.defaultParentId}, ${options.feedbackId}, ${line.note?.trim() || null},
-          ${tx.json(customValues)}, ${context.user.id}, ${(line.deadline ? new Date(line.deadline) : defaultDeadline) < (options.assignedAt ?? new Date())},
-          ${options.assignedAt ?? new Date()}, ${options.assignedAt ?? new Date()})
-        RETURNING id
-      `
-    )[0]!;
-    if (line.tagIds?.length) {
-      await setEntityTags(tx, organizationId, "TASK", created.id, line.tagIds);
-    }
-    ids.push(created.id);
+  const assignedAt = options.assignedAt ?? new Date();
+  const definitions = await loadFieldDefinitions(tx, organizationId, "TASK");
+  const rows = lines.map((line) => {
+    const parentId = line.sourceTaskId ?? options.defaultParentId;
+    const deadline = line.deadline
+      ? new Date(line.deadline)
+      : options.kind === "NORMAL"
+        ? defaultTaskDeadline(job.deadline, job.qc_buffer_hours)
+        : feedbackTaskDeadline({
+            jobDeadline: job.deadline,
+            qcBufferHours: job.qc_buffer_hours,
+            now: assignedAt,
+            source: parentId ? (parents.get(parentId) ?? null) : null
+          });
+    return {
+      id: randomUUID(),
+      assigneeId: line.assigneeId,
+      qcId: line.qcId ?? null,
+      processId: line.processId,
+      shiftId: line.shiftId,
+      qtyAssigned: line.qtyAssigned,
+      deadline: deadline.toISOString(),
+      parentId,
+      note: line.note?.trim() || null,
+      customValues: validateCustomValues(definitions, line.customValues, { enforceRequired: true }),
+      isLate: computeIsLate({ doneAt: null, closed: false, deadline, now: assignedAt }),
+      tagIds: line.tagIds ?? []
+    };
+  });
+  await tx`
+    INSERT INTO production.tasks (id, organization_id, job_id, assignee_id, qc_id, process_id, shift_id, qty_assigned, deadline,
+      status_id, kind, parent_task_id, feedback_id, note, custom_values, created_by, is_late, assigned_at, created_at)
+    SELECT (r->>'id')::uuid, ${organizationId}, ${job.id}, (r->>'assigneeId')::uuid, (r->>'qcId')::uuid, (r->>'processId')::uuid,
+      (r->>'shiftId')::uuid, (r->>'qtyAssigned')::int, (r->>'deadline')::timestamptz, ${initial.id}, ${options.kind},
+      (r->>'parentId')::uuid, ${options.feedbackId}, r->>'note', r->'customValues', ${context.user.id}, (r->>'isLate')::boolean,
+      ${assignedAt}, ${assignedAt}
+    FROM jsonb_array_elements(${tx.json(
+      rows.map((row) => ({
+        id: row.id,
+        assigneeId: row.assigneeId,
+        qcId: row.qcId,
+        processId: row.processId,
+        shiftId: row.shiftId,
+        qtyAssigned: row.qtyAssigned,
+        deadline: row.deadline,
+        parentId: row.parentId,
+        note: row.note,
+        customValues: row.customValues,
+        isLate: row.isLate
+      }))
+    )}) WITH ORDINALITY AS x(r, ord)
+    ORDER BY x.ord
+  `;
+  for (const row of rows.filter((item) => item.tagIds.length > 0)) {
+    await setEntityTags(tx, organizationId, "TASK", row.id, row.tagIds);
   }
+  const ids = rows.map((row) => row.id);
   await insertTaskLogs(
     tx,
     organizationId,
-    ids.map((taskId, index) => ({
-      taskId,
+    rows.map((row) => ({
+      taskId: row.id,
       jobId: job.id,
       userId: context.user.id,
       action: "CREATE" as const,
-      to: {
-        assigneeId: lines[index]!.assigneeId,
-        qcId: lines[index]!.qcId ?? null,
-        qtyAssigned: lines[index]!.qtyAssigned,
-        kind: options.kind,
-        ...(warning ? { warning } : {})
-      },
+      to: { assigneeId: row.assigneeId, qcId: row.qcId, qtyAssigned: row.qtyAssigned, kind: options.kind, ...(warning ? { warning } : {}) },
       ...(options.assignedAt ? { at: options.assignedAt } : {})
     }))
   );
@@ -464,6 +574,7 @@ export const createProductionTasks = async (context: AccessContext, jobId: strin
     return created;
   });
   publishProductionChange(organizationId, jobId, result.ids, "tasks", context.user.id);
+  await syncJobChat(context, jobId);
   const workflow = await loadWorkflowModel(sql, organizationId);
   const rows = await selectTasks(sql, organizationId, result.ids);
   return { tasks: rows.map((row) => toProductionTask(row, workflow, relationOf(context, row))), warnings: result.warnings };
@@ -471,7 +582,10 @@ export const createProductionTasks = async (context: AccessContext, jobId: strin
 
 // Changing tasks -------------------------------------------------------------------------------------------
 
-/** Loads a locked task with the caller's relation; hides it (404) from people who may not see it. */
+/**
+ * Loads a locked task with the caller's relation; hides it (404) from people who may not see it and refuses
+ * changes to tasks of an archived job (409 JOB_ARCHIVED, BUG-PR-04).
+ */
 const lockedTask = async (tx: QuerySql, context: AccessContext, taskId: string) => {
   const organizationId = context.organization.id;
   await lockTaskForUpdate(tx, organizationId, taskId);
@@ -479,6 +593,9 @@ const lockedTask = async (tx: QuerySql, context: AccessContext, taskId: string) 
   const relation = relationOf(context, task);
   if (!canViewTask(relation)) {
     throw notFound();
+  }
+  if (task.job_archived) {
+    throw jobArchivedError();
   }
   return { task, workflow, relation };
 };
@@ -544,7 +661,7 @@ export const assignProductionTask = async (context: AccessContext, taskId: strin
   assertProductionMember(context);
   const organizationId = context.organization.id;
   const sql = getSql();
-  const jobId = await sql.begin(async (tx) => {
+  const result = await sql.begin(async (tx) => {
     const { task, workflow, relation } = await lockedTask(tx, context, taskId);
     if (!canManageTask(relation)) {
       throw new AppError("FORBIDDEN", "Chỉ Leader của job (hoặc Quản trị) được giao lại task.", 403);
@@ -568,8 +685,9 @@ export const assignProductionTask = async (context: AccessContext, taskId: strin
     if (errors.length > 0) {
       throw new AppError("ASSIGNMENT_INVALID", errors.join(" "), 400);
     }
+    const previous = [task.assignee_id, task.qc_id];
     if (assigneeId === task.assignee_id && qcId === task.qc_id) {
-      return task.job_id;
+      return { jobId: task.job_id, previous, changed: false };
     }
     await tx`
       UPDATE production.tasks SET assignee_id = ${assigneeId}, qc_id = ${qcId}, updated_at = now()
@@ -605,9 +723,13 @@ export const assignProductionTask = async (context: AccessContext, taskId: strin
     await enqueueProductionEvents(tx, events);
     await applyFollowUps(tx, organizationId, workflow, { ...task, assignee_id: assigneeId, qc_id: qcId });
     await settleJob(tx, organizationId, workflow, task.job_id);
-    return task.job_id;
+    return { jobId: task.job_id, previous, changed: true };
   });
-  publishProductionChange(organizationId, jobId, [taskId], "tasks", context.user.id);
+  // People taken off the task get the hint too, so their lists drop it; the job chat follows (SEC-API-05).
+  publishProductionChange(organizationId, result.jobId, [taskId], "tasks", context.user.id, result.previous);
+  if (result.changed) {
+    await syncJobChat(context, result.jobId);
+  }
   return await getProductionTask(context, taskId);
 };
 
@@ -645,7 +767,8 @@ export const updateProductionTask = async (context: AccessContext, taskId: strin
         ? await resolveCustomValues(tx, organizationId, "TASK", input.customValues, { existing: task.custom_values as never, enforceRequired: false })
         : task.custom_values;
     const note = input.note === undefined ? task.note : input.note?.trim() || null;
-    const isLate = task.done_at ? task.done_at > deadline : new Date() > deadline;
+    // A deadline moved into the past makes the task late now; the next scan notifies once for that deadline (BUG-PR-03).
+    const isLate = computeIsLate({ doneAt: task.done_at, closed: task.closed_at !== null, deadline, now: new Date() });
     await tx`
       UPDATE production.tasks
       SET qty_assigned = ${input.qtyAssigned ?? task.qty_assigned}, process_id = ${input.processId ?? task.process_id},
@@ -683,15 +806,33 @@ export const updateProductionTask = async (context: AccessContext, taskId: strin
   return await getProductionTask(context, taskId);
 };
 
-/** Worker cron (every 15 min): open tasks past their deadline are late (PLAN §9: late = not Done by deadline). */
+// Lateness scan (worker) ------------------------------------------------------------------------------------
+
+/**
+ * Worker cron (every 15 min, PLAN §9: late = not Done by the deadline). Open tasks of active jobs past their
+ * deadline are flagged late; the ones not yet notified for their current deadline are returned (and marked
+ * notified) — so a task created or edited when already late is notified too, once per deadline (BUG-PR-03).
+ * Tasks closed without Done (BUG-PR-08) and tasks of archived jobs (BUG-PR-04) are not open work.
+ */
 export const markLateTasks = async (sql: QuerySql = getSql()) => {
-  const rows = await sql<{ organization_id: string; job_id: string; id: string }[]>`
-    UPDATE production.tasks SET is_late = true, updated_at = now()
-    WHERE done_at IS NULL AND deadline < now() AND NOT is_late
-    RETURNING organization_id, job_id, id
+  const rows = await sql<{ organization_id: string; job_id: string; id: string; notify: boolean; flagged: boolean }[]>`
+    WITH due AS (
+      SELECT t.id, NOT t.is_late AS flagged, t.late_notified_deadline IS DISTINCT FROM t.deadline AS notify
+      FROM production.tasks t
+      JOIN production.jobs j ON j.organization_id = t.organization_id AND j.id = t.job_id AND j.archived_at IS NULL
+      WHERE t.done_at IS NULL AND t.closed_at IS NULL AND t.deadline < now()
+        AND (NOT t.is_late OR t.late_notified_deadline IS DISTINCT FROM t.deadline)
+      ORDER BY t.deadline
+      LIMIT 5000
+      FOR UPDATE OF t SKIP LOCKED
+    )
+    UPDATE production.tasks t
+    SET is_late = true, late_notified_deadline = t.deadline, updated_at = CASE WHEN due.flagged THEN now() ELSE t.updated_at END
+    FROM due WHERE t.id = due.id
+    RETURNING t.organization_id, t.job_id, t.id, due.notify, due.flagged
   `;
   const byJob = new Map<string, { organizationId: string; taskIds: string[] }>();
-  for (const row of rows) {
+  for (const row of rows.filter((item) => item.flagged)) {
     const entry = byJob.get(row.job_id) ?? { organizationId: row.organization_id, taskIds: [] };
     entry.taskIds.push(row.id);
     byJob.set(row.job_id, entry);
@@ -699,16 +840,28 @@ export const markLateTasks = async (sql: QuerySql = getSql()) => {
   for (const [jobId, entry] of byJob) {
     publishProductionChange(entry.organizationId, jobId, entry.taskIds, "tasks", null);
   }
-  return rows;
+  return rows.filter((row) => row.notify);
 };
 
-/** Open tasks whose deadline falls within the organization's "due soon" window (settings.due_soon_hours, default 2). */
-export const findDueSoonTasks = (sql: QuerySql = getSql()) => sql<{ organization_id: string; id: string }[]>`
-  SELECT t.organization_id, t.id
-  FROM production.tasks t
-  LEFT JOIN production.settings s ON s.organization_id = t.organization_id AND s.key = 'due_soon_hours'
-  WHERE t.done_at IS NULL AND t.deadline > now()
-    AND t.deadline <= now() + make_interval(hours => coalesce((s.value #>> '{}')::int, 2))
-  ORDER BY t.deadline
-  LIMIT 2000
+/**
+ * Open tasks whose deadline falls within the organization's "due soon" window (settings.due_soon_hours,
+ * default 2) and that were not reminded for this deadline yet; they are marked reminded (PERF-15: each
+ * reminder is prepared once, not on every scan).
+ */
+export const markDueSoonTasks = (sql: QuerySql = getSql()) => sql<{ organization_id: string; id: string }[]>`
+  WITH due AS (
+    SELECT t.id
+    FROM production.tasks t
+    JOIN production.jobs j ON j.organization_id = t.organization_id AND j.id = t.job_id AND j.archived_at IS NULL
+    LEFT JOIN production.settings s ON s.organization_id = t.organization_id AND s.key = 'due_soon_hours'
+    WHERE t.done_at IS NULL AND t.closed_at IS NULL AND t.deadline > now()
+      AND t.deadline <= now() + make_interval(hours => coalesce((s.value #>> '{}')::int, 2))
+      AND t.due_soon_notified_deadline IS DISTINCT FROM t.deadline
+    ORDER BY t.deadline
+    LIMIT 2000
+    FOR UPDATE OF t SKIP LOCKED
+  )
+  UPDATE production.tasks t SET due_soon_notified_deadline = t.deadline
+  FROM due WHERE t.id = due.id
+  RETURNING t.organization_id, t.id
 `;

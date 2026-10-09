@@ -11,13 +11,15 @@ import { userJsonSql } from "./tasks.repo.js";
 /**
  * People search for assignee / mention pickers. With `projectId` the result is limited to people
  * who can access that project (so pickers never suggest someone who cannot see the work);
- * without it the caller needs `member.view`.
+ * without it the caller needs `member.view`. Callers without `member.view` (pickers in a project or
+ * channel they can use) get names only: no e-mail addresses, and e-mails are not searchable (SEC-API-04).
  */
 export const searchDirectory = async (
   context: AccessContext,
   input: { q?: string | undefined; projectId?: string | undefined; channelId?: string | undefined; limit: number }
 ) => {
   const sql = getSql();
+  const canViewMembers = hasPermission(context, Permission.MemberView);
   let projectFilter = sql`TRUE`;
   if (input.channelId) {
     // Mention pickers in private channels and DMs only offer current members.
@@ -44,7 +46,7 @@ export const searchDirectory = async (
           AND pm.user_id = om.user_id AND pm.status = 'active' AND pm.deleted_at IS NULL
       )`;
     }
-  } else if (!hasPermission(context, Permission.MemberView)) {
+  } else if (!canViewMembers) {
     throw new AppError("FORBIDDEN", "You do not have permission to browse members.", 403);
   }
 
@@ -61,10 +63,15 @@ export const searchDirectory = async (
       AND (
         ${q.length === 0}
         OR public.immutable_unaccent(lower(au.display_name)) LIKE public.immutable_unaccent(${like})
-        OR lower(au.email) LIKE ${like}
+        OR (${canViewMembers} AND lower(au.email) LIKE ${like})
       )
     ORDER BY (au.id = ${context.user.id}) DESC, au.display_name, au.id
     LIMIT ${input.limit}
   `;
-  return { items: rows.map((row) => toUserRef(row.user)!) };
+  return {
+    items: rows.map((row) => {
+      const user = toUserRef(row.user)!;
+      return canViewMembers || user.id === context.user.id ? user : { ...user, email: null };
+    })
+  };
 };

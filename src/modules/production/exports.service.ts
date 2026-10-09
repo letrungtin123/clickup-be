@@ -11,7 +11,7 @@ import {
 import { getSql } from "../../db/client.js";
 import type { QuerySql } from "../../lib/db-types.js";
 import type { AccessContext } from "../access/access-context.js";
-import { businessDate, dayCell, exportFilename, numberFormats, sendWorkbook, type CellValue, type SheetColumn, type SheetSpec } from "./excel.js";
+import { businessDate, dayCell, exportFilename, numberFormats, percentCell, sendWorkbook, type CellValue, type SheetColumn, type SheetSpec } from "./excel.js";
 import { listJobs } from "./jobs.service.js";
 import { getKpiReport } from "./kpi-settlement.service.js";
 import { runReport } from "./reports.js";
@@ -63,7 +63,7 @@ const presetLabels: Record<ReportRangePreset, string> = {
 };
 const taskDateLabels: Record<ReportConfig["taskDate"], string> = { DONE: "Ngày Done lần đầu", ASSIGNED: "Ngày giao", DEADLINE: "Deadline" };
 
-type NamedFilter = Exclude<keyof ReportFilters, "taskKind" | "scoreRole" | "taskState"> | "tag";
+type NamedFilter = Exclude<keyof ReportFilters, "taskKind" | "scoreRole" | "taskState" | "jobState"> | "tag";
 const filterLookups: Record<NamedFilter, { label: string; query: (sql: QuerySql, organizationId: string, ids: string[]) => Promise<{ name: string }[]> }> = {
   user: {
     label: "Nhân viên",
@@ -130,6 +130,9 @@ const filterRows = async (sql: QuerySql, organizationId: string, filters: Report
   if (filters.taskState) {
     rows.push(["Lọc – Tình trạng task", filters.taskState === "OPEN" ? "Chưa Done" : "Đã Done"]);
   }
+  if (filters.jobState) {
+    rows.push(["Lọc – Job", filters.jobState === "ACTIVE" ? "Chưa lưu trữ" : "Đã lưu trữ"]);
+  }
   return rows;
 };
 
@@ -161,13 +164,16 @@ export const exportReport = async (context: AccessContext, res: Response, input:
       out[dim] = dim === "day" || dim === "week" ? dayCell(typeof key === "string" ? key : null) : row[`${dim}_label`];
     }
     for (const measure of config.measures) {
-      out[measure] = row[measure];
+      const value = row[measure];
+      out[measure] = reportMeasureInfo[measure].format === "percent" && typeof value === "number" ? percentCell(value) : value;
     }
     return out;
   });
   const hasTotals = config.dimensions.length > 0;
   if (hasTotals) {
-    const totals: Record<string, CellValue> = { ...result.totals };
+    const totals: Record<string, CellValue> = Object.fromEntries(
+      config.measures.map((measure) => [measure, reportMeasureInfo[measure].format === "percent" ? percentCell(result.totals[measure]) : result.totals[measure]])
+    );
     const first = config.dimensions[0]!;
     totals[first] = first === "day" || first === "week" ? null : "Tổng cộng";
     dataRows.push(totals);
@@ -328,7 +334,8 @@ export const exportKpi = async (context: AccessContext, res: Response, query: { 
     { header: "% đạt", key: "percent", width: 10, numFmt: numberFormats.percent },
     { header: "Vượt / thiếu", key: "difference", width: 14, numFmt: numberFormats.points }
   ];
-  const percentOf = (value: number | null) => (value === null ? null : value / 100);
+  // Percent points with 2 decimals → a fraction for the "0.00%" cell, without float tails (PR-25).
+  const percentOf = (value: number | null) => (value === null ? null : percentCell(value / 100));
 
   const monthly: SheetSpec = {
     name: "KPI theo kỳ",

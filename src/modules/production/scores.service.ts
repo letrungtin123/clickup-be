@@ -6,6 +6,7 @@ import type { AccessContext } from "../access/access-context.js";
 import { toUserRef, type UserRefJson } from "../work/mappers.js";
 import { assertProductionMember, isProductionAdmin } from "./access.js";
 import { loadSettings } from "./catalog.service.js";
+import { cursorInstantSql, cursorTextSql, decodeTimeCursor, encodeTimeCursor } from "./cursor.js";
 import { canViewTask, loadTask, relationOf } from "./jobs.repo.js";
 import { approvedLeaveDays } from "./leave.service.js";
 import {
@@ -25,13 +26,12 @@ import {
   type SummaryEntry,
   type TargetVersion
 } from "./scoring.js";
-import { businessDay, isValidDay } from "./time.js";
+import { addDays, businessDay, isValidDay, startOfBusinessDay } from "./time.js";
 
 /** Personal scores, KPI forecast and the public board (SPEC Phase 3 §3–§4). Rules: scoring.ts. */
 
 const org = (context: AccessContext) => context.organization.id;
 const maxRangeDays = 366;
-const maxListedEntries = 1000;
 
 /**
  * Approved leave days of a user in [from, to] for KPI proration (settings.kpiProrateLeave). The leave
@@ -53,6 +53,7 @@ const invalidRange = () => new AppError("INVALID_RANGE", "Khoảng ngày không 
 
 type EntryRow = {
   id: string;
+  cursor_at?: string;
   role: ScoreRole;
   task_id: string;
   task_number: string;
@@ -110,26 +111,65 @@ const toSummaryEntry = (row: { business_day: string; role: ScoreRole; pay_mode: 
   projectCode: row.project_code
 });
 
-const selectEntries = (sql: QuerySql, organizationId: string, userId: string, from: string, to: string) => sql<EntryRow[]>`
+type SumRow = { business_day: string; role: ScoreRole; pay_mode: PayMode; credits: string; money: string; qty: number; project_id: string; project_code: string };
+
+/**
+ * One person's entries over a day range, summed per (day, role, pay mode[, project]) in SQL — an index-only
+ * scan of the covering index (PERF-09) instead of loading every row. The sums feed summarize() / totals()
+ * exactly like single entries (credits stay exact to 2 decimals).
+ */
+const selectSums = (sql: QuerySql, organizationId: string, userId: string, from: string, to: string, byProject: boolean) => sql<SumRow[]>`
+  SELECT to_char(a.business_day, 'YYYY-MM-DD') AS business_day, a.role, a.pay_mode, a.credits::text AS credits, a.money::text AS money,
+    a.qty::int AS qty, a.project_id, coalesce(p.code, '') AS project_code
+  FROM (
+    SELECT e.business_day, e.role, e.pay_mode, ${byProject ? sql`e.project_id` : sql`NULL::uuid`} AS project_id,
+      sum(e.credits) AS credits, sum(e.money) AS money, sum(e.qty) AS qty
+    FROM production.score_entries e
+    WHERE e.organization_id = ${organizationId} AND e.user_id = ${userId} AND e.business_day BETWEEN ${from}::date AND ${to}::date
+    GROUP BY 1, 2, 3, 4
+  ) a
+  LEFT JOIN production.projects p ON p.organization_id = ${organizationId} AND p.id = a.project_id
+`;
+
+/**
+ * One page of entries, newest first, keyset (created_at, id) at full precision. An entry's business day is
+ * the business day of its created_at (scoring-hooks), so the day range also bounds created_at and the
+ * (organization, user, created_at DESC, id DESC) index range-scans just the page.
+ */
+const selectEntryPage = (
+  sql: QuerySql,
+  organizationId: string,
+  userId: string,
+  range: { from: string; to: string },
+  page: { cursor: { at: string; id: string } | null; limit: number }
+) => sql<EntryRow[]>`
   SELECT e.id, e.role, e.task_id, t.number::text AS task_number, e.job_id, j.code AS job_code, e.project_id, p.code AS project_code,
     e.process_id, pr.name AS process_name, e.shift_id, s.name AS shift_name, e.pay_mode, e.kind, e.qty,
     e.unit_credits::text AS unit_credits, e.credits::text AS credits, e.money::text AS money, e.credit_rule_id,
     to_char(e.business_day, 'YYYY-MM-DD') AS business_day, to_char(e.period_month, 'YYYY-MM') AS period,
-    e.adjusts_entry_id, e.note, e.created_at
-  FROM production.score_entries e
+    e.adjusts_entry_id, e.note, e.created_at, ${cursorTextSql(sql, "e.created_at")} AS cursor_at
+  FROM (
+    SELECT * FROM production.score_entries
+    WHERE organization_id = ${organizationId} AND user_id = ${userId}
+      AND business_day BETWEEN ${range.from}::date AND ${range.to}::date
+      AND created_at >= ${startOfBusinessDay(range.from)} AND created_at < ${startOfBusinessDay(addDays(range.to, 1))}
+      ${page.cursor ? sql`AND (created_at, id) < (${cursorInstantSql(sql, page.cursor.at)}, ${page.cursor.id}::uuid)` : sql``}
+    ORDER BY created_at DESC, id DESC
+    LIMIT ${page.limit + 1}
+  ) e
   JOIN production.tasks t ON t.organization_id = e.organization_id AND t.id = e.task_id
   JOIN production.jobs j ON j.organization_id = e.organization_id AND j.id = e.job_id
   JOIN production.projects p ON p.organization_id = e.organization_id AND p.id = e.project_id
   JOIN production.shifts s ON s.organization_id = e.organization_id AND s.id = e.shift_id
   LEFT JOIN production.processes pr ON pr.organization_id = e.organization_id AND pr.id = e.process_id
-  WHERE e.organization_id = ${organizationId} AND e.user_id = ${userId}
-    AND e.business_day BETWEEN ${from}::date AND ${to}::date
   ORDER BY e.created_at DESC, e.id DESC
-  LIMIT 50000
 `;
 
-/** GET /production/scores/me — own summary, fixed today/week/period cards and entries with task links. */
-export const getMyScores = async (context: AccessContext, query: { from?: string | undefined; to?: string | undefined }): Promise<MyScores> => {
+/** GET /production/scores/me — own summary, fixed today/week/period cards and a page of entries with task links. */
+export const getMyScores = async (
+  context: AccessContext,
+  query: { from?: string | undefined; to?: string | undefined; cursor?: string | undefined; limit?: number | undefined }
+): Promise<MyScores> => {
   assertProductionMember(context);
   const sql = getSql();
   const settings = await loadSettings(sql, org(context));
@@ -142,19 +182,20 @@ export const getMyScores = async (context: AccessContext, query: { from?: string
     throw invalidRange();
   }
 
+  const cursor = decodeTimeCursor(query.cursor);
+  const limit = query.limit ?? 100;
+
   const week = weekStart(today);
   const cardsFrom = week < current.from ? week : current.from;
   const cardsTo = today > current.to ? today : current.to;
-  const [rows, cardRows] = await Promise.all([
-    selectEntries(sql, org(context), context.user.id, from, to),
-    sql<{ business_day: string; role: ScoreRole; pay_mode: PayMode; credits: string; money: string; qty: number; project_id: string; project_code: string }[]>`
-      SELECT to_char(business_day, 'YYYY-MM-DD') AS business_day, role, pay_mode, credits::text AS credits, money::text AS money, qty,
-        project_id, '' AS project_code
-      FROM production.score_entries
-      WHERE organization_id = ${org(context)} AND user_id = ${context.user.id}
-        AND business_day BETWEEN ${cardsFrom}::date AND ${cardsTo}::date
-    `
+  const [sums, cardRows, entryRows] = await Promise.all([
+    selectSums(sql, org(context), context.user.id, from, to, true),
+    selectSums(sql, org(context), context.user.id, cardsFrom, cardsTo, false),
+    selectEntryPage(sql, org(context), context.user.id, { from, to }, { cursor, limit })
   ]);
+  const page = entryRows.slice(0, limit);
+  const last = page[page.length - 1];
+  const hasMore = entryRows.length > limit;
   const cardEntries = cardRows.map(toSummaryEntry);
   const within = (start: string, end: string) => cardEntries.filter((entry) => entry.businessDay >= start && entry.businessDay <= end);
 
@@ -162,17 +203,15 @@ export const getMyScores = async (context: AccessContext, query: { from?: string
     from,
     to,
     today,
-    summary: summarize(
-      rows.map((row) => toSummaryEntry(row)),
-      { from, to }
-    ),
+    summary: summarize(sums.map(toSummaryEntry), { from, to }),
     cards: {
       today: totals(within(today, today)),
       week: totals(within(week, today)),
       period: { ...totals(within(current.from, current.to)), period: currentPeriod, from: current.from, to: current.to }
     },
-    entries: rows.slice(0, maxListedEntries).map(toEntry),
-    truncated: rows.length > maxListedEntries
+    entries: page.map(toEntry),
+    truncated: hasMore,
+    nextCursor: hasMore && last?.cursor_at ? encodeTimeCursor(last.cursor_at, last.id) : null
   };
 };
 
@@ -349,6 +388,9 @@ export const getScoreBoard = async (context: AccessContext, query: { period?: st
 /**
  * GET /production/scores/task/:taskId — the ledger rows of one task (task detail), for anyone who may
  * see the task. Points are public; money only for the row's owner, ADMIN, or when settings.moneyPublic.
+ * PR-11: while settings.scoresPublic is off, other people's rows (and totals) are shown only to an ADMIN and
+ * to the task's job leader (who manages its quantities); everyone else sees only their own rows — like the
+ * private board, where nobody but an Admin sees colleagues' points.
  */
 export const getTaskScores = async (context: AccessContext, taskId: string): Promise<TaskScores> => {
   assertProductionMember(context);
@@ -361,6 +403,7 @@ export const getTaskScores = async (context: AccessContext, taskId: string): Pro
   const settings = await loadSettings(sql, organizationId);
   const admin = isProductionAdmin(context);
   const moneyVisible = admin || settings.moneyPublic;
+  const everyone = settings.scoresPublic || admin || task.job_leader_id === context.user.id;
   const rows = await sql<(EntryRow & { owner: UserRefJson })[]>`
     SELECT e.id, e.role, e.task_id, t.number::text AS task_number, e.job_id, j.code AS job_code, e.project_id, p.code AS project_code,
       e.process_id, pr.name AS process_name, e.shift_id, s.name AS shift_name, e.pay_mode, e.kind, e.qty,
@@ -376,6 +419,7 @@ export const getTaskScores = async (context: AccessContext, taskId: string): Pro
     JOIN public.app_users au ON au.id = e.user_id
     LEFT JOIN production.processes pr ON pr.organization_id = e.organization_id AND pr.id = e.process_id
     WHERE e.organization_id = ${organizationId} AND e.task_id = ${taskId}
+      ${everyone ? sql`` : sql`AND e.user_id = ${context.user.id}`}
     ORDER BY e.created_at, e.adjusts_entry_id NULLS FIRST, e.recorded_at, e.id
   `;
   const visible = (userId: string) => moneyVisible || userId === context.user.id;

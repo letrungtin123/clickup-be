@@ -247,10 +247,21 @@ try {
       }
       return null;
     };
-    const created = await b.call("POST", "/production/leave", { fromDate: d(40), toDate: d(41), part: "FULL_DAY", note: note("notify") });
-    const leaveId = created.body?.id;
-    const requested = await waitFor(admin, "production.leave_requested", (item) => item.payload.leaveId === leaveId);
-    ok("admin notified of a new leave request", Boolean(requested), created.body);
+    // PR-14 (decided): a requester without a team notifies every production Leader as well as the Admins.
+    const meB = (await contextOf(b)).user.id;
+    const previousTeam = localSql(`SELECT coalesce(team_id::text, '') FROM production.member_profiles WHERE user_id = '${meB}'`)[0] ?? "";
+    localSql(`UPDATE production.member_profiles SET team_id = NULL WHERE user_id = '${meB}'`);
+    let leaveId = null;
+    try {
+      const created = await b.call("POST", "/production/leave", { fromDate: d(40), toDate: d(41), part: "FULL_DAY", note: note("notify") });
+      leaveId = created.body?.id;
+      const requested = await waitFor(admin, "production.leave_requested", (item) => item.payload.leaveId === leaveId);
+      ok("admin notified of a new leave request", Boolean(requested), created.body);
+      const leaderNotice = await waitFor(a, "production.leave_requested", (item) => item.payload.leaveId === leaveId);
+      ok("PR-14: requester without a team → the production Leaders are notified too", Boolean(leaderNotice));
+    } finally {
+      if (previousTeam) localSql(`UPDATE production.member_profiles SET team_id = '${previousTeam}' WHERE user_id = '${meB}'`);
+    }
     await admin.call("POST", `/production/leave/${leaveId}/decide`, { decision: "APPROVED" });
     const decided = await waitFor(b, "production.leave_decided", (item) => item.payload.leaveId === leaveId);
     ok("requester notified of the decision", decided?.payload.status === "APPROVED", decided ?? "none");

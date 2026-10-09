@@ -127,6 +127,15 @@ describe("computeChannelCapabilities", () => {
     expect(caps({ permissions: manager })).toMatchObject({ canUpdate: true, canManageMembers: true, canChangeKind: false, canDelete: false });
     expect(caps({ kind: "private", permissions: manager })).toBeNull();
   });
+
+  it("keeps the channel admin role for channel admins and superadmins (SEC-API-02)", () => {
+    const manager = { view: true, update: true, delete: false, manageMembers: true };
+    // channel.manage_members lets you manage members, not promote yourself (or anyone) to admin.
+    expect(caps({ permissions: manager, member: { access: "submit", role: "member" } })).toMatchObject({ canManageMembers: true, canManageAdmins: false });
+    expect(caps({ member: { access: "submit", role: "admin" } })).toMatchObject({ canManageAdmins: true });
+    expect(caps({ kind: "private", permissions: allPerms, superadmin: true })).toMatchObject({ canManageAdmins: true });
+    expect(caps({ kind: "dm", member: { access: "submit", role: "member" }, permissions: allPerms })).toMatchObject({ canManageAdmins: false });
+  });
 });
 
 describe("mentions", () => {

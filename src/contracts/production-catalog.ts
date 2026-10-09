@@ -12,6 +12,29 @@ const IsoDate = z.string().datetime({ offset: true });
 const DateOnly = z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "Use YYYY-MM-DD.");
 const Color = z.enum(colorTokens);
 
+// Request inputs (PR-16) ----------------------------------------------------------------------------
+
+/** PostgreSQL text and jsonb cannot store U+0000. */
+export const hasNoNul = (value: string) => !value.includes("\u0000");
+/**
+ * Free text from a request: a NUL character is rejected here (400) instead of failing in the database (500).
+ * Chain the usual checks after it: `SafeText().trim().min(1).max(120)`.
+ */
+export const SafeText = () => z.string().refine(hasNoNul, "Không được chứa ký tự NUL.");
+
+/** A real calendar instant the database accepts (years 1900–2999, no rolled-over days such as 31/02). */
+export const isAcceptedInstant = (value: string) => {
+  const match = /^(\d{4})-(\d{2})-(\d{2})T/.exec(value);
+  if (!match) {
+    return false;
+  }
+  const [year, month, day] = [Number(match[1]), Number(match[2]), Number(match[3])];
+  const date = new Date(Date.UTC(year, month - 1, day));
+  return year >= 1900 && year <= 2999 && date.getUTCMonth() === month - 1 && date.getUTCDate() === day;
+};
+/** Instant from a request: ISO 8601 with an offset, within isAcceptedInstant. */
+export const IsoDateInputSchema = z.string().datetime({ offset: true }).refine(isAcceptedInstant, "Thời điểm không hợp lệ.");
+
 export const productionRoleCodes = ["ADMIN", "ACCOUNT", "LEADER", "QC", "STAFF"] as const;
 export const ProductionRoleSchema = z.enum(productionRoleCodes);
 export type ProductionRole = z.infer<typeof ProductionRoleSchema>;
@@ -20,7 +43,7 @@ export const customFieldEntities = ["JOB", "TASK", "USER", "CLIENT"] as const;
 export const CustomFieldEntitySchema = z.enum(customFieldEntities);
 export type CustomFieldEntity = z.infer<typeof CustomFieldEntitySchema>;
 
-export const CustomValuesSchema = z.record(z.string(), z.union([z.string(), z.number(), z.array(z.string()), z.null()]));
+export const CustomValuesSchema = z.record(SafeText(), z.union([SafeText(), z.number(), z.array(SafeText()), z.null()]));
 export type CustomValues = z.infer<typeof CustomValuesSchema>;
 
 // Members -----------------------------------------------------------------------------------------
@@ -67,7 +90,7 @@ export type ProductionMe = z.infer<typeof ProductionMeSchema>;
 
 export const TeamSchema = z.object({ id: Id, name: z.string(), active: z.boolean(), memberCount: z.number().int() });
 export const TeamCollectionSchema = z.object({ items: z.array(TeamSchema) });
-export const UpsertTeamRequestSchema = z.object({ name: z.string().trim().min(1).max(120), active: z.boolean().optional() }).strict();
+export const UpsertTeamRequestSchema = z.object({ name: SafeText().trim().min(1).max(120), active: z.boolean().optional() }).strict();
 
 export const ClientSchema = z.object({
   id: Id,
@@ -81,8 +104,8 @@ export const ClientSchema = z.object({
 export const ClientCollectionSchema = z.object({ items: z.array(ClientSchema) });
 export const UpsertClientRequestSchema = z
   .object({
-    name: z.string().trim().min(1).max(160),
-    note: z.string().trim().max(2000).nullable().optional(),
+    name: SafeText().trim().min(1).max(160),
+    note: SafeText().trim().max(2000).nullable().optional(),
     active: z.boolean().optional(),
     customValues: CustomValuesSchema.optional(),
     tagIds: z.array(Id).max(50).optional()
@@ -102,8 +125,8 @@ export type ProductionProject = z.infer<typeof ProductionProjectSchema>;
 export const ProductionProjectCollectionSchema = z.object({ items: z.array(ProductionProjectSchema) });
 export const UpsertProductionProjectRequestSchema = z
   .object({
-    code: z.string().trim().min(1).max(40),
-    name: z.string().trim().min(1).max(160),
+    code: SafeText().trim().min(1).max(40),
+    name: SafeText().trim().min(1).max(160),
     clientId: Id.nullable().optional(),
     qcBufferHours: z.number().int().min(0).max(720).optional(),
     active: z.boolean().optional()
@@ -115,7 +138,7 @@ export type Process = z.infer<typeof ProcessSchema>;
 export const ProcessCollectionSchema = z.object({ items: z.array(ProcessSchema) });
 export const UpsertProcessRequestSchema = z
   .object({
-    name: z.string().trim().min(1).max(120),
+    name: SafeText().trim().min(1).max(120),
     isQc: z.boolean().optional(),
     sortOrder: z.number().int().min(0).max(10_000).optional(),
     active: z.boolean().optional()
@@ -136,7 +159,7 @@ export type Shift = z.infer<typeof ShiftSchema>;
 export const ShiftCollectionSchema = z.object({ items: z.array(ShiftSchema) });
 export const UpsertShiftRequestSchema = z
   .object({
-    name: z.string().trim().min(1).max(80),
+    name: SafeText().trim().min(1).max(80),
     payMode: PayModeSchema,
     requiresOtHours: z.boolean().optional(),
     sortOrder: z.number().int().min(0).max(10_000).optional(),
@@ -187,7 +210,7 @@ export const ReorderCatalogRequestSchema = z.object({ ids: z.array(Id).min(1).ma
 
 export const CreditImportRequestSchema = z
   .object({
-    csv: z.string().min(1).max(2_000_000),
+    csv: SafeText().min(1).max(2_000_000),
     effectiveFrom: DateOnly,
     /** Create unknown project codes / process names instead of rejecting the rows. */
     createMissing: z.boolean().default(false)
@@ -241,8 +264,8 @@ export type ProductionWorkflow = z.infer<typeof StatusWorkflowSchema>;
 
 export const UpsertStatusRequestSchema = z
   .object({
-    code: z.string().trim().toUpperCase().regex(/^[A-Z][A-Z0-9_]{1,39}$/),
-    name: z.string().trim().min(1).max(80),
+    code: SafeText().trim().toUpperCase().regex(/^[A-Z][A-Z0-9_]{1,39}$/),
+    name: SafeText().trim().min(1).max(80),
     color: Color,
     countsDone: z.boolean().default(false),
     countsChecked: z.boolean().default(false),
@@ -275,8 +298,8 @@ export const ReplaceTransitionsRequestSchema = z
 
 export const CustomFieldTypeSchema = z.enum(["TEXT", "NUMBER", "DATE", "SELECT", "MULTISELECT"]);
 export const CustomFieldOptionSchema = z.object({
-  value: z.string().trim().min(1).max(80),
-  label: z.string().trim().min(1).max(120),
+  value: SafeText().trim().min(1).max(80),
+  label: SafeText().trim().min(1).max(120),
   color: Color.optional()
 });
 
@@ -297,8 +320,8 @@ export const CustomFieldCollectionSchema = z.object({ items: z.array(CustomField
 export const UpsertCustomFieldRequestSchema = z
   .object({
     entity: CustomFieldEntitySchema,
-    key: z.string().trim().regex(/^[a-z][a-z0-9_]{0,39}$/, "Use lowercase letters, digits and _."),
-    label: z.string().trim().min(1).max(120),
+    key: SafeText().trim().regex(/^[a-z][a-z0-9_]{0,39}$/, "Use lowercase letters, digits and _."),
+    label: SafeText().trim().min(1).max(120),
     type: CustomFieldTypeSchema,
     options: z.array(CustomFieldOptionSchema).max(200).default([]),
     required: z.boolean().default(false),
@@ -311,7 +334,7 @@ export const UpsertCustomFieldRequestSchema = z
 export const TagSchema = z.object({ id: Id, name: z.string(), color: Color, active: z.boolean() });
 export const TagCollectionSchema = z.object({ items: z.array(TagSchema) });
 export const UpsertTagRequestSchema = z
-  .object({ name: z.string().trim().min(1).max(60), color: Color.default("slate"), active: z.boolean().optional() })
+  .object({ name: SafeText().trim().min(1).max(60), color: Color.default("slate"), active: z.boolean().optional() })
   .strict();
 
 // Settings & whitelist ----------------------------------------------------------------------------
@@ -336,7 +359,7 @@ export const AllowedEmailCollectionSchema = z.object({ items: z.array(AllowedEma
 export const AddAllowedEmailsRequestSchema = z
   .object({
     /** Free text pasted from a spreadsheet: emails separated by commas, semicolons, spaces or new lines. */
-    text: z.string().min(3).max(200_000)
+    text: SafeText().min(3).max(200_000)
   })
   .strict();
 export const AddAllowedEmailsResultSchema = z.object({

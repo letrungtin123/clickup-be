@@ -1,6 +1,7 @@
+import { spawnSync } from "node:child_process";
 import { createRequire } from "node:module";
-import { cleanupWorkProjects, dbNow } from "./cleanup.mjs";
-import { apiOrigin, session } from "./lib.mjs";
+import { cleanupWorkProjects, dbNow, quote } from "./cleanup.mjs";
+import { apiOrigin, localSql, session } from "./lib.mjs";
 const require = createRequire(process.cwd() + "/package.json");
 const { io } = require("socket.io-client");
 const ok = (label, cond, extra = "") => console.log(`${cond ? "PASS" : "FAIL"}  ${label} ${extra}`);
@@ -47,10 +48,20 @@ try {
   r = await a.call("POST", "/notifications/read", { all: true });
   ok("mark all read", r.body.unreadCount === 0);
 
-  // Deadline reminder: runs every 5 min in the worker; check after first scan (10s after worker start) or skip
+  // Deadline reminders (PERF-04): the set-based scan run twice in a separate process — exactly one reminder.
+  const scan = spawnSync(process.execPath, [
+    "--import", "tsx", "--input-type=module", "-e",
+    "const m = await import('./src/modules/notifications/deadline-scheduler.ts'); const first = await m.runDeadlineScan(); const second = await m.runDeadlineScan(); console.log('SCAN ' + JSON.stringify({ first, second })); process.exit(0);"
+  ], { cwd: process.cwd(), encoding: "utf8", timeout: 60_000, env: { ...process.env, LOG_LEVEL: "silent" } });
+  const scanLine = (scan.stdout ?? "").split(/\r?\n/).find((line) => line.startsWith("SCAN ")) ?? "";
+  ok("deadline scan runs (set-based)", scan.status === 0 && scanLine.length > 0, scanLine || (scan.stderr ?? "").split(/\r?\n/).slice(-3).join(" "));
+  const reminders = localSql(`
+    SELECT count(*) FROM public.notifications
+    WHERE recipient_user_id = ${quote(ctxA.user.id)} AND task_id = ${quote(task.id)} AND type = 'task.due_soon'
+  `)[0];
+  ok("exactly one due-soon reminder after repeated scans", reminders === "1", reminders);
   r = await a.call("GET", "/notifications?limit=50");
-  const dueSoon = r.body.items.filter((n) => n.type === "task.due_soon" && n.target.taskId === task.id).length;
-  console.log(`INFO  due_soon reminders so far for this task: ${dueSoon} (scanner runs every 5 minutes)`);
+  ok("reminder reaches the inbox", r.body.items.some((n) => n.type === "task.due_soon" && n.target.taskId === task.id && n.payload.taskKey?.startsWith(key)));
 } finally {
   socket.close();
   await cleanupWorkProjects(mgr, [proj?.id], since);

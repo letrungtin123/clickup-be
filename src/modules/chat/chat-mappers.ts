@@ -10,9 +10,10 @@ import type {
   ChatSystemEvent,
   NotifyLevel
 } from "../../contracts/chat.js";
+import { chatLimits } from "../../contracts/chat.js";
 import type { RichTextDoc } from "../../contracts/rich-text.js";
 import type { UserRef } from "../../contracts/work.js";
-import { toIso, toNullableIso, type QuerySql } from "../../lib/db-types.js";
+import { toIso, toNullableIso, type QuerySql, type SqlFragment } from "../../lib/db-types.js";
 import { inlineImageTypes } from "../../lib/storage.js";
 import { toSeq, unreadCount } from "./chat-rules.js";
 
@@ -85,8 +86,24 @@ export type ChannelViewRow = ChannelInfoRow & {
   notify_level: NotifyLevel | null;
   last_read_seq: string | number | null;
   mention_count: number;
+  unread_count: number;
   participants: UserRefJson[] | null;
 };
+
+/** Unread top-level messages after a read marker, deleted ones excluded (WK-45), capped. */
+export const unreadCountSql = (
+  sql: QuerySql,
+  organizationId: SqlFragment,
+  channelId: SqlFragment,
+  lastReadSeq: SqlFragment
+) => sql`(
+  SELECT count(*)::int FROM (
+    SELECT 1 FROM public.messages um
+    WHERE um.organization_id = ${organizationId} AND um.channel_id = ${channelId}
+      AND um.seq IS NOT NULL AND um.seq > ${lastReadSeq} AND um.deleted_at IS NULL
+    LIMIT ${chatLimits.unreadCountCap}
+  ) unread_capped
+)`;
 
 /**
  * Viewer columns (membership, unread mentions capped, DM participants); expects `c` (channels) and
@@ -102,6 +119,7 @@ export const channelViewerColumnsSql = (sql: QuerySql, userId: string, mentionCa
       LIMIT ${mentionCap}
     ) capped
   ) END AS mention_count,
+  CASE WHEN cm.id IS NULL THEN 0 ELSE ${unreadCountSql(sql, sql`c.organization_id`, sql`c.id`, sql`cm.last_read_seq`)} END AS unread_count,
   CASE WHEN c.kind IN ('dm', 'group_dm') THEN (
     SELECT coalesce(json_agg(${userJsonSql(sql)} ORDER BY au.display_name, au.id), '[]'::json)
     FROM public.channel_members pm
@@ -122,7 +140,7 @@ export const toChannel = (row: ChannelViewRow): ChatChannel => {
     myRole: row.role,
     notifyLevel: row.notify_level,
     lastReadSeq,
-    unreadCount: lastReadSeq === null ? 0 : unreadCount(info.lastMessageSeq, lastReadSeq),
+    unreadCount: lastReadSeq === null ? 0 : Math.min(Number(row.unread_count), unreadCount(info.lastMessageSeq, lastReadSeq)),
     mentionCount: isMember ? Number(row.mention_count) : 0,
     participants: (row.participants ?? []).map((user) => toUserRef(user)!)
   };

@@ -12,6 +12,13 @@ const postgresErrors: Record<string, { status: number; code: string; message: st
   "23514": { status: 409, code: "RULE_VIOLATION", message: "This change is not allowed by a data rule." },
   "23P01": { status: 409, code: "CONFLICT", message: "This change overlaps existing data." },
   "22P02": { status: 400, code: "VALIDATION_FAILED", message: "Request validation failed." },
+  // Bad input that slipped past request validation must never become a 500 (SEC-API-08).
+  "22001": { status: 400, code: "VALIDATION_FAILED", message: "Dữ liệu quá dài." },
+  "22003": { status: 400, code: "VALIDATION_FAILED", message: "Giá trị số nằm ngoài phạm vi cho phép." },
+  "22007": { status: 400, code: "VALIDATION_FAILED", message: "Định dạng ngày giờ không hợp lệ." },
+  "22008": { status: 400, code: "VALIDATION_FAILED", message: "Ngày giờ nằm ngoài phạm vi cho phép." },
+  "22021": { status: 400, code: "VALIDATION_FAILED", message: "Dữ liệu chứa ký tự không hợp lệ." },
+  "22P05": { status: 400, code: "VALIDATION_FAILED", message: "Dữ liệu chứa ký tự không hợp lệ." },
   "40001": { status: 409, code: "RETRY", message: "The request conflicted with another change. Please retry." },
   "40P01": { status: 409, code: "RETRY", message: "The request conflicted with another change. Please retry." }
 };
@@ -58,6 +65,12 @@ export const errorHandler: ErrorRequestHandler = (error, req, res, next) => {
       return;
     }
     const mapped = pgCode ? postgresErrors[pgCode] : undefined;
+    if (pgCode === "57014" && error.name === "PostgresError") {
+      // statement_timeout (db/client.ts): the query was cancelled, nothing was changed.
+      logger.warn({ err: error, requestId: req.id }, "Database statement timed out");
+      send(503, "QUERY_TIMEOUT", "Yêu cầu mất quá nhiều thời gian. Vui lòng thử lại hoặc thu hẹp bộ lọc.");
+      return;
+    }
     if (mapped && error.name === "PostgresError") {
       logger.warn({ err: error, requestId: req.id }, "Database rule rejected request");
       send(mapped.status, mapped.code, mapped.message);

@@ -12,11 +12,12 @@ import {
   getObjectInfo,
   baseMime,
   inlineImageTypes,
-  isBlockedMimeType,
+  isAllowedUploadType,
   isInlineImage,
   removeObjects,
   sanitizeFileName,
-  storageSafeSegment
+  storageSafeSegment,
+  uploadTypeRejected
 } from "../../lib/storage.js";
 import { publishToRoom } from "../../realtime/publisher.js";
 import type { AccessContext } from "../access/access-context.js";
@@ -32,9 +33,9 @@ export const createTaskUpload = async (context: AccessContext, taskId: string, i
   if (!hasPermission(context, Permission.TaskUpdate) && !hasPermission(context, Permission.TaskComment)) {
     throw new AppError("FORBIDDEN", "You do not have permission to attach files.", 403);
   }
-  const mimeType = input.mimeType.toLowerCase();
-  if (isBlockedMimeType(mimeType)) {
-    throw new AppError("ATTACHMENT_TYPE_BLOCKED", "This file type is not allowed.", 400);
+  const mimeType = baseMime(input.mimeType);
+  if (!isAllowedUploadType(mimeType)) {
+    throw uploadTypeRejected();
   }
   const sql = getSql();
   const { task } = await authorizeTask(sql, context, taskId, "submit");
@@ -102,16 +103,17 @@ export const completeTaskUpload = async (context: AccessContext, attachmentId: s
     await discard();
     throw new AppError("ATTACHMENT_TOO_LARGE", "The uploaded file is larger than allowed.", 400);
   }
-  // Storage serves the Content-Type sent with the upload: it must match what was authorized.
+  // Storage serves the Content-Type sent with the upload: it must match what was authorized (and be allowed).
   const storedType = info.contentType ? baseMime(info.contentType) : null;
-  if (!storedType || storedType !== baseMime(row.mime_type) || isBlockedMimeType(storedType)) {
+  if (!storedType || storedType !== baseMime(row.mime_type) || !isAllowedUploadType(storedType)) {
     await discard();
     throw new AppError("ATTACHMENT_TYPE_MISMATCH", "The uploaded file type does not match the declared type.", 400);
   }
 
   await sql.begin(async (tx) => {
+    // Files for a comment draft are not task attachments until (and unless) the comment is posted (WK-28).
     await tx`
-      UPDATE public.task_attachments SET status = 'ready', size_bytes = ${info.size}, completed_at = now()
+      UPDATE public.task_attachments SET status = 'ready', size_bytes = ${info.size}, completed_at = now(), purpose = ${target}
       WHERE id = ${attachmentId} AND organization_id = ${context.organization.id}
     `;
     if (target === "task") {

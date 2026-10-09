@@ -41,8 +41,13 @@ export const taskStatusEvent = (
 export const taskQtyEvent = (organizationId: string, taskId: string, actorId: string, from: number, to: number, note: string | null) =>
   event(organizationId, "production.task.qty_changed", taskId, actorId, { taskId, from, to, note });
 
-export const feedbackEvent = (organizationId: string, jobId: string, actorId: string, feedback: { type: string; note: string; sourceTaskId: string | null }) =>
-  ({ ...event(organizationId, "production.feedback.created", jobId, actorId, { jobId, ...feedback }), aggregateType: "production_job" });
+/** `taskIds`: the delivering tasks the feedback parked (their workers are "NV cũ" when no source task is named). */
+export const feedbackEvent = (
+  organizationId: string,
+  jobId: string,
+  actorId: string,
+  feedback: { type: string; note: string; sourceTaskId: string | null; taskIds: string[] }
+) => ({ ...event(organizationId, "production.feedback.created", jobId, actorId, { jobId, ...feedback }), aggregateType: "production_job" });
 
 export const commentCreatedEvent = (
   organizationId: string,
@@ -78,17 +83,19 @@ type TaskInfo = {
   deadline: Date;
 };
 
-const loadTaskInfo = async (organizationId: string, taskId: string) =>
-  (
-    await getSql()<TaskInfo[]>`
-      SELECT t.id, t.number, t.job_id, j.code AS job_code, j.leader_id, t.assignee_id, t.qc_id, pr.name AS process_name,
-        t.qty_assigned, t.qty_done, t.deadline
-      FROM production.tasks t
-      JOIN production.jobs j ON j.organization_id = t.organization_id AND j.id = t.job_id
-      JOIN production.processes pr ON pr.organization_id = t.organization_id AND pr.id = t.process_id
-      WHERE t.organization_id = ${organizationId} AND t.id = ${taskId}
-    `
-  )[0] ?? null;
+const loadTaskInfos = async (organizationId: string, taskIds: string[]) =>
+  taskIds.length === 0
+    ? []
+    : await getSql()<TaskInfo[]>`
+        SELECT t.id, t.number, t.job_id, j.code AS job_code, j.leader_id, t.assignee_id, t.qc_id, pr.name AS process_name,
+          t.qty_assigned, t.qty_done, t.deadline
+        FROM production.tasks t
+        JOIN production.jobs j ON j.organization_id = t.organization_id AND j.id = t.job_id
+        JOIN production.processes pr ON pr.organization_id = t.organization_id AND pr.id = t.process_id
+        WHERE t.organization_id = ${organizationId} AND t.id = ANY(${taskIds}::uuid[])
+      `;
+
+const loadTaskInfo = async (organizationId: string, taskId: string) => (await loadTaskInfos(organizationId, [taskId]))[0] ?? null;
 
 const taskPayload = (task: TaskInfo, extra: Record<string, unknown> = {}) => ({
   productionTaskId: task.id,
@@ -170,13 +177,21 @@ export const productionNotificationHandlers: Record<string, (event: DomainEventE
     if (!jobId) {
       return;
     }
+    // "NV cũ" (PR-15): the worker of the named source task — whatever its kind, an FB redo task included —
+    // otherwise the workers of the delivering tasks the feedback parked (events before PR-15: normal tasks).
+    const sourceTaskId = str(envelope.payload.sourceTaskId);
+    const parked = strArray(envelope.payload.taskIds);
     const sql = getSql();
     const job = (
       await sql<{ code: string; leader_id: string; workers: string[] }[]>`
         SELECT j.code, j.leader_id,
           coalesce((SELECT array_agg(DISTINCT t.assignee_id) FROM production.tasks t
-            WHERE t.organization_id = j.organization_id AND t.job_id = j.id AND t.kind = 'NORMAL'
-              AND (${str(envelope.payload.sourceTaskId)}::uuid IS NULL OR t.id = ${str(envelope.payload.sourceTaskId)}::uuid)), '{}') AS workers
+            WHERE t.organization_id = j.organization_id AND t.job_id = j.id
+              AND CASE
+                WHEN ${sourceTaskId}::uuid IS NOT NULL THEN t.id = ${sourceTaskId}::uuid
+                WHEN cardinality(${parked}::uuid[]) > 0 THEN t.id = ANY(${parked}::uuid[])
+                ELSE t.kind = 'NORMAL'
+              END), '{}') AS workers
         FROM production.jobs j WHERE j.organization_id = ${envelope.organizationId} AND j.id = ${jobId}
       `
     )[0];
@@ -261,7 +276,11 @@ const leavePayload = (leaveId: string, leave: LeaveInfo) => ({
 });
 
 Object.assign(productionNotificationHandlers, {
-  /** SPEC §6.3: new leave request → leaders of the requester's team (if any) and production admins. */
+  /**
+   * SPEC §6.3: new leave request → the Leaders of the requester's team and the production Admins
+   * (organization superadmins included). Requester without a team (PR-14, decided): every production
+   * Leader and Admin.
+   */
   "production.leave.requested": async (envelope: DomainEventEnvelope) => {
     const leaveId = str(envelope.payload.leaveId);
     const leave = leaveId ? await loadLeave(envelope.organizationId, leaveId) : null;
@@ -269,10 +288,15 @@ Object.assign(productionNotificationHandlers, {
       return;
     }
     const recipients = await getSql()<{ user_id: string }[]>`
-      SELECT DISTINCT ur.user_id FROM production.user_roles ur
+      SELECT ur.user_id FROM production.user_roles ur
       LEFT JOIN production.member_profiles mp ON mp.organization_id = ur.organization_id AND mp.user_id = ur.user_id
       WHERE ur.organization_id = ${envelope.organizationId}
-        AND (ur.role_code = 'ADMIN' OR (ur.role_code = 'LEADER' AND ${leave.team_id}::uuid IS NOT NULL AND mp.team_id = ${leave.team_id}::uuid))
+        AND (ur.role_code = 'ADMIN'
+          OR (ur.role_code = 'LEADER' AND (${leave.team_id}::uuid IS NULL OR mp.team_id = ${leave.team_id}::uuid)))
+      UNION
+      SELECT om.user_id FROM public.organization_memberships om
+      JOIN public.roles r ON r.id = om.role_id AND r.key = 'superadmin'
+      WHERE om.organization_id = ${envelope.organizationId} AND om.deleted_at IS NULL AND om.status = 'active'
     `;
     await deliverNotifications({
       organizationId: envelope.organizationId,
@@ -308,25 +332,37 @@ Object.assign(productionNotificationHandlers, {
 // SPEC §8.2: KPI_SETTLED → each settled person + one summary per run for production admins.
 Object.assign(productionNotificationHandlers, kpiSettlementNotificationHandlers);
 
-/** Lateness scan side: late (once per task + deadline) and due-soon reminders to the worker and the job leader. */
+const deliverDeadline = (kind: "production.task_late" | "production.task_due_soon", organizationId: string, task: TaskInfo) =>
+  deliverNotifications({
+    organizationId,
+    recipientIds: [task.assignee_id, task.leader_id],
+    type: kind,
+    actorUserId: null,
+    title: task.job_code,
+    body: `#${Number(task.number)} · ${task.process_name} · ${task.qty_assigned} tấm`,
+    payload: taskPayload(task),
+    dedupeKey: `${kind}:${task.id}:${task.deadline.toISOString()}`
+  });
+
+/**
+ * Lateness scan side: late (once per task + deadline) and due-soon reminders to the worker and the job
+ * leader. The tasks of an organization are loaded in one query per 500 (PERF-15).
+ */
 export const notifyDeadline = async (
   kind: "production.task_late" | "production.task_due_soon",
   rows: { organization_id: string; id: string }[]
 ) => {
+  const byOrganization = new Map<string, string[]>();
   for (const row of rows) {
-    const task = await loadTaskInfo(row.organization_id, row.id);
-    if (!task) {
-      continue;
+    const ids = byOrganization.get(row.organization_id) ?? [];
+    ids.push(row.id);
+    byOrganization.set(row.organization_id, ids);
+  }
+  for (const [organizationId, taskIds] of byOrganization) {
+    for (let index = 0; index < taskIds.length; index += 500) {
+      for (const task of await loadTaskInfos(organizationId, taskIds.slice(index, index + 500))) {
+        await deliverDeadline(kind, organizationId, task);
+      }
     }
-    await deliverNotifications({
-      organizationId: row.organization_id,
-      recipientIds: [task.assignee_id, task.leader_id],
-      type: kind,
-      actorUserId: null,
-      title: task.job_code,
-      body: `#${Number(task.number)} · ${task.process_name} · ${task.qty_assigned} tấm`,
-      payload: taskPayload(task),
-      dedupeKey: `${kind}:${task.id}:${task.deadline.toISOString()}`
-    });
   }
 };

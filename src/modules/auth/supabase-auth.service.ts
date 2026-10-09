@@ -163,6 +163,8 @@ export type VerifiedSession = AuthUser & {
   sessionId: string | null;
   /** Token expiry, seconds since epoch. */
   expiresAt: number;
+  /** Token issue time (`iat`), seconds since epoch, when the token carries it. */
+  issuedAt: number | null;
 };
 
 const jwtSecret = env.SUPABASE_JWT_SECRET ? new TextEncoder().encode(env.SUPABASE_JWT_SECRET) : undefined;
@@ -183,7 +185,7 @@ const revokedSessionKey = (sessionId: string) => `auth:revoked:${sessionId}`;
 const validAfterKey = (userId: string) => `auth:valid-after:${userId}`;
 
 /** A token is revoked when its session was logged out, or it was issued before a user-wide revocation. */
-const isTokenRevoked = async (userId: string, sessionId: string | null, issuedAt: number | undefined) => {
+export const isTokenRevoked = async (userId: string, sessionId: string | null, issuedAt: number | undefined) => {
   const redis = getOptionalRedis();
   if (!redis) {
     return false;
@@ -220,7 +222,7 @@ const verifyAccessTokenRemotely = async (accessToken: string): Promise<VerifiedS
     (value) => SupabaseUserSchema.parse(value)
   );
 
-  return { ...toAuthUser(user), sessionId: null, expiresAt: Math.floor(Date.now() / 1000) + 60 };
+  return { ...toAuthUser(user), sessionId: null, expiresAt: Math.floor(Date.now() / 1000) + 60, issuedAt: null };
 };
 
 /**
@@ -257,7 +259,8 @@ export const verifyAccessToken = async (accessToken: string): Promise<VerifiedSe
       user_metadata: claims.user_metadata ?? {}
     }),
     sessionId,
-    expiresAt: claims.exp
+    expiresAt: claims.exp,
+    issuedAt: claims.iat ?? null
   };
 };
 
@@ -275,13 +278,15 @@ export const denylistSession = async (session: Pick<VerifiedSession, "sessionId"
 };
 
 /**
- * Logs a session out everywhere it matters; returns its id so live sockets can be closed.
- * `scope: "local"` ends only this session (GoTrue's default for /logout is every session of the user).
+ * Logs a session out; returns its id so live sockets can be closed. Product decision (BUG-WK-02): signing
+ * out ends only this device's session, so the default is `scope: "local"`. `scope: "global"` (GoTrue's own
+ * default) ends every session of the user — other devices would die when their access token expires.
  */
 export const revokeAuthSession = async (
   accessToken: string | null,
-  options: { scope?: "local" } = {}
+  options: { scope?: "local" | "global" } = {}
 ): Promise<string | null> => {
+  const scope = options.scope ?? "local";
   if (!accessToken) {
     return null;
   }
@@ -296,7 +301,7 @@ export const revokeAuthSession = async (
   }
 
   await supabaseJson(
-    options.scope ? `/logout?scope=${options.scope}` : "/logout",
+    `/logout?scope=${scope}`,
     {
       method: "POST",
       headers: {

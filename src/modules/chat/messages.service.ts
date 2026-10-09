@@ -17,11 +17,21 @@ import type {
 } from "../../contracts/chat.js";
 import { chatLimits } from "../../contracts/chat.js";
 import { Permission } from "../../contracts/permissions.js";
-import { messageLimits, RichTextError, sanitizeRichText } from "../../contracts/rich-text.js";
+import { messageLimits, RichTextError } from "../../contracts/rich-text.js";
 import { getSql } from "../../db/client.js";
 import { AppError } from "../../lib/app-error.js";
-import { toIso, toNullableIso, toPrefixTsQuery, type QuerySql } from "../../lib/db-types.js";
+import {
+  decodeTimeCursor,
+  encodeTimeCursor,
+  timestampParamSql,
+  timestampTextSql,
+  toIso,
+  toNullableIso,
+  toPrefixTsQuery,
+  type QuerySql
+} from "../../lib/db-types.js";
 import { logger } from "../../lib/logger.js";
+import { sanitizeWithMentionLabels } from "../../lib/mentions.js";
 import { removeObjects } from "../../lib/storage.js";
 import { publishToRoom, publishToUsers } from "../../realtime/publisher.js";
 import type { AccessContext } from "../access/access-context.js";
@@ -35,11 +45,10 @@ import {
   requireReadableChannel,
   type ResolvedChannel
 } from "./chat-access.js";
-import { toUserRef, userJsonSql, type UserRefJson } from "./chat-mappers.js";
+import { toUserRef, unreadCountSql, userJsonSql, type UserRefJson } from "./chat-mappers.js";
+import { assertChatAttachmentsEnabled } from "./chat-settings.js";
 import { consumeChatQuota } from "./chat-rate-limit.js";
 import {
-  decodeTimeCursor,
-  encodeTimeCursor,
   findInvalidMentions,
   hasMessageContent,
   mentionRecipients,
@@ -53,9 +62,10 @@ import { channelRoom, isUniqueViolation, selectMessageById, selectMessages } fro
 
 const messageNotFound = () => new AppError("CHAT_MESSAGE_NOT_FOUND", "Message was not found.", 404);
 
-const sanitizeBody = (body: unknown) => {
+/** Sanitized body; mention labels are the people's current display names (SEC-API-10 / WK-44). */
+const sanitizeBody = async (sql: QuerySql, context: AccessContext, body: unknown) => {
   try {
-    return sanitizeRichText(body, messageLimits);
+    return await sanitizeWithMentionLabels(sql, context.organization.id, body, messageLimits);
   } catch (error) {
     if (error instanceof RichTextError) {
       throw new AppError("INVALID_RICH_TEXT", error.message, 400);
@@ -204,16 +214,19 @@ export const sendMessage = async (
   channelId: string,
   input: SendMessageRequest
 ): Promise<{ created: boolean; message: ChatMessage }> => {
-  const sanitized = sanitizeBody(input.body);
+  const sql = getSql();
+  const sanitized = await sanitizeBody(sql, context, input.body);
   const attachmentIds = uniqueIds(input.attachmentIds);
   if (!hasMessageContent(sanitized.text, attachmentIds.length)) {
     throw new AppError("CHAT_MESSAGE_EMPTY", "Write a message or attach a file.", 400);
   }
 
-  const sql = getSql();
   const existing = await findByClientMessageId(sql, context, input.clientMessageId);
   if (existing) {
     return await replayExisting(context, channelId, existing);
+  }
+  if (attachmentIds.length > 0) {
+    await assertChatAttachmentsEnabled(sql, context.organization.id);
   }
   await consumeChatQuota("send", context.user.id);
 
@@ -362,8 +375,8 @@ const lockMessage = async (tx: QuerySql, context: AccessContext, messageId: stri
 };
 
 export const editMessage = async (context: AccessContext, messageId: string, body: unknown): Promise<ChatMessage> => {
-  const sanitized = sanitizeBody(body);
   const sql = getSql();
+  const sanitized = await sanitizeBody(sql, context, body);
 
   const outcome = await sql.begin(async (tx) => {
     const { message, resolved } = await lockMessage(tx, context, messageId);
@@ -469,11 +482,19 @@ export const deleteMessage = async (context: AccessContext, messageId: string) =
 
     let threadRoot: ThreadRootSummary | null = null;
     if (message.thread_root_id) {
+      // Recounted from the live replies, so the count and "last reply" always match the thread (WK-63).
       const root = (
         await tx<{ id: string; reply_count: number; last_reply_at: Date | null }[]>`
-          UPDATE public.messages SET reply_count = GREATEST(reply_count - 1, 0)
-          WHERE organization_id = ${context.organization.id} AND id = ${message.thread_root_id}
-          RETURNING id, reply_count, last_reply_at
+          UPDATE public.messages root
+          SET reply_count = live.n, last_reply_at = live.last_at
+          FROM (
+            SELECT count(*)::int AS n, max(r.created_at) AS last_at
+            FROM public.messages r
+            WHERE r.organization_id = ${context.organization.id} AND r.thread_root_id = ${message.thread_root_id}
+              AND r.deleted_at IS NULL
+          ) live
+          WHERE root.organization_id = ${context.organization.id} AND root.id = ${message.thread_root_id}
+          RETURNING root.id, root.reply_count, root.last_reply_at
         `
       )[0];
       if (root) {
@@ -541,13 +562,15 @@ export const getThread = async (context: AccessContext, messageId: string, query
   const rootId = base.thread_root_id ?? base.id;
   const cursor = decodeTimeCursor(query.cursor);
 
+  // Deleted replies stay as tombstones (the root's replyCount counts live replies only); the keyset compares
+  // microsecond-exact timestamps (BUG-WK-12).
   const [root, replyRows] = await Promise.all([
     selectMessageById(sql, context, rootId),
     sql<{ id: string; created_at_text: string }[]>`
-      SELECT m.id, m.created_at::text AS created_at_text
+      SELECT m.id, ${timestampTextSql(sql, () => sql`m.created_at`)} AS created_at_text
       FROM public.messages m
       WHERE m.organization_id = ${context.organization.id} AND m.thread_root_id = ${rootId}
-        AND (${cursor === null} OR (m.created_at, m.id) > (${cursor?.at ?? null}::timestamptz, ${cursor?.id ?? null}::uuid))
+        ${cursor ? sql`AND (m.created_at, m.id) > (${timestampParamSql(sql, cursor.at)}, ${cursor.id}::uuid)` : sql``}
       ORDER BY m.created_at, m.id
       LIMIT ${query.limit + 1}
     `
@@ -665,10 +688,19 @@ export const markRead = async (context: AccessContext, channelId: string, seq: n
 
   const lastReadSeq = moved ? toSeq(moved.last_read_seq) : resolved.member.lastReadSeq;
   const lastMessageSeq = moved ? toSeq(moved.last_message_seq) : toSeq(resolved.channel.last_message_seq);
+  // Deleted messages are not unread (WK-45).
+  const liveUnread =
+    unreadCount(lastMessageSeq, lastReadSeq) === 0
+      ? 0
+      : ((
+          await sql<{ n: number }[]>`
+            SELECT ${unreadCountSql(sql, sql`${context.organization.id}::uuid`, sql`${channelId}::uuid`, sql`${lastReadSeq}::bigint`)} AS n
+          `
+        )[0]?.n ?? 0);
   const state: ReadState = {
     channelId,
     lastReadSeq,
-    unreadCount: unreadCount(lastMessageSeq, lastReadSeq),
+    unreadCount: liveUnread,
     mentionCount: await countUnreadMentions(sql, context, channelId, lastReadSeq)
   };
   if (moved) {
@@ -728,7 +760,7 @@ export const searchMessages = async (context: AccessContext, query: ChatSearchQu
   const canViewChannels = hasPermission(context, Permission.ChannelView);
   const rows = await sql<HitRow[]>`
     SELECT m.id, m.channel_id, c.kind AS channel_kind, c.name AS channel_name, m.seq, m.thread_root_id,
-      left(m.body_text, 500) AS text, m.created_at, m.created_at::text AS cursor_at,
+      left(m.body_text, 500) AS text, m.created_at, ${timestampTextSql(sql, () => sql`m.created_at`)} AS cursor_at,
       (SELECT ${userJsonSql(sql)} FROM public.app_users au WHERE au.id = m.author_user_id) AS author
     FROM public.messages m
     JOIN public.channel_members cm
@@ -742,7 +774,7 @@ export const searchMessages = async (context: AccessContext, query: ChatSearchQu
       AND m.search_vector @@ to_tsquery('simple', ${tsQuery})
       AND (c.kind IN ('dm', 'group_dm') OR ${canViewChannels})
       AND (${query.channelId ?? null}::uuid IS NULL OR m.channel_id = ${query.channelId ?? null}::uuid)
-      AND (${cursor === null} OR (m.created_at, m.id) < (${cursor?.at ?? null}::timestamptz, ${cursor?.id ?? null}::uuid))
+      ${cursor ? sql`AND (m.created_at, m.id) < (${timestampParamSql(sql, cursor.at)}, ${cursor.id}::uuid)` : sql``}
     ORDER BY m.created_at DESC, m.id DESC
     LIMIT ${query.limit + 1}
   `;
@@ -756,7 +788,7 @@ export const listMyMentions = async (context: AccessContext, query: ChatMentions
   const canViewChannels = hasPermission(context, Permission.ChannelView);
   const rows = await sql<HitRow[]>`
     SELECT m.id, m.channel_id, c.kind AS channel_kind, c.name AS channel_name, m.seq, m.thread_root_id,
-      left(m.body_text, 500) AS text, m.created_at, mm.created_at::text AS cursor_at,
+      left(m.body_text, 500) AS text, m.created_at, ${timestampTextSql(sql, () => sql`mm.created_at`)} AS cursor_at,
       (SELECT ${userJsonSql(sql)} FROM public.app_users au WHERE au.id = m.author_user_id) AS author
     FROM public.message_mentions mm
     JOIN public.messages m ON m.organization_id = mm.organization_id AND m.id = mm.message_id AND m.deleted_at IS NULL
@@ -772,7 +804,7 @@ export const listMyMentions = async (context: AccessContext, query: ChatMentions
         )
         OR (c.kind = 'public' AND ${canViewChannels})
       )
-      AND (${cursor === null} OR (mm.created_at, mm.message_id) < (${cursor?.at ?? null}::timestamptz, ${cursor?.id ?? null}::uuid))
+      ${cursor ? sql`AND (mm.created_at, mm.message_id) < (${timestampParamSql(sql, cursor.at)}, ${cursor.id}::uuid)` : sql``}
     ORDER BY mm.created_at DESC, mm.message_id DESC
     LIMIT ${query.limit + 1}
   `;
