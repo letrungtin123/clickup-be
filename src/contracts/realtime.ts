@@ -1,5 +1,15 @@
 import { z } from "zod";
 
+import type {
+  ChatChannelEvent,
+  ChatMessageDeletedEvent,
+  ChatMessageEvent,
+  ChatMessageUpdatedEvent,
+  ChatReactionEvent,
+  ChatReadEvent
+} from "./chat.js";
+import type { NotificationNewEvent, NotificationReadEvent } from "./notifications.js";
+
 /**
  * Realtime contract shared by the API gateway, the worker, and the SPA.
  * Realtime messages are hints for the client cache; PostgreSQL stays authoritative.
@@ -65,15 +75,15 @@ export type ServerToClientEvents = {
   "task:changed": (event: TaskChangedEvent) => void;
   "task:timeline": (event: TaskTimelineEvent) => void;
   "project:structure": (event: ProjectStructureEvent) => void;
-  "chat:message": (event: GenericEnvelope) => void;
-  "chat:message:updated": (event: GenericEnvelope) => void;
-  "chat:message:deleted": (event: GenericEnvelope) => void;
-  "chat:reaction": (event: GenericEnvelope) => void;
-  "chat:channel": (event: GenericEnvelope) => void;
-  "chat:read": (event: GenericEnvelope) => void;
+  "chat:message": (event: ChatMessageEvent) => void;
+  "chat:message:updated": (event: ChatMessageUpdatedEvent) => void;
+  "chat:message:deleted": (event: ChatMessageDeletedEvent) => void;
+  "chat:reaction": (event: ChatReactionEvent) => void;
+  "chat:channel": (event: ChatChannelEvent) => void;
+  "chat:read": (event: ChatReadEvent) => void;
   "chat:typing": (event: ChatTypingEvent) => void;
-  "notification:new": (event: GenericEnvelope) => void;
-  "notification:read": (event: GenericEnvelope) => void;
+  "notification:new": (event: NotificationNewEvent) => void;
+  "notification:read": (event: NotificationReadEvent) => void;
   "access:revoked": (event: { room: RealtimeRoomRef }) => void;
   "session:expiring": (event: { expiresAt: number }) => void;
 };
