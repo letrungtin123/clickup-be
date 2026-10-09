@@ -40,6 +40,8 @@ export const leaveLimits = {
 export const LeaveRequestSchema = z.object({
   id: Id,
   user: UserRefSchema,
+  /** The requester's report team (label only), for the calendar's team filter. */
+  team: z.object({ id: Id, name: z.string() }).nullable(),
   fromDate: DateOnly,
   toDate: DateOnly,
   part: LeavePartSchema,
@@ -64,7 +66,7 @@ export const LeaveRequestCollectionSchema = z.object({ items: z.array(LeaveReque
 export type LeaveRequestCollection = z.infer<typeof LeaveRequestCollectionSchema>;
 
 /** GET /production/leave?from&to — inclusive window, at most leaveLimits.maxCalendarDays days. */
-export const LeaveCalendarQuerySchema = z.object({ from: DateOnly, to: DateOnly });
+export const LeaveCalendarQuerySchema = z.object({ from: DateOnly, to: DateOnly, teamId: Id.optional() });
 
 /**
  * Everyone: APPROVED requests of all members + own requests in any status.

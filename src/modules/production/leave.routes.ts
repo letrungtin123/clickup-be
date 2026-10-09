@@ -10,7 +10,14 @@ import {
 } from "../../contracts/production-leave.js";
 import { requireSupabaseUser } from "../../middleware/auth.js";
 import { handle, param } from "../work/http.js";
-import { cancelLeaveRequest, createLeaveRequest, decideLeaveRequest, getLeaveCalendar, listPendingLeave } from "./leave.service.js";
+import {
+  cancelLeaveRequest,
+  createLeaveRequest,
+  decideLeaveRequest,
+  getLeaveCalendar,
+  listMyLeave,
+  listPendingLeave
+} from "./leave.service.js";
 
 /**
  * Shared leave calendar ("Lịch nghỉ", SPEC §6.3). Every handler checks production roles itself
@@ -24,6 +31,7 @@ export const createProductionLeaveRoutes = (): ExpressRouter => {
     "/production/leave",
     handle(async (context, req) => LeaveCalendarSchema.parse(await getLeaveCalendar(context, LeaveCalendarQuerySchema.parse(req.query))))
   );
+  routes.get("/production/leave/mine", handle(async (context) => LeaveRequestCollectionSchema.parse(await listMyLeave(context))));
   routes.get("/production/leave/pending", handle(async (context) => LeaveRequestCollectionSchema.parse(await listPendingLeave(context))));
   routes.post(
     "/production/leave",

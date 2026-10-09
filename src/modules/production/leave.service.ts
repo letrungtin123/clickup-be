@@ -53,6 +53,8 @@ type LeaveRow = {
   updated_at: Date;
   owner: UserRefJson;
   decider: UserRefJson | null;
+  team_id: string | null;
+  team_name: string | null;
 };
 
 type Viewer = { userId: string; admin: boolean; leader: boolean; today: string };
@@ -73,10 +75,13 @@ const selectLeaves = (sql: QuerySql, organizationId: string, where: postgres.Pen
     lr.part, lr.note, lr.status, lr.decided_at, lr.decision_note, lr.cancelled_at, lr.created_at, lr.updated_at,
     json_build_object('id', au.id, 'display_name', au.display_name, 'email', au.email, 'avatar_url', au.avatar_url) AS owner,
     CASE WHEN du.id IS NULL THEN NULL
-      ELSE json_build_object('id', du.id, 'display_name', du.display_name, 'email', du.email, 'avatar_url', du.avatar_url) END AS decider
+      ELSE json_build_object('id', du.id, 'display_name', du.display_name, 'email', du.email, 'avatar_url', du.avatar_url) END AS decider,
+    tm.id AS team_id, tm.name AS team_name
   FROM production.leave_requests lr
   JOIN public.app_users au ON au.id = lr.user_id
   LEFT JOIN public.app_users du ON du.id = lr.decided_by
+  LEFT JOIN production.member_profiles mp ON mp.organization_id = lr.organization_id AND mp.user_id = lr.user_id
+  LEFT JOIN production.teams tm ON tm.organization_id = lr.organization_id AND tm.id = mp.team_id
   WHERE lr.organization_id = ${organizationId} AND ${where}
   ORDER BY lr.from_date, au.display_name, lr.created_at, lr.id
   LIMIT 5000
@@ -90,6 +95,7 @@ const toLeave = (row: LeaveRow, viewer: Viewer): LeaveRequest => {
   return {
     id: row.id,
     user: details ? owner : { ...owner, email: null },
+    team: row.team_id && row.team_name ? { id: row.team_id, name: row.team_name } : null,
     fromDate: row.from_date,
     toDate: row.to_date,
     part: row.part,
@@ -148,9 +154,18 @@ export const getLeaveCalendar = async (context: AccessContext, query: In<typeof 
       (lr.status IN ('PENDING', 'APPROVED') AND lr.slot_range && ${windowRange(sql, query.from, query.to)}
         AND (lr.status = 'APPROVED' OR lr.user_id = ${viewer.userId} OR ${seeAllPending}::boolean))
       OR (lr.user_id = ${viewer.userId} AND lr.from_date <= ${query.to}::date AND lr.to_date >= ${query.from}::date)
-    )`
+    ) AND (${query.teamId ?? null}::uuid IS NULL OR mp.team_id = ${query.teamId ?? null}::uuid)`
   );
   return { from: query.from, to: query.to, today: viewer.today, items: rows.map((row) => toLeave(row, viewer)) };
+};
+
+/** "Đơn của tôi": the caller's own requests in any status, newest leave first. */
+export const listMyLeave = async (context: AccessContext) => {
+  assertProductionMember(context);
+  const viewer = viewerOf(context);
+  const sql = getSql();
+  const rows = await selectLeaves(sql, org(context), sql`lr.user_id = ${viewer.userId}`);
+  return { items: rows.map((row) => toLeave(row, viewer)).reverse().slice(0, 200) };
 };
 
 /** Approval queue (LEADER/ADMIN): every PENDING request, oldest leave first. */

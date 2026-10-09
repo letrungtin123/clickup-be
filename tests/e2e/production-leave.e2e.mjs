@@ -214,6 +214,15 @@ try {
   } finally {
     socket.close();
   }
+  // "Đơn của tôi" and the team filter
+  {
+    const mine = await b.call("GET", "/production/leave/mine");
+    const meB = (await contextOf(b)).user.id;
+    ok("my requests list returns only mine", mine.status === 200 && mine.body.items.every((item) => item.user.id === meB), mine.body);
+    const team = await b.call("GET", `/production/leave?from=${d(0)}&to=${d(60)}&teamId=00000000-0000-4000-8000-000000000000`);
+    ok("team filter narrows the calendar", team.status === 200 && team.body.items.every((item) => item.team?.id === "00000000-0000-4000-8000-000000000000"), team.body);
+  }
+
   // Notifications (SPEC §6.3): request → production admins (+ team leaders); decision → requester.
   {
     const waitFor = async (who, type, predicate) => {
