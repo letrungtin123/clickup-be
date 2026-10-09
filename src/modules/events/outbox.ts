@@ -35,14 +35,13 @@ export const enqueueDomainEvents = async (tx: QuerySql, events: DomainEventInput
 
   await tx`
     INSERT INTO public.outbox_events (organization_id, event_type, aggregate_type, aggregate_id, actor_user_id, payload)
-    SELECT *
-    FROM unnest(
-      ${events.map((event) => event.organizationId)}::uuid[],
-      ${events.map((event) => event.type)}::text[],
-      ${events.map((event) => event.aggregateType)}::text[],
-      ${events.map((event) => event.aggregateId)}::uuid[],
-      ${events.map((event) => event.actorUserId)}::uuid[],
-      ${events.map((event) => JSON.stringify(event.payload))}::jsonb[]
-    )
+    SELECT
+      (event->>'organizationId')::uuid,
+      event->>'type',
+      event->>'aggregateType',
+      (event->>'aggregateId')::uuid,
+      (event->>'actorUserId')::uuid,
+      event->'payload'
+    FROM jsonb_array_elements(${tx.json(events as unknown as postgres.JSONValue)}) AS event
   `;
 };

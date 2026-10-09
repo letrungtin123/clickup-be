@@ -2,68 +2,29 @@ import { Router, type Request, type Router as ExpressRouter } from "express";
 
 import {
   ArchiveResponseSchema,
-  CreateListRequestSchema,
-  CreateProjectRequestSchema,
   CreateRoleRequestSchema,
-  CreateTaskCommentRequestSchema,
-  CreateTaskRequestSchema,
-  ListCollectionSchema,
-  ListSummarySchema,
   OpaqueIdSchema,
   OrganizationMemberCollectionSchema,
   OrganizationMemberSchema,
   PermissionCollectionSchema,
-  ProjectCollectionSchema,
-  ProjectMemberSchema,
-  ProjectMemberCollectionSchema,
-  ProjectSummarySchema,
   RoleCollectionSchema,
   ManagedRoleSchema,
-  TaskDetailResponseSchema,
-  TaskPageSchema,
-  TaskStatusCollectionSchema,
-  TaskSummarySchema,
-  UpdateListRequestSchema,
   UpdateOrganizationMemberRequestSchema,
-  UpdateProjectMemberRequestSchema,
-  UpdateProjectRequestSchema,
   UpdateRolePermissionsRequestSchema,
   UpdateRoleRequestSchema,
-  UpdateTaskRequestSchema,
-  UpsertProjectMemberRequestSchema,
   WorkspaceContextSchema
 } from "../../contracts/schemas.js";
-import { CursorQuerySchema } from "../../contracts/pagination.js";
 import { requireSupabaseUser, type AuthenticatedRequest } from "../../middleware/auth.js";
 import { invalidateAccessContexts, resolveAccessContext } from "../access/access-context.js";
 import {
   archiveRole,
-  archiveProject,
-  archiveProjectList,
-  createProject,
-  createProjectList,
   createRole,
-  createTask,
-  createTaskComment,
-  getTaskDetail,
-
   listOrganizationMembers,
   listPermissions,
-  listProjectLists,
-  listProjectMembers,
-  listProjectStatuses,
-  listProjectTasks,
-  listProjects,
   listRoles,
-  removeProjectMember,
-  updateProject,
   updateOrganizationMember,
-  updateProjectMember,
-  updateProjectList,
   updateRole,
-  updateRolePermissions,
-  upsertProjectMember,
-  updateTask
+  updateRolePermissions
 } from "./workspace.service.js";
 
 export const workspaceRoutes: ExpressRouter = Router();
@@ -174,227 +135,3 @@ workspaceRoutes.patch("/organization/members/:membershipId", async (req, res, ne
     next(error);
   }
 });
-
-workspaceRoutes.get("/projects", async (req, res, next) => {
-  try {
-    const context = await resolveAccessContext(getAuthenticatedUserId(req));
-    const payload = await listProjects(context);
-    res.json(ProjectCollectionSchema.parse(payload));
-  } catch (error) {
-    next(error);
-  }
-});
-
-workspaceRoutes.post("/projects", async (req, res, next) => {
-  try {
-    const input = CreateProjectRequestSchema.parse(req.body);
-    const context = await resolveAccessContext(getAuthenticatedUserId(req));
-    const payload = await createProject(context, input);
-    res.status(201).json(ProjectSummarySchema.parse(payload));
-  } catch (error) {
-    next(error);
-  }
-});
-
-workspaceRoutes.patch("/projects/:projectId", async (req, res, next) => {
-  try {
-    const projectId = OpaqueIdSchema.parse(req.params.projectId);
-    const input = UpdateProjectRequestSchema.parse(req.body);
-    const context = await resolveAccessContext(getAuthenticatedUserId(req));
-    const payload = await updateProject(context, projectId, input);
-    res.json(ProjectSummarySchema.parse(payload));
-  } catch (error) {
-    next(error);
-  }
-});
-
-workspaceRoutes.delete("/projects/:projectId", async (req, res, next) => {
-  try {
-    const projectId = OpaqueIdSchema.parse(req.params.projectId);
-    const context = await resolveAccessContext(getAuthenticatedUserId(req));
-    const payload = await archiveProject(context, projectId);
-    res.json(ArchiveResponseSchema.parse(payload));
-  } catch (error) {
-    next(error);
-  }
-});
-
-workspaceRoutes.get("/projects/:projectId/members", async (req, res, next) => {
-  try {
-    const projectId = OpaqueIdSchema.parse(req.params.projectId);
-    const context = await resolveAccessContext(getAuthenticatedUserId(req));
-    const payload = await listProjectMembers(context, projectId);
-    res.json(ProjectMemberCollectionSchema.parse(payload));
-  } catch (error) {
-    next(error);
-  }
-});
-
-workspaceRoutes.post("/projects/:projectId/members", async (req, res, next) => {
-  try {
-    const projectId = OpaqueIdSchema.parse(req.params.projectId);
-    const input = UpsertProjectMemberRequestSchema.parse(req.body);
-    const context = await resolveAccessContext(getAuthenticatedUserId(req));
-    const payload = await upsertProjectMember(context, projectId, input);
-    res.status(201).json(ProjectMemberSchema.parse(payload));
-  } catch (error) {
-    next(error);
-  }
-});
-
-workspaceRoutes.patch("/projects/:projectId/members/:userId", async (req, res, next) => {
-  try {
-    const projectId = OpaqueIdSchema.parse(req.params.projectId);
-    const userId = OpaqueIdSchema.parse(req.params.userId);
-    const input = UpdateProjectMemberRequestSchema.parse(req.body);
-    const context = await resolveAccessContext(getAuthenticatedUserId(req));
-    const payload = await updateProjectMember(context, projectId, userId, input);
-    res.json(ProjectMemberSchema.parse(payload));
-  } catch (error) {
-    next(error);
-  }
-});
-
-workspaceRoutes.delete("/projects/:projectId/members/:userId", async (req, res, next) => {
-  try {
-    const projectId = OpaqueIdSchema.parse(req.params.projectId);
-    const userId = OpaqueIdSchema.parse(req.params.userId);
-    const context = await resolveAccessContext(getAuthenticatedUserId(req));
-    const payload = await removeProjectMember(context, projectId, userId);
-    res.json(ArchiveResponseSchema.parse(payload));
-  } catch (error) {
-    next(error);
-  }
-});
-
-workspaceRoutes.get("/projects/:projectId/lists", async (req, res, next) => {
-  try {
-    const projectId = OpaqueIdSchema.parse(req.params.projectId);
-    const context = await resolveAccessContext(getAuthenticatedUserId(req));
-    const payload = await listProjectLists(context, projectId);
-    res.json(ListCollectionSchema.parse(payload));
-  } catch (error) {
-    next(error);
-  }
-});
-
-workspaceRoutes.post("/projects/:projectId/lists", async (req, res, next) => {
-  try {
-    const projectId = OpaqueIdSchema.parse(req.params.projectId);
-    const input = CreateListRequestSchema.parse(req.body);
-    const context = await resolveAccessContext(getAuthenticatedUserId(req));
-    const payload = await createProjectList(context, projectId, input);
-    res.status(201).json(ListSummarySchema.parse(payload));
-  } catch (error) {
-    next(error);
-  }
-});
-
-workspaceRoutes.patch("/projects/:projectId/lists/:listId", async (req, res, next) => {
-  try {
-    const projectId = OpaqueIdSchema.parse(req.params.projectId);
-    const listId = OpaqueIdSchema.parse(req.params.listId);
-    const input = UpdateListRequestSchema.parse(req.body);
-    const context = await resolveAccessContext(getAuthenticatedUserId(req));
-    const payload = await updateProjectList(context, projectId, listId, input);
-    res.json(ListSummarySchema.parse(payload));
-  } catch (error) {
-    next(error);
-  }
-});
-
-workspaceRoutes.delete("/projects/:projectId/lists/:listId", async (req, res, next) => {
-  try {
-    const projectId = OpaqueIdSchema.parse(req.params.projectId);
-    const listId = OpaqueIdSchema.parse(req.params.listId);
-    const context = await resolveAccessContext(getAuthenticatedUserId(req));
-    const payload = await archiveProjectList(context, projectId, listId);
-    res.json(ArchiveResponseSchema.parse(payload));
-  } catch (error) {
-    next(error);
-  }
-});
-
-workspaceRoutes.get("/projects/:projectId/statuses", async (req, res, next) => {
-  try {
-    const projectId = OpaqueIdSchema.parse(req.params.projectId);
-    const query = CursorQuerySchema.pick({}).extend({
-      listId: OpaqueIdSchema.optional()
-    }).parse(req.query);
-    const context = await resolveAccessContext(getAuthenticatedUserId(req));
-    const payload = await listProjectStatuses(context, projectId, query.listId ? { listId: query.listId } : {});
-    res.json(TaskStatusCollectionSchema.parse(payload));
-  } catch (error) {
-    next(error);
-  }
-});
-
-workspaceRoutes.get("/projects/:projectId/tasks", async (req, res, next) => {
-  try {
-    const projectId = OpaqueIdSchema.parse(req.params.projectId);
-    const query = CursorQuerySchema.extend({
-      listId: OpaqueIdSchema.optional()
-    }).parse(req.query);
-    const context = await resolveAccessContext(getAuthenticatedUserId(req));
-    const payload = await listProjectTasks(context, {
-      projectId,
-      limit: query.limit,
-      ...(query.listId ? { listId: query.listId } : {}),
-      ...(query.cursor ? { cursor: query.cursor } : {})
-    });
-    res.json(TaskPageSchema.parse(payload));
-  } catch (error) {
-    next(error);
-  }
-});
-
-workspaceRoutes.post("/projects/:projectId/tasks", async (req, res, next) => {
-  try {
-    const projectId = OpaqueIdSchema.parse(req.params.projectId);
-    const input = CreateTaskRequestSchema.parse(req.body);
-    const context = await resolveAccessContext(getAuthenticatedUserId(req));
-    const payload = await createTask(context, projectId, input);
-    res.status(201).json(TaskSummarySchema.parse(payload));
-  } catch (error) {
-    next(error);
-  }
-});
-
-workspaceRoutes.get("/projects/:projectId/tasks/:taskId", async (req, res, next) => {
-  try {
-    const projectId = OpaqueIdSchema.parse(req.params.projectId);
-    const taskId = OpaqueIdSchema.parse(req.params.taskId);
-    const context = await resolveAccessContext(getAuthenticatedUserId(req));
-    const payload = await getTaskDetail(context, projectId, taskId);
-    res.json(TaskDetailResponseSchema.parse(payload));
-  } catch (error) {
-    next(error);
-  }
-});
-
-workspaceRoutes.patch("/projects/:projectId/tasks/:taskId", async (req, res, next) => {
-  try {
-    const projectId = OpaqueIdSchema.parse(req.params.projectId);
-    const taskId = OpaqueIdSchema.parse(req.params.taskId);
-    const input = UpdateTaskRequestSchema.parse(req.body);
-    const context = await resolveAccessContext(getAuthenticatedUserId(req));
-    const payload = await updateTask(context, projectId, taskId, input);
-    res.json(TaskDetailResponseSchema.parse(payload));
-  } catch (error) {
-    next(error);
-  }
-});
-
-workspaceRoutes.post("/projects/:projectId/tasks/:taskId/comments", async (req, res, next) => {
-  try {
-    const projectId = OpaqueIdSchema.parse(req.params.projectId);
-    const taskId = OpaqueIdSchema.parse(req.params.taskId);
-    const input = CreateTaskCommentRequestSchema.parse(req.body);
-    const context = await resolveAccessContext(getAuthenticatedUserId(req));
-    const payload = await createTaskComment(context, projectId, taskId, input);
-    res.status(201).json(TaskDetailResponseSchema.parse(payload));
-  } catch (error) {
-    next(error);
-  }
-});
-
