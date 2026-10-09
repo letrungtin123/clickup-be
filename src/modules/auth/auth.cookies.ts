@@ -7,7 +7,8 @@ export const refreshTokenCookieName = "nesso_refresh_token";
 
 const baseCookieOptions = {
   httpOnly: true,
-  sameSite: "lax" as const,
+  // The SPA calls the API same-origin (proxy), so Strict costs nothing and blocks cross-site sends.
+  sameSite: "strict" as const,
   secure: authCookieSecure,
   path: "/"
 };
