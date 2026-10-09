@@ -456,3 +456,18 @@ export const DirectoryQuerySchema = z.object({
   limit: z.coerce.number().int().min(1).max(50).default(20)
 });
 export const DirectoryCollectionSchema = z.object({ items: z.array(UserRefSchema) });
+
+/** "My tasks": tasks assigned to the caller across every project they can still see. */
+export const MyTasksQuerySchema = z.object({
+  due: z.enum(["overdue", "none"]).optional(),
+  dueFrom: IsoDate.optional(),
+  dueTo: IsoDate.optional(),
+  includeDone: z
+    .enum(["true", "false"])
+    .default("false")
+    .transform((value) => value === "true"),
+  sort: z.enum(["dueAt", "updatedAt", "priority"]).default("dueAt"),
+  cursor: z.string().max(500).optional(),
+  limit: z.coerce.number().int().min(1).max(100).default(50)
+});
+export type MyTasksQuery = z.infer<typeof MyTasksQuerySchema>;

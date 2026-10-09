@@ -1,12 +1,12 @@
 import type postgres from "postgres";
 
 import { Permission } from "../../contracts/permissions.js";
-import type { TaskPage, TaskQuery, TaskSort } from "../../contracts/work.js";
+import type { MyTasksQuery, TaskPage, TaskQuery, TaskSort } from "../../contracts/work.js";
 import { getSql } from "../../db/client.js";
 import { AppError } from "../../lib/app-error.js";
 import { decodeCursor, encodeCursor, escapeLike, toPrefixTsQuery, type QuerySql } from "../../lib/db-types.js";
 import type { AccessContext } from "../access/access-context.js";
-import { assertPermission, assertProjectAccess } from "../access/resource-access.js";
+import { assertPermission, assertProjectAccess, hasPermission, visibleProjectsPredicate } from "../access/resource-access.js";
 import { assertListInProject } from "./projects.service.js";
 import { selectTaskSummaries } from "./tasks.repo.js";
 
@@ -144,6 +144,53 @@ export const listTasks = async (context: AccessContext, projectId: string, query
         hasMore && last
           ? encodeCursor([query.sort === "priority" || query.sort === "number" ? Number(last.sort_value) : last.sort_value, last.id])
           : null
+    }
+  };
+};
+
+/** Tasks assigned to the caller in projects they can still see (membership may have changed since assignment). */
+export const listMyTasks = async (context: AccessContext, query: MyTasksQuery): Promise<TaskPage> => {
+  assertPermission(context, Permission.TaskView);
+  if (!hasPermission(context, Permission.ProjectView)) {
+    return { items: [], pageInfo: { hasMore: false, nextCursor: null } };
+  }
+  const sql = getSql();
+  const sort = sorts[query.sort];
+  const cursor = decodeCursor(query.cursor, 2);
+  if (query.cursor && !cursor) {
+    throw new AppError("INVALID_CURSOR", "The pagination cursor is invalid.", 400);
+  }
+  const direction = query.sort === "dueAt" ? sql`ASC` : sql`DESC`;
+  const comparison = query.sort === "dueAt" ? sql`>` : sql`<`;
+
+  const rows = await sql<{ id: string; sort_value: string }[]>`
+    SELECT t.id, (${sort.expr(sql)})::text AS sort_value
+    FROM public.task_assignees ta
+    JOIN public.tasks t ON t.id = ta.task_id AND t.organization_id = ta.organization_id
+    JOIN public.projects p ON p.id = t.project_id AND p.organization_id = t.organization_id
+      AND p.deleted_at IS NULL AND p.archived_at IS NULL
+    JOIN public.task_statuses ts ON ts.id = t.status_id AND ts.organization_id = t.organization_id
+    WHERE ta.organization_id = ${context.organization.id}
+      AND ta.assignee_user_id = ${context.user.id}
+      AND ta.removed_at IS NULL
+      AND t.deleted_at IS NULL AND t.archived_at IS NULL
+      AND ${visibleProjectsPredicate(sql, context)}
+      AND (${query.includeDone} OR ts.category = 'active')
+      AND ${query.due === "overdue" ? sql`t.due_at < now() AND t.completed_at IS NULL` : query.due === "none" ? sql`t.due_at IS NULL` : sql`TRUE`}
+      AND (${query.dueFrom ?? null}::timestamptz IS NULL OR t.due_at >= ${query.dueFrom ?? null}::timestamptz)
+      AND (${query.dueTo ?? null}::timestamptz IS NULL OR t.due_at < ${query.dueTo ?? null}::timestamptz)
+      ${cursor ? sql`AND (${sort.expr(sql)}, t.id) ${comparison} (${sort.cast(sql, cursor[0] ?? null)}, ${String(cursor[1])}::uuid)` : sql``}
+    ORDER BY ${sort.expr(sql)} ${direction}, t.id ${direction}
+    LIMIT ${query.limit + 1}
+  `;
+  const page = rows.slice(0, query.limit);
+  const last = page[page.length - 1];
+  const hasMore = rows.length > query.limit;
+  return {
+    items: await selectTaskSummaries(sql, context, page.map((row) => row.id)),
+    pageInfo: {
+      hasMore,
+      nextCursor: hasMore && last ? encodeCursor([query.sort === "priority" ? Number(last.sort_value) : last.sort_value, last.id]) : null
     }
   };
 };

@@ -17,6 +17,7 @@ import {
   DirectoryQuerySchema,
   ListSchema,
   MoveTaskRequestSchema,
+  MyTasksQuerySchema,
   ProjectCollectionSchema,
   ProjectMemberCollectionSchema,
   ProjectMemberSchema,
@@ -42,7 +43,7 @@ import { createAttachmentUrls, completeTaskUpload, createTaskUpload, deleteAttac
 import { searchDirectory } from "./directory.service.js";
 import { handle, IdParam, param } from "./http.js";
 import { getWorkflow, replaceWorkflow } from "./statuses.service.js";
-import { listTasks } from "./tasks.query.js";
+import { listMyTasks, listTasks } from "./tasks.query.js";
 import { createTask, deleteTask, getTaskDetail, lookupTaskByKey, moveTask, updateTask } from "./tasks.service.js";
 import { createComment, deleteComment, getTimeline, listReplies, updateComment } from "./timeline.service.js";
 import {
@@ -157,6 +158,7 @@ export const createWorkRoutes = (): ExpressRouter => {
       201
     )
   );
+  routes.get("/tasks/mine", handle(async (context, req) => TaskPageSchema.parse(await listMyTasks(context, MyTasksQuerySchema.parse(req.query)))));
   routes.get(
     "/tasks/by-key/:key",
     handle(async (context, req) => TaskKeyLookupSchema.parse(await lookupTaskByKey(context, z.string().max(40).parse(req.params.key))))
