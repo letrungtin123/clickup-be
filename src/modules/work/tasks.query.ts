@@ -7,9 +7,8 @@ import { AppError } from "../../lib/app-error.js";
 import { decodeCursor, encodeCursor, escapeLike, toPrefixTsQuery, type QuerySql } from "../../lib/db-types.js";
 import type { AccessContext } from "../access/access-context.js";
 import { assertPermission, assertProjectAccess } from "../access/resource-access.js";
-import { toTaskSummary, type TaskRow } from "./mappers.js";
 import { assertListInProject } from "./projects.service.js";
-import { taskColumnsSql, taskFromSql } from "./tasks.repo.js";
+import { selectTaskSummaries } from "./tasks.repo.js";
 
 type SortSpec = {
   expr: (sql: QuerySql) => postgres.PendingQuery<postgres.Row[]>;
@@ -23,7 +22,7 @@ const sorts: Record<TaskSort, SortSpec> = {
     cast: (sql, value) => sql`${String(value)}::timestamptz`
   },
   priority: {
-    expr: (sql) => sql`(CASE t.priority WHEN 'urgent' THEN 4 WHEN 'high' THEN 3 WHEN 'normal' THEN 2 ELSE 1 END)`,
+    expr: (sql) => sql`public.task_priority_rank(t.priority)`,
     cast: (sql, value) => sql`${Number(value)}::int`
   },
   createdAt: { expr: (sql) => sql`t.created_at`, cast: (sql, value) => sql`${String(value)}::timestamptz` },
@@ -123,9 +122,11 @@ export const listTasks = async (context: AccessContext, projectId: string, query
     where = sql`${where} AND (${sort.expr(sql)}, t.id) ${comparison} (${sort.cast(sql, cursor[0] ?? null)}, ${String(cursor[1])}::uuid)`;
   }
 
-  const rows = await sql<(TaskRow & { sort_value: string })[]>`
-    SELECT ${taskColumnsSql(sql)}, (${sort.expr(sql)})::text AS sort_value
-    FROM ${taskFromSql(sql)}
+  // Phase 1: narrow, index-friendly id selection. Phase 2: enrich only the page (assignees, counts).
+  const rows = await sql<{ id: string; sort_value: string }[]>`
+    SELECT t.id, (${sort.expr(sql)})::text AS sort_value
+    FROM public.tasks t
+    JOIN public.task_statuses ts ON ts.id = t.status_id AND ts.organization_id = t.organization_id
     WHERE ${where}
     ORDER BY ${sort.expr(sql)} ${direction}, t.id ${direction}
     LIMIT ${query.limit + 1}
@@ -134,8 +135,9 @@ export const listTasks = async (context: AccessContext, projectId: string, query
   const pageRows = rows.slice(0, query.limit);
   const last = pageRows[pageRows.length - 1];
   const hasMore = rows.length > query.limit;
+  const summaries = await selectTaskSummaries(sql, context, pageRows.map((row) => row.id));
   return {
-    items: pageRows.map(toTaskSummary),
+    items: summaries,
     pageInfo: {
       hasMore,
       nextCursor:

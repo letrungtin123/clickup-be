@@ -33,6 +33,33 @@ export const globalSearch = async (context: AccessContext, query: GlobalSearchQu
     if (!groups.has("tasks") || !canSeeProjects || !hasPermission(context, Permission.TaskView)) {
       return [];
     }
+    // Phase 1: rank matching ids on narrow rows; phase 2 enriches only the hits.
+    const hits = await sql<{ id: string }[]>`
+      SELECT t.id
+      FROM public.tasks t
+      JOIN public.projects p ON p.id = t.project_id AND p.organization_id = t.organization_id AND p.deleted_at IS NULL AND p.archived_at IS NULL
+      WHERE t.organization_id = ${context.organization.id}
+        AND t.deleted_at IS NULL AND t.archived_at IS NULL
+        AND EXISTS (
+          SELECT 1 FROM public.lists l
+          WHERE l.id = t.list_id AND l.organization_id = t.organization_id AND l.deleted_at IS NULL AND l.archived_at IS NULL
+        )
+        AND ${visibleProjectsPredicate(sql, context)}
+        AND (
+          ${keyMatch ? sql`(upper(p.key) = ${keyMatch[1]!.toUpperCase()} AND t.number = ${Number(keyMatch[2])})` : sql`FALSE`}
+          OR ${tsQuery ? sql`t.search_vector @@ to_tsquery('simple', ${tsQuery})` : sql`FALSE`}
+          OR public.immutable_unaccent(lower(t.title)) LIKE public.immutable_unaccent(${like})
+        )
+      ORDER BY
+        ${keyMatch ? sql`(upper(p.key) = ${keyMatch[1]!.toUpperCase()} AND t.number = ${Number(keyMatch[2])}) DESC,` : sql``}
+        ${tsQuery ? sql`ts_rank(t.search_vector, to_tsquery('simple', ${tsQuery})) DESC,` : sql``}
+        (t.completed_at IS NULL) DESC, t.updated_at DESC, t.id
+      LIMIT ${limit}
+    `;
+    if (hits.length === 0) {
+      return [];
+    }
+    const order = new Map(hits.map((hit, index) => [hit.id, index]));
     const rows = await sql<{
       id: string;
       task_key: string;
@@ -51,23 +78,12 @@ export const globalSearch = async (context: AccessContext, query: GlobalSearchQu
       SELECT t.id, p.key || '-' || t.number AS task_key, t.title, t.project_id, p.name AS project_name, t.list_id, l.name AS list_name,
         ts.id AS status_id, ts.name AS status_name, ts.color AS status_color, ts.category AS status_category, t.completed_at, t.updated_at
       FROM public.tasks t
-      JOIN public.projects p ON p.id = t.project_id AND p.organization_id = t.organization_id AND p.deleted_at IS NULL AND p.archived_at IS NULL
-      JOIN public.lists l ON l.id = t.list_id AND l.organization_id = t.organization_id AND l.deleted_at IS NULL AND l.archived_at IS NULL
+      JOIN public.projects p ON p.id = t.project_id AND p.organization_id = t.organization_id
+      JOIN public.lists l ON l.id = t.list_id AND l.organization_id = t.organization_id
       JOIN public.task_statuses ts ON ts.id = t.status_id AND ts.organization_id = t.organization_id
-      WHERE t.organization_id = ${context.organization.id}
-        AND t.deleted_at IS NULL AND t.archived_at IS NULL
-        AND ${visibleProjectsPredicate(sql, context)}
-        AND (
-          ${keyMatch ? sql`(upper(p.key) = ${keyMatch[1]!.toUpperCase()} AND t.number = ${Number(keyMatch[2])})` : sql`FALSE`}
-          OR ${tsQuery ? sql`t.search_vector @@ to_tsquery('simple', ${tsQuery})` : sql`FALSE`}
-          OR public.immutable_unaccent(lower(t.title)) LIKE public.immutable_unaccent(${like})
-        )
-      ORDER BY
-        ${keyMatch ? sql`(upper(p.key) = ${keyMatch[1]!.toUpperCase()} AND t.number = ${Number(keyMatch[2])}) DESC,` : sql``}
-        ${tsQuery ? sql`ts_rank(t.search_vector, to_tsquery('simple', ${tsQuery})) DESC,` : sql``}
-        (t.completed_at IS NULL) DESC, t.updated_at DESC, t.id
-      LIMIT ${limit}
+      WHERE t.organization_id = ${context.organization.id} AND t.id = ANY(${hits.map((hit) => hit.id)}::uuid[])
     `;
+    rows.sort((a, b) => (order.get(a.id) ?? 0) - (order.get(b.id) ?? 0));
     return rows.map((row) => ({
       id: row.id,
       key: row.task_key,
