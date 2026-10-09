@@ -9,6 +9,10 @@ const HealthResponseSchema = z.object({
   status: z.literal("ok")
 });
 
+const CsrfResponseSchema = z.object({
+  csrfToken: z.string().min(32)
+});
+
 const ApiErrorResponseSchema = z.object({
   error: z.object({
     code: z.string(),
@@ -65,15 +69,48 @@ describe("api app", () => {
     ["patch", "/api/v1/projects/00000000-0000-4000-8000-000000000001/tasks/00000000-0000-4000-8000-000000000002"],
     ["post", "/api/v1/projects/00000000-0000-4000-8000-000000000001/tasks/00000000-0000-4000-8000-000000000002/comments"]
   ])("requires authentication for %s %s", async (method, path) => {
-    const response = await request(app)[method as "get"](path).expect(401);
+    const agent = request.agent(app);
+    const csrf = await agent.get("/api/v1/auth/csrf").expect(200);
+    const token = CsrfResponseSchema.parse(csrf.body).csrfToken;
+    const response = await agent[method as "get"](path).set("x-csrf-token", token).expect(401);
     const body = ApiErrorResponseSchema.parse(response.body);
 
     expect(body.error.code).toBe("AUTH_REQUIRED");
   });
 
-  it("validates login payload before contacting auth provider", async () => {
+  it("rejects unsafe requests without a CSRF token", async () => {
+    const response = await request(app).post("/api/v1/projects").send({}).expect(403);
+    const body = ApiErrorResponseSchema.parse(response.body);
+
+    expect(body.error.code).toBe("CSRF_INVALID");
+  });
+
+  it("rejects a CSRF token that does not match the cookie", async () => {
+    const agent = request.agent(app);
+    await agent.get("/api/v1/auth/csrf").expect(200);
+    const response = await agent.post("/api/v1/projects").set("x-csrf-token", "x".repeat(43)).send({}).expect(403);
+    const body = ApiErrorResponseSchema.parse(response.body);
+
+    expect(body.error.code).toBe("CSRF_INVALID");
+  });
+
+  it("rejects a forged access token", async () => {
     const response = await request(app)
+      .get("/api/v1/auth/me")
+      .set("authorization", "Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDEiLCJyb2xlIjoiYXV0aGVudGljYXRlZCJ9.invalid")
+      .expect(401);
+    const body = ApiErrorResponseSchema.parse(response.body);
+
+    expect(body.error.code).toBe("AUTH_INVALID");
+  });
+
+  it("validates login payload before contacting auth provider", async () => {
+    const agent = request.agent(app);
+    const csrf = await agent.get("/api/v1/auth/csrf").expect(200);
+    const token = CsrfResponseSchema.parse(csrf.body).csrfToken;
+    const response = await agent
       .post("/api/v1/auth/login")
+      .set("x-csrf-token", token)
       .send({ email: "not-an-email", password: "" })
       .expect(400);
     const body = ApiErrorResponseSchema.parse(response.body);

@@ -1,17 +1,15 @@
 import type { NextFunction, Request, Response } from "express";
 
-import type { AuthUser } from "../contracts/schemas.js";
-import type { PermissionKey } from "../contracts/permissions.js";
 import { AppError } from "../lib/app-error.js";
 import { readCookie } from "../lib/cookies.js";
 import { accessTokenCookieName } from "../modules/auth/auth.cookies.js";
-import { verifyAccessToken } from "../modules/auth/supabase-auth.service.js";
+import { verifyAccessToken, type VerifiedSession } from "../modules/auth/supabase-auth.service.js";
 
 export type AuthenticatedRequest = Request & {
-  auth: AuthUser;
+  auth: VerifiedSession;
 };
 
-export const getAccessTokenFromRequest = (req: Request) => {
+export const getAccessTokenFromRequest = (req: Pick<Request, "header">) => {
   const authorization = req.header("authorization");
   if (authorization?.startsWith("Bearer ")) {
     return authorization.slice("Bearer ".length).trim();
@@ -20,6 +18,10 @@ export const getAccessTokenFromRequest = (req: Request) => {
   return readCookie(req, accessTokenCookieName);
 };
 
+/**
+ * Authenticates the request. Authorization (RBAC + resource membership) is resolved separately
+ * from the database-backed access context, never from token claims.
+ */
 export const requireSupabaseUser = async (req: Request, _res: Response, next: NextFunction) => {
   try {
     const accessToken = getAccessTokenFromRequest(req);
@@ -32,23 +34,4 @@ export const requireSupabaseUser = async (req: Request, _res: Response, next: Ne
   } catch (error) {
     next(error);
   }
-};
-
-export const requirePermission = (permission: PermissionKey) => {
-  return (req: Request, _res: Response, next: NextFunction) => {
-    try {
-      const auth = (req as Partial<AuthenticatedRequest>).auth;
-      if (!auth) {
-        throw new AppError("AUTH_REQUIRED", "Authentication is required.", 401);
-      }
-
-      if (!auth.permissions.includes(permission)) {
-        throw new AppError("FORBIDDEN", "You do not have permission to perform this action.", 403);
-      }
-
-      next();
-    } catch (error) {
-      next(error);
-    }
-  };
 };

@@ -1,3 +1,4 @@
+import { jwtVerify } from "jose";
 import { z } from "zod";
 
 import { env } from "../../config/env.js";
@@ -5,6 +6,7 @@ import type { AuthUser } from "../../contracts/schemas.js";
 import { permissionValues } from "../../contracts/permissions.js";
 import type { PermissionKey } from "../../contracts/permissions.js";
 import { AppError } from "../../lib/app-error.js";
+import { getOptionalRedis } from "../../lib/redis.js";
 
 const MetadataSchema = z.record(z.string(), z.unknown()).default({});
 
@@ -68,7 +70,9 @@ const supabaseJson = async <Result>(
     throw new AppError("AUTH_PROVIDER_ERROR", "Authentication provider is unavailable.", 503);
   }
 
-  return parse(await response.json());
+  // GoTrue answers some endpoints (e.g. /logout) with 204 No Content.
+  const text = await response.text();
+  return parse(text.length > 0 ? JSON.parse(text) : null);
 };
 
 const toPermissionKeys = (value: unknown): PermissionKey[] => {
@@ -138,7 +142,36 @@ export const refreshAuthSession = async (refreshToken: string) => {
   return toAuthSession(result);
 };
 
-export const verifyAccessToken = async (accessToken: string): Promise<AuthUser> => {
+export type VerifiedSession = AuthUser & {
+  sessionId: string | null;
+  /** Token expiry, seconds since epoch. */
+  expiresAt: number;
+};
+
+const jwtSecret = env.SUPABASE_JWT_SECRET ? new TextEncoder().encode(env.SUPABASE_JWT_SECRET) : undefined;
+
+const AccessTokenClaimsSchema = z.object({
+  sub: z.string().uuid(),
+  exp: z.number().int(),
+  role: z.literal("authenticated"),
+  email: z.string().email().nullable().optional(),
+  session_id: z.string().uuid().nullable().optional(),
+  app_metadata: MetadataSchema.optional(),
+  user_metadata: MetadataSchema.optional()
+});
+
+const revokedSessionKey = (sessionId: string) => `auth:revoked:${sessionId}`;
+
+const isSessionRevoked = async (sessionId: string | null) => {
+  const redis = getOptionalRedis();
+  if (!redis || !sessionId) {
+    return false;
+  }
+
+  return (await redis.exists(revokedSessionKey(sessionId))) === 1;
+};
+
+const verifyAccessTokenRemotely = async (accessToken: string): Promise<VerifiedSession> => {
   const user = await supabaseJson(
     "/user",
     {
@@ -150,12 +183,69 @@ export const verifyAccessToken = async (accessToken: string): Promise<AuthUser> 
     (value) => SupabaseUserSchema.parse(value)
   );
 
-  return toAuthUser(user);
+  return { ...toAuthUser(user), sessionId: null, expiresAt: Math.floor(Date.now() / 1000) + 60 };
+};
+
+/**
+ * Verifies a Supabase access token locally (HS256, issuer, audience, expiry) and rejects
+ * sessions revoked at logout. Falls back to asking GoTrue when no JWT secret is configured (dev only).
+ */
+export const verifyAccessToken = async (accessToken: string): Promise<VerifiedSession> => {
+  if (!jwtSecret) {
+    return await verifyAccessTokenRemotely(accessToken);
+  }
+
+  let claims: z.infer<typeof AccessTokenClaimsSchema>;
+  try {
+    const { payload } = await jwtVerify(accessToken, jwtSecret, {
+      algorithms: ["HS256"],
+      audience: "authenticated",
+      ...(env.SUPABASE_JWT_ISSUER ? { issuer: env.SUPABASE_JWT_ISSUER } : {})
+    });
+    claims = AccessTokenClaimsSchema.parse(payload);
+  } catch {
+    throw new AppError("AUTH_INVALID", "Email, password, or session is invalid.", 401);
+  }
+
+  const sessionId = claims.session_id ?? null;
+  if (await isSessionRevoked(sessionId)) {
+    throw new AppError("AUTH_INVALID", "Email, password, or session is invalid.", 401);
+  }
+
+  return {
+    ...toAuthUser({
+      id: claims.sub,
+      email: claims.email ?? null,
+      app_metadata: claims.app_metadata ?? {},
+      user_metadata: claims.user_metadata ?? {}
+    }),
+    sessionId,
+    expiresAt: claims.exp
+  };
+};
+
+/** Marks a session as revoked until its access token would have expired anyway. */
+export const denylistSession = async (session: Pick<VerifiedSession, "sessionId" | "expiresAt">) => {
+  const redis = getOptionalRedis();
+  if (!redis || !session.sessionId) {
+    return;
+  }
+
+  const ttlSeconds = session.expiresAt - Math.floor(Date.now() / 1000);
+  if (ttlSeconds > 0) {
+    await redis.set(revokedSessionKey(session.sessionId), "1", "EX", ttlSeconds);
+  }
 };
 
 export const revokeAuthSession = async (accessToken: string | null) => {
   if (!accessToken) {
     return;
+  }
+
+  try {
+    await denylistSession(await verifyAccessToken(accessToken));
+  } catch {
+    // Expired or invalid tokens need no denylist entry.
   }
 
   await supabaseJson(

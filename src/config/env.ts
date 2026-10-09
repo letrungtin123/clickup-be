@@ -17,9 +17,17 @@ const EnvSchema = z
       .transform((value) => value === "true"),
     SUPABASE_URL: z.string().url().default("http://127.0.0.1:56321"),
     SUPABASE_ANON_KEY: z.string().min(1).optional(),
+    SUPABASE_JWT_SECRET: z.string().min(32).optional(),
+    SUPABASE_JWT_ISSUER: z.string().url().optional(),
+    SUPABASE_SERVICE_ROLE_KEY: z.string().min(1).optional(),
+    STORAGE_BUCKET: z.string().min(3).max(63).default("nesso-work-files"),
     AUTH_COOKIE_SECURE: z.enum(["true", "false"]).optional(),
     RATE_LIMIT_WINDOW_MS: z.coerce.number().int().min(1000).default(60_000),
-    RATE_LIMIT_MAX: z.coerce.number().int().min(1).default(300)
+    RATE_LIMIT_MAX: z.coerce.number().int().min(1).default(300),
+    LOGIN_RATE_LIMIT_MAX: z.coerce.number().int().min(1).default(10),
+    REDIS_URL: z.string().url().optional(),
+    RABBITMQ_URL: z.string().url().optional(),
+    ACCESS_CONTEXT_CACHE_TTL_SECONDS: z.coerce.number().int().min(0).max(3600).default(60)
   })
   .superRefine((value, context) => {
     if (value.NODE_ENV === "production") {
@@ -31,12 +39,23 @@ const EnvSchema = z
         });
       }
 
-      if (!value.SUPABASE_ANON_KEY) {
-        context.addIssue({
-          code: "custom",
-          path: ["SUPABASE_ANON_KEY"],
-          message: "SUPABASE_ANON_KEY is required in production"
-        });
+      const requiredInProduction = [
+        "SUPABASE_ANON_KEY",
+        "SUPABASE_JWT_SECRET",
+        "SUPABASE_JWT_ISSUER",
+        "SUPABASE_SERVICE_ROLE_KEY",
+        "REDIS_URL",
+        "RABBITMQ_URL"
+      ] as const;
+
+      for (const key of requiredInProduction) {
+        if (!value[key]) {
+          context.addIssue({
+            code: "custom",
+            path: [key],
+            message: `${key} is required in production`
+          });
+        }
       }
     }
   });

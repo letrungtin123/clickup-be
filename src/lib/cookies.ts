@@ -1,7 +1,10 @@
 import type { Request } from "express";
 
-export const readCookie = (req: Request, name: string) => {
-  const header = req.header("cookie");
+export const readCookie = (req: Pick<Request, "header">, name: string) => {
+  return readCookieFromHeader(req.header("cookie"), name);
+};
+
+export const readCookieFromHeader = (header: string | undefined | null, name: string) => {
   if (!header) {
     return null;
   }

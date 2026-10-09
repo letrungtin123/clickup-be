@@ -12,50 +12,63 @@ import {
   requireSupabaseUser,
   type AuthenticatedRequest
 } from "../../middleware/auth.js";
+import { issueCsrfToken } from "../../middleware/csrf.js";
+import { createLoginRateLimit } from "../../middleware/rate-limit.js";
 import { accessTokenCookieName, clearAuthCookies, refreshTokenCookieName, setAuthCookies } from "./auth.cookies.js";
 import { refreshAuthSession, revokeAuthSession, signInWithPassword } from "./supabase-auth.service.js";
 
-export const authRoutes: ExpressRouter = Router();
+export const createAuthRoutes = (): ExpressRouter => {
+  const authRoutes = Router();
+  const loginRateLimit = createLoginRateLimit();
 
-authRoutes.post("/auth/login", async (req, res, next) => {
-  try {
-    const input = LoginRequestSchema.parse(req.body);
-    const session = await signInWithPassword(input);
+  authRoutes.get("/auth/csrf", (req, res) => {
+    res.setHeader("cache-control", "no-store");
+    res.json({ csrfToken: issueCsrfToken(req, res) });
+  });
 
-    setAuthCookies(res, session.tokens);
-    res.json(AuthSessionSchema.parse({ user: session.user }));
-  } catch (error) {
-    next(error);
-  }
-});
+  authRoutes.post("/auth/login", loginRateLimit, async (req, res, next) => {
+    try {
+      const input = LoginRequestSchema.parse(req.body);
+      const session = await signInWithPassword(input);
 
-authRoutes.post("/auth/refresh", async (req, res, next) => {
-  try {
-    const refreshToken = readCookie(req, refreshTokenCookieName);
-    if (!refreshToken) {
-      throw new AppError("AUTH_REQUIRED", "Authentication is required.", 401);
+      setAuthCookies(res, session.tokens);
+      res.json(AuthSessionSchema.parse({ user: session.user }));
+    } catch (error) {
+      next(error);
     }
+  });
 
-    const session = await refreshAuthSession(refreshToken);
-    setAuthCookies(res, session.tokens);
-    res.json(AuthSessionSchema.parse({ user: session.user }));
-  } catch (error) {
-    next(error);
-  }
-});
+  authRoutes.post("/auth/refresh", async (req, res, next) => {
+    try {
+      const refreshToken = readCookie(req, refreshTokenCookieName);
+      if (!refreshToken) {
+        throw new AppError("AUTH_REQUIRED", "Authentication is required.", 401);
+      }
 
-authRoutes.post("/auth/logout", async (req, res, next) => {
-  try {
-    const accessToken = getAccessTokenFromRequest(req) ?? readCookie(req, accessTokenCookieName);
-    clearAuthCookies(res);
-    await revokeAuthSession(accessToken);
-    res.json(LogoutResponseSchema.parse({ ok: true }));
-  } catch (error) {
-    clearAuthCookies(res);
-    next(error);
-  }
-});
+      const session = await refreshAuthSession(refreshToken);
+      setAuthCookies(res, session.tokens);
+      res.json(AuthSessionSchema.parse({ user: session.user }));
+    } catch (error) {
+      next(error);
+    }
+  });
 
-authRoutes.get("/auth/me", requireSupabaseUser, (req, res) => {
-  res.json(AuthSessionSchema.parse({ user: (req as AuthenticatedRequest).auth }));
-});
+  authRoutes.post("/auth/logout", async (req, res, next) => {
+    try {
+      const accessToken = getAccessTokenFromRequest(req) ?? readCookie(req, accessTokenCookieName);
+      clearAuthCookies(res);
+      await revokeAuthSession(accessToken);
+      res.json(LogoutResponseSchema.parse({ ok: true }));
+    } catch (error) {
+      clearAuthCookies(res);
+      next(error);
+    }
+  });
+
+  authRoutes.get("/auth/me", requireSupabaseUser, (req, res) => {
+    res.setHeader("cache-control", "no-store");
+    res.json(AuthSessionSchema.parse({ user: (req as AuthenticatedRequest).auth }));
+  });
+
+  return authRoutes;
+};
