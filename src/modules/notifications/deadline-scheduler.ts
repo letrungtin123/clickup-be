@@ -1,4 +1,5 @@
 import { getSql } from "../../db/client.js";
+import { withJobLock } from "../../lib/job-lock.js";
 import { logger } from "../../lib/logger.js";
 import { filterProjectViewers } from "./notification-handlers.js";
 import { deliverNotifications } from "./notifications.service.js";
@@ -82,12 +83,8 @@ const scanWindow = async (kind: "task.due_soon" | "task.overdue") => {
 };
 
 export const runDeadlineScan = async () => {
-  const sql = getSql();
-  return await sql.begin(async (tx) => {
-    const lock = await tx<{ locked: boolean }[]>`SELECT pg_try_advisory_xact_lock(hashtextextended('deadline-scan', 0)) AS locked`;
-    if (!lock[0]?.locked) {
-      return 0;
-    }
+  // One instance at a time, without keeping a transaction open while notifications are delivered.
+  const delivered = await withJobLock("deadline-scan", 10 * 60 * 1000, async () => {
     const soon = await scanWindow("task.due_soon");
     const overdue = await scanWindow("task.overdue");
     if (soon + overdue > 0) {
@@ -95,6 +92,7 @@ export const runDeadlineScan = async () => {
     }
     return soon + overdue;
   });
+  return delivered ?? 0;
 };
 
 export const startDeadlineScheduler = () => {
