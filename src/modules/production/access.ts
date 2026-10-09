@@ -41,3 +41,8 @@ export const assertProductionRole = (context: AccessContext, ...roles: Productio
 };
 
 export const assertProductionAdmin = (context: AccessContext) => assertProductionRole(context, "ADMIN");
+
+export const hasAnyProductionRole = (context: AccessContext) => productionRolesOf(context).size > 0;
+
+/** Realtime room of the organization's production module (production roles only). */
+export const productionRoom = (organizationId: string) => ({ type: "production" as const, id: organizationId });

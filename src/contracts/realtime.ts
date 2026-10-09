@@ -15,7 +15,8 @@ import type { NotificationNewEvent, NotificationReadEvent } from "./notification
  * Realtime messages are hints for the client cache; PostgreSQL stays authoritative.
  */
 
-export const RealtimeRoomTypeSchema = z.enum(["project", "channel", "task"]);
+/** "production": the organization's production module (id = organization id; production roles only). */
+export const RealtimeRoomTypeSchema = z.enum(["project", "channel", "task", "production"]);
 export type RealtimeRoomType = z.infer<typeof RealtimeRoomTypeSchema>;
 
 export const RealtimeRoomRefSchema = z.object({
@@ -70,6 +71,15 @@ export type SidebarHintEvent = {
   at: string;
 };
 
+/** Production jobs/tasks changed (cache hint: ids only). */
+export type ProductionChangedEvent = {
+  jobId: string;
+  taskIds: string[];
+  kind: "job" | "tasks" | "feedback" | "comment";
+  actorId: string | null;
+  at: string;
+};
+
 export type ChatTypingEvent = {
   channelId: string;
   threadRootId: string | null;
@@ -84,6 +94,9 @@ export type ServerToClientEvents = {
   "task:timeline": (event: TaskTimelineEvent) => void;
   "project:structure": (event: ProjectStructureEvent) => void;
   "workspace:sidebar": (event: SidebarHintEvent) => void;
+  "production:changed": (event: ProductionChangedEvent) => void;
+  /** Leave calendar changed (cache hint for the production room; refetch /production/leave). */
+  "production:leave": (event: { at: string }) => void;
   "chat:message": (event: ChatMessageEvent) => void;
   "chat:message:updated": (event: ChatMessageUpdatedEvent) => void;
   "chat:message:deleted": (event: ChatMessageDeletedEvent) => void;

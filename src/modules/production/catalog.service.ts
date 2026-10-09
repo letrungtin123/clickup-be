@@ -24,12 +24,15 @@ import { productionRoleCodes } from "../../contracts/production-catalog.js";
 import { getSql } from "../../db/client.js";
 import { AppError } from "../../lib/app-error.js";
 import { toIso, type QuerySql } from "../../lib/db-types.js";
+import { isEmailEnabled } from "../../lib/mailer.js";
 import { invalidateAccessContexts, type AccessContext } from "../access/access-context.js";
+import { scheduleGoogleAuthUserProvisioning } from "../auth/google-auth.service.js";
 import { toColor } from "../work/mappers.js";
 import { assertProductionAdmin, assertProductionMember, assertProductionRole, isProductionAdmin, productionRolesOf } from "./access.js";
-import { importCreditRules, listRuleHistory, listRulesAt, setCreditRule, startNewVersion } from "./credit-rules.js";
+import { deleteCreditRuleVersion, importCreditRules, listRuleHistory, listRulesAt, setCreditRule, startNewVersion } from "./credit-rules.js";
 import { resolveCustomValues, setEntityTags } from "./custom-fields.js";
 import { businessDay, isValidDay } from "./time.js";
+import { systemStatusCodes } from "./workflow.js";
 
 type In<T extends z.ZodTypeAny> = z.infer<T>;
 const org = (context: AccessContext) => context.organization.id;
@@ -159,7 +162,9 @@ const toMember = (row: MemberRow) => ({
   displayName: row.display_name,
   email: row.email,
   avatarUrl: row.avatar_url,
-  roles: (row.roles ?? []).filter((role): role is ProductionRole => (productionRoleCodes as readonly string[]).includes(role)),
+  roles: (row.roles ?? [])
+    .filter((role): role is ProductionRole => (productionRoleCodes as readonly string[]).includes(role))
+    .sort((a, b) => productionRoleCodes.indexOf(a) - productionRoleCodes.indexOf(b)),
   teamId: row.team_id,
   active: row.status === "active",
   customValues: row.custom_values ?? {},
@@ -298,7 +303,8 @@ export const upsertClient = async (context: AccessContext, id: string | null, in
     }
     const customValues = await resolveCustomValues(tx, org(context), "CLIENT", input.customValues, {
       existing: existing?.custom_values ?? {},
-      enforceRequired: true
+      // Required fields are checked on create and whenever values are sent — not on archive/rename.
+      enforceRequired: !id || input.customValues !== undefined
     });
     const clientId = id
       ? (
@@ -510,7 +516,13 @@ export const getWorkflow = async (context: AccessContext) => {
 export const upsertStatus = async (context: AccessContext, id: string | null, input: In<typeof UpsertStatusRequestSchema>) => {
   assertProductionAdmin(context);
   const sql = getSql();
+  const system = new Set<string>(systemStatusCodes);
   if (id) {
+    // The workflow engine relies on the system codes: they may be renamed but not recoded or disabled.
+    const current = (await sql<{ code: string }[]>`SELECT code FROM production.statuses WHERE organization_id = ${org(context)} AND id = ${id}`)[0];
+    if (current && system.has(current.code) && (input.code !== current.code || input.active === false)) {
+      throw new AppError("SYSTEM_STATUS_LOCKED", "Trạng thái hệ thống chỉ được đổi tên, màu và cờ; không đổi mã hoặc tắt.", 409);
+    }
     const rows = await sql`
       UPDATE production.statuses
       SET code = ${input.code}, name = ${input.name}, color = ${input.color}, counts_done = ${input.countsDone},
@@ -692,6 +704,8 @@ export const addAllowedEmails = async (context: AccessContext, text: string) => 
       `
     : [];
   const added = inserted.map((row) => row.email);
+  // PD-012: whitelisted addresses need a GoTrue user before their first Google sign-in (no-op when off).
+  scheduleGoogleAuthUserProvisioning(valid);
   return { added, alreadyAllowed: valid.filter((email) => !added.includes(email)), invalid };
 };
 
@@ -705,7 +719,8 @@ export const getNotificationPreferences = async (context: AccessContext) => {
   const row = (await getSql()<{ notify_web: boolean; notify_email: boolean }[]>`
     SELECT notify_web, notify_email FROM public.app_users WHERE id = ${context.user.id}
   `)[0];
-  return { notifyWeb: row?.notify_web ?? true, notifyEmail: row?.notify_email ?? false };
+  // emailAvailable: the server has SMTP configured (PD-013); until then notifyEmail is stored but nothing is sent.
+  return { notifyWeb: row?.notify_web ?? true, notifyEmail: row?.notify_email ?? false, emailAvailable: isEmailEnabled() };
 };
 
 export const updateNotificationPreferences = async (context: AccessContext, input: { notifyWeb?: boolean | undefined; notifyEmail?: boolean | undefined }) => {
@@ -805,3 +820,22 @@ class ImportRejected extends Error {
     super("Credit import rejected");
   }
 }
+
+export const removeCreditVersion = async (context: AccessContext, ruleId: string) => {
+  assertProductionAdmin(context);
+  const pair = await getSql().begin(async (tx) => await deleteCreditRuleVersion(tx, org(context), ruleId));
+  return await getCreditHistory(context, pair.projectId, pair.processId);
+};
+
+const reorderTables = { processes: "processes", shifts: "shifts", customFields: "custom_fields" } as const;
+
+/** Bulk reorder (sort_order = position in `ids`); ids from other organizations are ignored. */
+export const reorderCatalog = async (context: AccessContext, kind: keyof typeof reorderTables, ids: string[]) => {
+  assertProductionAdmin(context);
+  const sql = getSql();
+  await sql`
+    UPDATE ${sql("production")}.${sql(reorderTables[kind])} AS t SET sort_order = data.position
+    FROM unnest(${ids}::uuid[]) WITH ORDINALITY AS data(id, position)
+    WHERE t.organization_id = ${org(context)} AND t.id = data.id
+  `;
+};

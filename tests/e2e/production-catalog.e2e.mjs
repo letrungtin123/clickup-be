@@ -54,7 +54,7 @@ ok("LEADER cannot change settings (403)", r.status === 403);
 
 // Workflow seed
 r = await b.call("GET", "/production/workflow");
-const codes = r.body.statuses?.map((status) => status.code) ?? [];
+const codes = r.body.statuses?.filter((status) => status.active).map((status) => status.code) ?? [];
 ok("workflow seeded (9 statuses, 10 transitions)", codes.length === 9 && r.body.transitions.length === 10 && codes[0] === "ASSIGNED", codes.join(","));
 const qcReturn = r.body.transitions?.find(
   (t) => t.fromStatusId === r.body.statuses.find((s) => s.code === "WAITING_QC").id && t.toStatusId === r.body.statuses.find((s) => s.code === "PROCESSING").id
@@ -67,7 +67,9 @@ r = await admin.call("POST", "/production/projects", { code, name: `E2E ${code}`
 const project = r.body.items?.find((item) => item.code === code);
 ok("admin creates production project", r.status === 201 && Boolean(project));
 r = await admin.call("POST", "/production/projects", { code: code.toLowerCase(), name: "dup" });
-ok("project code unique case-insensitively (409)", r.status === 409);
+ok("project code unique case-insensitively (409 PROJECT_CODE_TAKEN)", r.status === 409 && r.body.error.code === "PROJECT_CODE_TAKEN", r.body?.error?.code);
+r = await admin.call("PATCH", `/production/projects/${project.id}`, { qcBufferHours: 3 });
+ok("partial PATCH keeps unsent fields", r.status === 200 && r.body.items.find((item) => item.id === project.id)?.qcBufferHours === 3 && r.body.items.find((item) => item.id === project.id)?.code === code);
 r = await b.call("POST", "/production/projects", { code: `${code}X`, name: "nope" });
 ok("STAFF cannot create projects (403)", r.status === 403);
 const processes = (await admin.call("GET", "/production/processes")).body.items;
@@ -118,6 +120,25 @@ r = await admin.call("POST", "/production/credit-rules/versions", { effectiveFro
 ok("new version copies every current rule", r.status === 201 && r.body.created >= 2, JSON.stringify(r.body));
 r = await b.call("POST", "/production/credit-rules/import", { csv: "project_code,process_name,credit\nA,B,1", effectiveFrom: "2026-07-01" });
 ok("STAFF cannot import (403)", r.status === 403);
+{
+  // Delete a mistaken version: the earlier one takes its period back; used prices cannot be deleted.
+  const history = (await admin.call("GET", `/production/credit-rules/history?projectId=${project.id}&processId=${normal.id}`)).body.items;
+  const newest = history[0];
+  r = await admin.call("DELETE", `/production/credit-rules/${newest.id}`);
+  ok("delete an unused price version", r.status === 200 && r.body.items.length === history.length - 1 && r.body.items[0].effectiveTo === newest.effectiveTo, JSON.stringify(r.body?.items?.slice(0, 2) ?? r.body));
+  const used = localSql("SELECT credit_rule_id FROM production.score_entries WHERE credit_rule_id IS NOT NULL LIMIT 1")[0];
+  if (used) {
+    r = await admin.call("DELETE", `/production/credit-rules/${used}`);
+    ok("a price used by scores cannot be deleted", r.status === 409 && r.body.error.code === "CREDIT_RULE_IN_USE");
+  }
+  r = await b.call("DELETE", `/production/credit-rules/${newest.id}`);
+  ok("STAFF cannot delete prices", r.status === 403 || r.status === 404);
+  const order = processes.map((item) => item.id);
+  r = await admin.call("PUT", "/production/processes/order", { ids: [...order].reverse() });
+  const reordered = (await admin.call("GET", "/production/processes")).body.items.filter((item) => item.active).map((item) => item.id);
+  ok("bulk reorder processes", r.status === 200 && reordered[0] === [...order].reverse().find((id) => reordered.includes(id)));
+  await admin.call("PUT", "/production/processes/order", { ids: order });
+}
 
 // Custom fields & clients
 const key = `tier_${Date.now().toString(36)}`;

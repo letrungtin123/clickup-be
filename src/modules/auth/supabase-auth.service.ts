@@ -126,6 +126,23 @@ export const signInWithPassword = async (input: { email: string; password: strin
   return toAuthSession(result);
 };
 
+/** OAuth (PKCE) step 2: trades GoTrue's one-time auth code + our verifier for a session. */
+export const exchangePkceCode = async (input: { authCode: string; codeVerifier: string }) => {
+  const result = await supabaseJson(
+    "/token?grant_type=pkce",
+    {
+      method: "POST",
+      headers: {
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({ auth_code: input.authCode, code_verifier: input.codeVerifier })
+    },
+    (value) => SupabaseTokenResponseSchema.parse(value)
+  );
+
+  return toAuthSession(result);
+};
+
 export const refreshAuthSession = async (refreshToken: string) => {
   const result = await supabaseJson(
     "/token?grant_type=refresh_token",
@@ -257,8 +274,14 @@ export const denylistSession = async (session: Pick<VerifiedSession, "sessionId"
   }
 };
 
-/** Logs a session out everywhere it matters; returns its id so live sockets can be closed. */
-export const revokeAuthSession = async (accessToken: string | null): Promise<string | null> => {
+/**
+ * Logs a session out everywhere it matters; returns its id so live sockets can be closed.
+ * `scope: "local"` ends only this session (GoTrue's default for /logout is every session of the user).
+ */
+export const revokeAuthSession = async (
+  accessToken: string | null,
+  options: { scope?: "local" } = {}
+): Promise<string | null> => {
   if (!accessToken) {
     return null;
   }
@@ -273,7 +296,7 @@ export const revokeAuthSession = async (accessToken: string | null): Promise<str
   }
 
   await supabaseJson(
-    "/logout",
+    options.scope ? `/logout?scope=${options.scope}` : "/logout",
     {
       method: "POST",
       headers: {

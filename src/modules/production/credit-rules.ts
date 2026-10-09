@@ -144,6 +144,35 @@ export const setCreditRule = async (
   return created.id;
 };
 
+/**
+ * Removes one version of a price (e.g. created by mistake) when no score used it yet; the previous
+ * version then extends over its period again. Used prices are history and stay.
+ */
+export const deleteCreditRuleVersion = async (sql: QuerySql, organizationId: string, ruleId: string) => {
+  const rule = (
+    await sql<{ project_id: string; process_id: string; effective_from: string; effective_to: string | null }[]>`
+      SELECT project_id, process_id, to_char(effective_from, 'YYYY-MM-DD') AS effective_from, to_char(effective_to, 'YYYY-MM-DD') AS effective_to
+      FROM production.credit_rules WHERE organization_id = ${organizationId} AND id = ${ruleId}
+    `
+  )[0];
+  if (!rule) {
+    throw new AppError("CREDIT_RULE_NOT_FOUND", "Không tìm thấy phiên bản đơn giá.", 404);
+  }
+  await sql`SELECT pg_advisory_xact_lock(hashtextextended(${`credit:${rule.project_id}:${rule.process_id}`}, 0))`;
+  const used = await sql`SELECT 1 FROM production.score_entries WHERE organization_id = ${organizationId} AND credit_rule_id = ${ruleId} LIMIT 1`;
+  if (used.length > 0) {
+    throw new AppError("CREDIT_RULE_IN_USE", "Đơn giá này đã được dùng để tính điểm nên không xoá được — hãy tạo phiên bản mới.", 409);
+  }
+  await sql`DELETE FROM production.credit_rules WHERE organization_id = ${organizationId} AND id = ${ruleId}`;
+  // The version that ended where this one started takes over its period (deleted first: no overlap).
+  await sql`
+    UPDATE production.credit_rules SET effective_to = ${rule.effective_to}::date
+    WHERE organization_id = ${organizationId} AND project_id = ${rule.project_id} AND process_id = ${rule.process_id}
+      AND effective_to = ${rule.effective_from}::date
+  `;
+  return { projectId: rule.project_id, processId: rule.process_id };
+};
+
 /** "Tạo phiên bản mới từ ngày…": copies every rule effective on that day into a new version starting that day. */
 export const startNewVersion = async (sql: QuerySql, organizationId: string, effectiveFrom: string, userId: string | null) => {
   const current = await listRulesAt(sql, organizationId, effectiveFrom);

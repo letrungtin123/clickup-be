@@ -19,7 +19,21 @@ export const notificationTypes = [
   "project.member_added",
   "chat.mentioned",
   "chat.thread_replied",
-  "channel.member_added"
+  "channel.member_added",
+  // Production (Photo Retouch) module — PLAN §8. Target: productionTaskId / jobId.
+  "production.task_assigned",
+  "production.task_waiting_qc",
+  "production.qc_failed",
+  "production.task_checked",
+  "production.task_due_soon",
+  "production.task_late",
+  "production.qty_changed",
+  "production.feedback",
+  "production.mentioned",
+  "production.commented",
+  "production.leave_requested",
+  "production.leave_decided",
+  "production.kpi_settled"
 ] as const;
 export const NotificationTypeSchema = z.enum(notificationTypes);
 export type NotificationType = z.infer<typeof NotificationTypeSchema>;
@@ -30,7 +44,10 @@ export const NotificationTargetSchema = z.object({
   taskKey: z.string().nullable(),
   commentId: Id.nullable(),
   channelId: Id.nullable(),
-  messageId: Id.nullable()
+  messageId: Id.nullable(),
+  /** Production module targets (production.* types). */
+  productionTaskId: Id.nullable().default(null),
+  jobId: Id.nullable().default(null)
 });
 
 export const NotificationSchema = z.object({

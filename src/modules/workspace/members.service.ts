@@ -2,6 +2,7 @@ import { Permission } from "../../contracts/permissions.js";
 import type { ChangePasswordRequest, CreateOrganizationMemberRequest, WorkspaceContext } from "../../contracts/schemas.js";
 import { getSql } from "../../db/client.js";
 import { AppError } from "../../lib/app-error.js";
+import type { QuerySql } from "../../lib/db-types.js";
 import { logger } from "../../lib/logger.js";
 import { getOptionalRedis } from "../../lib/redis.js";
 import { disconnectUsers } from "../../realtime/publisher.js";
@@ -96,32 +97,75 @@ export const createOrganizationMember = async (context: WorkspaceContext, input:
     userId = await createAuthUser({ email: input.email, password: temporaryPassword, displayName: input.displayName });
   }
 
+  const createdUserId = userId;
   await sql.begin(async (tx) => {
-    await tx`
-      INSERT INTO public.app_users (id, email, display_name, job_title, must_change_password)
-      VALUES (${userId}, ${input.email}, ${input.displayName}, ${input.jobTitle ?? null}, true)
-      ON CONFLICT (id) DO UPDATE
-        SET email = EXCLUDED.email, display_name = EXCLUDED.display_name, job_title = EXCLUDED.job_title,
-            must_change_password = true, deleted_at = NULL
-    `;
-    await tx`
-      INSERT INTO public.organization_memberships (organization_id, user_id, role_id, status, invited_by, joined_at)
-      VALUES (${context.organization.id}, ${userId}, ${input.roleId}, 'active', ${context.user.id}, now())
-    `;
-    await enqueueDomainEvents(tx, [
-      {
-        organizationId: context.organization.id,
-        type: "member.created",
-        aggregateType: "user",
-        aggregateId: userId,
-        actorUserId: context.user.id,
-        payload: { email: input.email, roleId: input.roleId }
-      }
-    ]);
+    await insertOrganizationMemberRecords(tx, {
+      organizationId: context.organization.id,
+      userId: createdUserId,
+      email: input.email,
+      displayName: input.displayName,
+      jobTitle: input.jobTitle ?? null,
+      roleId: input.roleId,
+      mustChangePassword: true,
+      profile: "overwrite",
+      invitedBy: context.user.id,
+      actorUserId: context.user.id
+    });
   });
 
   await invalidateAccessContexts();
   return { member: await findMemberById(context, userId), temporaryPassword };
+};
+
+/**
+ * Writes the app profile, an active organization membership and the `member.created` event, inside
+ * the caller's transaction. Shared by admin-created accounts and Google-provisioned ones (PD-012);
+ * callers have already decided the role. `profile: "keep"` leaves an existing profile untouched.
+ */
+export const insertOrganizationMemberRecords = async (
+  tx: QuerySql,
+  input: {
+    organizationId: string;
+    userId: string;
+    email: string;
+    displayName: string;
+    jobTitle: string | null;
+    roleId: string;
+    mustChangePassword: boolean;
+    profile: "overwrite" | "keep";
+    invitedBy: string | null;
+    actorUserId: string | null;
+  }
+) => {
+  if (input.profile === "overwrite") {
+    await tx`
+      INSERT INTO public.app_users (id, email, display_name, job_title, must_change_password)
+      VALUES (${input.userId}, ${input.email}, ${input.displayName}, ${input.jobTitle}, ${input.mustChangePassword})
+      ON CONFLICT (id) DO UPDATE
+        SET email = EXCLUDED.email, display_name = EXCLUDED.display_name, job_title = EXCLUDED.job_title,
+            must_change_password = EXCLUDED.must_change_password, deleted_at = NULL
+    `;
+  } else {
+    await tx`
+      INSERT INTO public.app_users (id, email, display_name, job_title, must_change_password)
+      VALUES (${input.userId}, ${input.email}, ${input.displayName}, ${input.jobTitle}, ${input.mustChangePassword})
+      ON CONFLICT (id) DO NOTHING
+    `;
+  }
+  await tx`
+    INSERT INTO public.organization_memberships (organization_id, user_id, role_id, status, invited_by, joined_at)
+    VALUES (${input.organizationId}, ${input.userId}, ${input.roleId}, 'active', ${input.invitedBy}, now())
+  `;
+  await enqueueDomainEvents(tx, [
+    {
+      organizationId: input.organizationId,
+      type: "member.created",
+      aggregateType: "user",
+      aggregateId: input.userId,
+      actorUserId: input.actorUserId,
+      payload: { email: input.email, roleId: input.roleId }
+    }
+  ]);
 };
 
 export const resetMemberPassword = async (context: WorkspaceContext, membershipId: string) => {

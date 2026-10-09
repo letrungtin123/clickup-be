@@ -10,6 +10,7 @@ import {
   CreditImportResultSchema,
   CreditMatrixSchema,
   CreditRuleHistorySchema,
+  CreditVersionResultSchema,
   CustomFieldCollectionSchema,
   CustomFieldEntitySchema,
   NewCreditVersionRequestSchema,
@@ -20,6 +21,7 @@ import {
   ProductionMemberSchema,
   ProductionProjectCollectionSchema,
   ProductionSettingsSchema,
+  ReorderCatalogRequestSchema,
   ReorderStatusesRequestSchema,
   ReplaceTransitionsRequestSchema,
   SetCreditRuleRequestSchema,
@@ -39,6 +41,7 @@ import {
   UpsertTagRequestSchema,
   UpsertTeamRequestSchema
 } from "../../contracts/production-catalog.js";
+import { AppError } from "../../lib/app-error.js";
 import { requireSupabaseUser } from "../../middleware/auth.js";
 import { handle, param } from "../work/http.js";
 import {
@@ -61,6 +64,8 @@ import {
   listTags,
   listTeams,
   putCreditRule,
+  removeCreditVersion,
+  reorderCatalog,
   removeAllowedEmail,
   reorderStatuses,
   replaceTransitions,
@@ -80,6 +85,31 @@ import {
 const DayQuery = z.object({ at: z.string().optional() });
 const HistoryQuery = z.object({ projectId: z.string().uuid(), processId: z.string().uuid() });
 const FieldQuery = z.object({ entity: CustomFieldEntitySchema.optional() });
+/**
+ * PATCH is a partial update: fields absent from the body keep their current values (read from the
+ * current record), so archiving or renaming never needs the whole object. `keepUnsent` fields are not
+ * copied (e.g. custom values, so required-field checks only run when values are actually sent).
+ */
+const patchBody = <S extends z.ZodObject>(schema: S, current: object | undefined, body: unknown, keepUnsent: string[] = []): z.infer<S> => {
+  if (!current) {
+    throw new AppError("NOT_FOUND", "Không tìm thấy.", 404);
+  }
+  const sent = new Set(body && typeof body === "object" ? Object.keys(body) : []);
+  const patch = schema.partial().parse(body ?? {}) as Record<string, unknown>;
+  const merged: Record<string, unknown> = {};
+  for (const key of Object.keys(schema.shape)) {
+    const value = (current as Record<string, unknown>)[key];
+    if (!keepUnsent.includes(key) && value !== undefined) {
+      merged[key] = value;
+    }
+  }
+  for (const key of sent) {
+    merged[key] = patch[key];
+  }
+  return schema.parse(merged);
+};
+const byId = <T extends { id: string }>(items: T[], id: string) => items.find((item) => item.id === id);
+
 const EmailParam = z.string().trim().toLowerCase().email().max(254);
 
 /**
@@ -111,7 +141,9 @@ export const createProductionRoutes = (): ExpressRouter => {
   routes.patch(
     "/production/teams/:teamId",
     handle(async (context, req) =>
-      TeamCollectionSchema.parse(await upsertTeam(context, param(req, "teamId"), UpsertTeamRequestSchema.parse(req.body)))
+      TeamCollectionSchema.parse(
+        await upsertTeam(context, param(req, "teamId"), patchBody(UpsertTeamRequestSchema, byId((await listTeams(context)).items, param(req, "teamId")), req.body))
+      )
     )
   );
 
@@ -124,7 +156,13 @@ export const createProductionRoutes = (): ExpressRouter => {
   routes.patch(
     "/production/clients/:clientId",
     handle(async (context, req) =>
-      ClientCollectionSchema.parse(await upsertClient(context, param(req, "clientId"), UpsertClientRequestSchema.parse(req.body)))
+      ClientCollectionSchema.parse(
+        await upsertClient(
+          context,
+          param(req, "clientId"),
+          patchBody(UpsertClientRequestSchema, byId((await listClients(context)).items, param(req, "clientId")), req.body, ["customValues", "tagIds"])
+        )
+      )
     )
   );
 
@@ -142,7 +180,11 @@ export const createProductionRoutes = (): ExpressRouter => {
     "/production/projects/:projectId",
     handle(async (context, req) =>
       ProductionProjectCollectionSchema.parse(
-        await upsertProject(context, param(req, "projectId"), UpsertProductionProjectRequestSchema.parse(req.body))
+        await upsertProject(
+          context,
+          param(req, "projectId"),
+          patchBody(UpsertProductionProjectRequestSchema, byId((await listProjects(context)).items, param(req, "projectId")), req.body)
+        )
       )
     )
   );
@@ -156,7 +198,9 @@ export const createProductionRoutes = (): ExpressRouter => {
   routes.patch(
     "/production/processes/:processId",
     handle(async (context, req) =>
-      ProcessCollectionSchema.parse(await upsertProcess(context, param(req, "processId"), UpsertProcessRequestSchema.parse(req.body)))
+      ProcessCollectionSchema.parse(
+        await upsertProcess(context, param(req, "processId"), patchBody(UpsertProcessRequestSchema, byId((await listProcesses(context)).items, param(req, "processId")), req.body))
+      )
     )
   );
   routes.get("/production/shifts", handle(async (context) => ShiftCollectionSchema.parse(await listShifts(context))));
@@ -167,9 +211,25 @@ export const createProductionRoutes = (): ExpressRouter => {
   routes.patch(
     "/production/shifts/:shiftId",
     handle(async (context, req) =>
-      ShiftCollectionSchema.parse(await upsertShift(context, param(req, "shiftId"), UpsertShiftRequestSchema.parse(req.body)))
+      ShiftCollectionSchema.parse(
+        await upsertShift(context, param(req, "shiftId"), patchBody(UpsertShiftRequestSchema, byId((await listShifts(context)).items, param(req, "shiftId")), req.body))
+      )
     )
   );
+
+  for (const [segment, kind] of [
+    ["processes", "processes"],
+    ["shifts", "shifts"],
+    ["custom-fields", "customFields"]
+  ] as const) {
+    routes.put(
+      `/production/${segment}/order`,
+      handle(async (context, req) => {
+        await reorderCatalog(context, kind, ReorderCatalogRequestSchema.parse(req.body).ids);
+        return { ok: true as const };
+      })
+    );
+  }
 
   // Credit rules
   routes.get(
@@ -189,7 +249,11 @@ export const createProductionRoutes = (): ExpressRouter => {
   );
   routes.post(
     "/production/credit-rules/versions",
-    handle(async (context, req) => await createCreditVersion(context, NewCreditVersionRequestSchema.parse(req.body).effectiveFrom), 201)
+    handle(async (context, req) => CreditVersionResultSchema.parse(await createCreditVersion(context, NewCreditVersionRequestSchema.parse(req.body).effectiveFrom)), 201)
+  );
+  routes.delete(
+    "/production/credit-rules/:ruleId",
+    handle(async (context, req) => CreditRuleHistorySchema.parse(await removeCreditVersion(context, param(req, "ruleId"))))
   );
   routes.post(
     "/production/credit-rules/import",
@@ -205,7 +269,9 @@ export const createProductionRoutes = (): ExpressRouter => {
   routes.patch(
     "/production/statuses/:statusId",
     handle(async (context, req) =>
-      StatusWorkflowSchema.parse(await upsertStatus(context, param(req, "statusId"), UpsertStatusRequestSchema.parse(req.body)))
+      StatusWorkflowSchema.parse(
+        await upsertStatus(context, param(req, "statusId"), patchBody(UpsertStatusRequestSchema, byId((await getWorkflow(context)).statuses, param(req, "statusId")), req.body))
+      )
     )
   );
   routes.put(
@@ -234,7 +300,13 @@ export const createProductionRoutes = (): ExpressRouter => {
   routes.patch(
     "/production/custom-fields/:fieldId",
     handle(async (context, req) =>
-      CustomFieldCollectionSchema.parse(await upsertCustomField(context, param(req, "fieldId"), UpsertCustomFieldRequestSchema.parse(req.body)))
+      CustomFieldCollectionSchema.parse(
+        await upsertCustomField(
+          context,
+          param(req, "fieldId"),
+          patchBody(UpsertCustomFieldRequestSchema, byId((await listCustomFields(context, null)).items, param(req, "fieldId")), req.body)
+        )
+      )
     )
   );
   routes.get("/production/tags", handle(async (context) => TagCollectionSchema.parse(await listTags(context))));
@@ -244,7 +316,9 @@ export const createProductionRoutes = (): ExpressRouter => {
   );
   routes.patch(
     "/production/tags/:tagId",
-    handle(async (context, req) => TagCollectionSchema.parse(await upsertTag(context, param(req, "tagId"), UpsertTagRequestSchema.parse(req.body))))
+    handle(async (context, req) =>
+      TagCollectionSchema.parse(await upsertTag(context, param(req, "tagId"), patchBody(UpsertTagRequestSchema, byId((await listTags(context)).items, param(req, "tagId")), req.body)))
+    )
   );
 
   // Settings & whitelist

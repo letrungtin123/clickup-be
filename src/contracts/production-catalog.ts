@@ -180,6 +180,10 @@ export const SetCreditRuleRequestSchema = z
   .strict();
 
 export const NewCreditVersionRequestSchema = z.object({ effectiveFrom: DateOnly }).strict();
+export const CreditVersionResultSchema = z.object({ created: z.number().int() });
+
+/** Bulk reorder of processes, shifts or custom fields (ids in the new order). */
+export const ReorderCatalogRequestSchema = z.object({ ids: z.array(Id).min(1).max(500) }).strict();
 
 export const CreditImportRequestSchema = z
   .object({
@@ -341,5 +345,10 @@ export const AddAllowedEmailsResultSchema = z.object({
   invalid: z.array(z.string())
 });
 
-export const NotificationPreferencesSchema = z.object({ notifyWeb: z.boolean(), notifyEmail: z.boolean() });
-export const UpdateNotificationPreferencesRequestSchema = NotificationPreferencesSchema.partial().strict();
+export const NotificationPreferencesSchema = z.object({
+  notifyWeb: z.boolean(),
+  notifyEmail: z.boolean(),
+  /** Read-only: the server has SMTP configured (PD-013). Until then notifyEmail is saved but no e-mail is sent. */
+  emailAvailable: z.boolean()
+});
+export const UpdateNotificationPreferencesRequestSchema = NotificationPreferencesSchema.omit({ emailAvailable: true }).partial().strict();

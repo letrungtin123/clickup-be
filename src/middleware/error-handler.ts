@@ -2,6 +2,7 @@ import type { ErrorRequestHandler } from "express";
 import { ZodError } from "zod";
 
 import { AppError } from "../lib/app-error.js";
+import { uniqueViolationFor } from "../lib/db-errors.js";
 import { logger } from "../lib/logger.js";
 
 /** PostgreSQL integrity errors that reach the API map to safe, generic client errors (never raw DB text). */
@@ -51,6 +52,11 @@ export const errorHandler: ErrorRequestHandler = (error, req, res, next) => {
       return;
     }
     const pgCode = typeof error.code === "string" ? error.code : undefined;
+    const specific = pgCode === "23505" && error.name === "PostgresError" ? uniqueViolationFor(error.constraint_name) : null;
+    if (specific) {
+      send(409, specific.code, specific.message);
+      return;
+    }
     const mapped = pgCode ? postgresErrors[pgCode] : undefined;
     if (mapped && error.name === "PostgresError") {
       logger.warn({ err: error, requestId: req.id }, "Database rule rejected request");

@@ -2,6 +2,7 @@ import { getSql } from "../db/client.js";
 import { registerRoomAuthorizer } from "../realtime/room-authorizers.js";
 import { getProjectAccessLevel, projectLevelAtLeast } from "./access/resource-access.js";
 import { authorizeChannelRoom } from "./chat/chat-access.js";
+import { hasAnyProductionRole } from "./production/access.js";
 import { authorizeTask } from "./work/tasks.service.js";
 
 /** Wires each realtime room type to the module that owns its authorization rules. */
@@ -24,4 +25,8 @@ export const registerRoomAuthorizers = () => {
   });
 
   registerRoomAuthorizer("channel", authorizeChannelRoom);
+
+  registerRoomAuthorizer("production", (context, organizationId) =>
+    Promise.resolve(organizationId === context.organization.id && hasAnyProductionRole(context) ? "view" : null)
+  );
 };

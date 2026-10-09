@@ -7,10 +7,13 @@ import type {
 import { NotificationTypeSchema } from "../../contracts/notifications.js";
 import { AppError } from "../../lib/app-error.js";
 import { decodeCursor, encodeCursor, toIso, type QuerySql } from "../../lib/db-types.js";
+import { logger } from "../../lib/logger.js";
+import { isEmailEnabled } from "../../lib/mailer.js";
 import { publishToUsers } from "../../realtime/publisher.js";
 import type { AccessContext } from "../access/access-context.js";
 import { toUserRef, type UserRefJson } from "../work/mappers.js";
 import { userJsonSql } from "../work/tasks.repo.js";
+import { enqueueNotificationEmails } from "./notification-email.js";
 
 type NotificationRow = {
   id: string;
@@ -40,7 +43,9 @@ const toNotification = (row: NotificationRow): Notification => ({
     taskKey: typeof row.payload.taskKey === "string" ? row.payload.taskKey : null,
     commentId: row.comment_id,
     channelId: row.channel_id,
-    messageId: row.message_id
+    messageId: row.message_id,
+    productionTaskId: typeof row.payload.productionTaskId === "string" ? row.payload.productionTaskId : null,
+    jobId: typeof row.payload.jobId === "string" ? row.payload.jobId : null
   },
   payload: row.payload,
   createdAt: toIso(row.created_at),
@@ -188,6 +193,15 @@ export const deliverNotifications = async (draft: NotificationDraft) => {
   for (const row of inserted) {
     const unreadCount = await countUnread(sql, draft.organizationId, row.recipient_user_id);
     publishToUsers([row.recipient_user_id], "notification:new", { notification: toNotification(row), unreadCount });
+  }
+
+  // Optional e-mail (PD-013): only once SMTP is configured, and never at the expense of web delivery.
+  if (inserted.length > 0 && isEmailEnabled()) {
+    try {
+      await enqueueNotificationEmails(draft.organizationId, inserted);
+    } catch (error) {
+      logger.warn({ err: error, type: draft.type, count: inserted.length }, "Queueing notification e-mails failed");
+    }
   }
   return inserted.length;
 };

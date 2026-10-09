@@ -1,4 +1,4 @@
-import type { Request } from "express";
+import type { Request, Response } from "express";
 import { ipKeyGenerator, rateLimit, type Options } from "express-rate-limit";
 import { RedisStore } from "rate-limit-redis";
 
@@ -119,4 +119,19 @@ export const createPasswordChangeRateLimit = () =>
     keyGenerator: (req) => `pwd:${(req as Partial<AuthenticatedRequest>).auth?.id ?? clientIp(req)}`,
     handler: rejectWith("PASSWORD_CHANGE_RATE_LIMITED", "Too many attempts. Try again in a few minutes."),
     ...redisStore("password-change")
+  });
+
+/**
+ * Google sign-in redirects (start + callback), per client address; every request counts because each
+ * start allocates server-side state. These are browser navigations, so the caller answers with a redirect.
+ */
+export const createGoogleAuthRateLimit = (onLimited: (req: Request, res: Response) => void) =>
+  rateLimit({
+    windowMs: 15 * 60 * 1000,
+    limit: env.GOOGLE_AUTH_RATE_LIMIT_MAX,
+    standardHeaders: "draft-8",
+    legacyHeaders: false,
+    keyGenerator: (req) => `google:${clientIp(req)}`,
+    handler: (req, res) => onLimited(req, res),
+    ...redisStore("google-auth")
   });

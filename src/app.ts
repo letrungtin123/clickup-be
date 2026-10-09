@@ -10,6 +10,7 @@ import { errorHandler } from "./middleware/error-handler.js";
 import { notFound } from "./middleware/not-found.js";
 import { createApiRateLimit } from "./middleware/rate-limit.js";
 import { requestContext } from "./middleware/request-context.js";
+import { redactUrl } from "./lib/redact-url.js";
 import { healthRoutes } from "./modules/health/health.routes.js";
 import { createApiRoutes } from "./routes.js";
 import { logger } from "./lib/logger.js";
@@ -35,7 +36,7 @@ export const createApp = (): Express => {
       autoLogging: { ignore: (req) => req.url === "/health" || req.url === "/ready" },
       // Keep request logs compact and free of credentials (cookies, tokens, CSRF headers).
       serializers: {
-        req: (req: { id: string; method: string; url: string }) => ({ id: req.id, method: req.method, url: req.url }),
+        req: (req: { id: string; method: string; url: string }) => ({ id: req.id, method: req.method, url: redactUrl(req.url) }),
         res: (res: { statusCode: number }) => ({ statusCode: res.statusCode })
       }
     })

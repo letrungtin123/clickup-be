@@ -1,6 +1,7 @@
 import { getSql } from "../../db/client.js";
 import { logger } from "../../lib/logger.js";
 import type { DomainEventEnvelope } from "../events/outbox.js";
+import { productionNotificationHandlers } from "../production/notifications.js";
 import { deliverNotifications } from "./notifications.service.js";
 
 type TaskInfo = {
@@ -349,6 +350,9 @@ const handlers: Record<string, Handler> = {
     });
   }
 };
+
+// Production module events (PLAN §8) share the notifications consumer.
+Object.assign(handlers, productionNotificationHandlers);
 
 export const notificationBindings = Object.keys(handlers);
 

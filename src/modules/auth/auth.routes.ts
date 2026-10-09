@@ -16,6 +16,7 @@ import { issueCsrfToken } from "../../middleware/csrf.js";
 import { disconnectRooms, sessionRoom } from "../../realtime/publisher.js";
 import { createLoginAccountRateLimit, createLoginRateLimit } from "../../middleware/rate-limit.js";
 import { accessTokenCookieName, clearAuthCookies, refreshTokenCookieName, setAuthCookies } from "./auth.cookies.js";
+import { createGoogleAuthRoutes } from "./google-auth.routes.js";
 import { refreshAuthSession, revokeAuthSession, signInWithPassword } from "./supabase-auth.service.js";
 
 export const createAuthRoutes = (): ExpressRouter => {
@@ -74,6 +75,9 @@ export const createAuthRoutes = (): ExpressRouter => {
     res.setHeader("cache-control", "no-store");
     res.json(AuthSessionSchema.parse({ user: (req as AuthenticatedRequest).auth }));
   });
+
+  // GET /auth/providers, /auth/google/start, /auth/google/callback (PD-012; off unless GOOGLE_AUTH_ENABLED).
+  authRoutes.use(createGoogleAuthRoutes());
 
   return authRoutes;
 };

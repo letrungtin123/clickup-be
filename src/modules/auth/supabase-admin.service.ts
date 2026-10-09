@@ -1,5 +1,7 @@
 import { randomInt } from "node:crypto";
 
+import { z } from "zod";
+
 import { env } from "../../config/env.js";
 import { AppError } from "../../lib/app-error.js";
 import { logger } from "../../lib/logger.js";
@@ -82,4 +84,43 @@ export const setAuthUserBanned = async (userId: string, banned: boolean) => {
     logger.warn({ status: result.status }, "GoTrue admin ban update failed");
     throw new AppError("AUTH_PROVIDER_ERROR", "Account status could not be updated.", 502);
   }
+};
+
+const AdminAuthUserSchema = z.object({
+  id: z.string().uuid(),
+  email: z.string().nullable().optional(),
+  email_confirmed_at: z.string().nullable().optional(),
+  banned_until: z.string().nullable().optional(),
+  user_metadata: z.record(z.string(), z.unknown()).optional(),
+  identities: z
+    .array(
+      z.object({
+        provider: z.string(),
+        identity_data: z.record(z.string(), z.unknown()).optional()
+      })
+    )
+    .nullable()
+    .optional()
+});
+export type AdminAuthUser = z.infer<typeof AdminAuthUserSchema>;
+
+/** Authoritative GoTrue view of a user (identities, ban). Null when the user does not exist. */
+export const getAuthUser = async (userId: string): Promise<AdminAuthUser | null> => {
+  const result = await adminFetch(`/users/${encodeURIComponent(userId)}`, { method: "GET" });
+  if (result.status === 404) {
+    return null;
+  }
+  if (result.status >= 300) {
+    logger.warn({ status: result.status }, "GoTrue admin get user failed");
+    throw new AppError("AUTH_PROVIDER_ERROR", "Account could not be loaded.", 502);
+  }
+  return AdminAuthUserSchema.parse(result.body);
+};
+
+export const isBannedUntil = (bannedUntil: string | null | undefined, now = Date.now()) => {
+  if (!bannedUntil) {
+    return false;
+  }
+  const until = Date.parse(bannedUntil);
+  return Number.isNaN(until) || until > now;
 };

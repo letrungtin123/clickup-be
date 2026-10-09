@@ -2,6 +2,10 @@ import "dotenv/config";
 
 import { z } from "zod";
 
+/** Optional string setting; a blank value (`SMTP_HOST=`) counts as unset. */
+const optionalText = () =>
+  z.preprocess((value) => (typeof value === "string" && value.trim() === "" ? undefined : value), z.string().trim().min(1).optional());
+
 const EnvSchema = z
   .object({
     NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
@@ -36,9 +40,66 @@ const EnvSchema = z
     TRUST_PROXY_HOPS: z.coerce.number().int().min(0).max(5).default(1),
     REDIS_URL: z.string().url().optional(),
     RABBITMQ_URL: z.string().url().optional(),
-    ACCESS_CONTEXT_CACHE_TTL_SECONDS: z.coerce.number().int().min(0).max(3600).default(60)
+    ACCESS_CONTEXT_CACHE_TTL_SECONDS: z.coerce.number().int().min(0).max(3600).default(60),
+    /**
+     * E-mail delivery of notifications (PD-013). Active only when SMTP_HOST and SMTP_FROM are set.
+     * SMTP_HOST=log renders mails into the worker log instead of sending them (development).
+     */
+    SMTP_HOST: optionalText(),
+    SMTP_PORT: z.coerce.number().int().min(1).max(65535).default(587),
+    /** Implicit TLS (port 465). Unset: true only for port 465; 587 upgrades with STARTTLS. */
+    SMTP_SECURE: z
+      .enum(["true", "false"])
+      .optional()
+      .transform((value) => (value === undefined ? undefined : value === "true")),
+    SMTP_USER: optionalText(),
+    SMTP_PASS: optionalText(),
+    /** Sender, e.g. `Nesso Work <no-reply@example.com>` (Gmail: the authenticated address or a verified alias). */
+    SMTP_FROM: optionalText(),
+    /** Base URL of the web app used for links in e-mails. Defaults to WEB_ORIGIN. */
+    APP_PUBLIC_URL: z.preprocess((value) => (value === "" ? undefined : value), z.string().url().optional()),
+    /** Digest window (PD-013 / SPEC §6): at most one e-mail per user per this many minutes. */
+    EMAIL_DIGEST_MINUTES: z.coerce.number().int().min(1).max(1440).default(5),
+    /**
+     * "Đăng nhập bằng Google" (PD-012). Off unless "true"; GoTrue must also have the Google provider
+     * enabled (docs/architecture/google-login.md). Only `allowed_emails` entries may sign in.
+     */
+    GOOGLE_AUTH_ENABLED: z.preprocess(
+      (value) => (typeof value === "string" && value.trim() === "" ? undefined : value),
+      z
+        .enum(["true", "false"])
+        .default("false")
+        .transform((value) => value === "true")
+    ),
+    /** Browser-facing Supabase origin used for GoTrue's /auth/v1/authorize redirect. Defaults to SUPABASE_URL. */
+    SUPABASE_PUBLIC_URL: z.preprocess((value) => (value === "" ? undefined : value), z.string().url().optional()),
+    /** Optional comma-separated Google Workspace domains (`hd` claim); empty = any verified Google account. */
+    GOOGLE_AUTH_HOSTED_DOMAINS: z.string().default(""),
+    /** Google sign-in redirects (start + callback) per client address per 15 minutes. */
+    GOOGLE_AUTH_RATE_LIMIT_MAX: z.coerce.number().int().min(1).default(60)
   })
   .superRefine((value, context) => {
+    if (value.GOOGLE_AUTH_ENABLED) {
+      // State lives in Redis, the code exchange needs the anon key, provisioning needs the DB + admin API.
+      for (const key of ["DATABASE_URL", "SUPABASE_ANON_KEY", "SUPABASE_SERVICE_ROLE_KEY", "REDIS_URL"] as const) {
+        if (!value[key]) {
+          context.addIssue({ code: "custom", path: [key], message: `${key} is required when GOOGLE_AUTH_ENABLED=true` });
+        }
+      }
+      if (value.NODE_ENV === "production") {
+        // Google only accepts HTTPS redirect URIs (localhost aside); the state cookie must be Secure.
+        for (const key of ["SUPABASE_PUBLIC_URL", "APP_PUBLIC_URL"] as const) {
+          if (!value[key]?.startsWith("https://")) {
+            context.addIssue({
+              code: "custom",
+              path: [key],
+              message: `${key} must be an https:// URL when GOOGLE_AUTH_ENABLED=true in production`
+            });
+          }
+        }
+      }
+    }
+
     if (value.NODE_ENV === "production") {
       if (!value.DATABASE_URL) {
         context.addIssue({
@@ -86,6 +147,12 @@ export const corsOrigins = [
     .map((origin) => origin.trim())
     .filter((origin) => origin.length > 0)
 ];
+
+/** Origin (+ optional base path) of the web app, without a trailing slash; links in e-mails start here. */
+export const appPublicUrl = (env.APP_PUBLIC_URL ?? env.WEB_ORIGIN).replace(/\/+$/, "");
+
+/** Browser-facing Supabase origin (OAuth redirects), without a trailing slash. */
+export const supabasePublicUrl = (env.SUPABASE_PUBLIC_URL ?? env.SUPABASE_URL).replace(/\/+$/, "");
 
 export const authCookieSecure = env.AUTH_COOKIE_SECURE
   ? env.AUTH_COOKIE_SECURE === "true"
