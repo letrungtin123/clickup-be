@@ -1,6 +1,7 @@
 // Production (Photo Retouch) shared leave calendar — SPEC §6.3 / PLAN §10 "Lịch nghỉ":
 // create, overlap 409, half-day rules, visibility, decide permissions, cancel, realtime hint.
 import { createRequire } from "node:module";
+import { dbNow, settleOutbox } from "./cleanup.mjs";
 import { apiOrigin, bumpAuthz, localSql, seed, session } from "./lib.mjs";
 
 const require = createRequire(new URL("../../package.json", import.meta.url));
@@ -39,9 +40,21 @@ localSql(`
   ${grant("MANAGER", ["ADMIN"])}
   ${grant("MEMBER_A", ["LEADER", "QC"])}
   ${grant("MEMBER_B", ["STAFF"])}
-  DELETE FROM production.leave_requests WHERE note LIKE ${quote(`${marker}%`)};
 `);
 bumpAuthz();
+// Removes this suite's leave requests (also leftovers of an interrupted run) and the notifications about them:
+// every request notifies all production admins — the organization superadmin included.
+const purgeLeaves = () =>
+  localSql(`
+    BEGIN;
+    DELETE FROM public.notifications
+    WHERE type LIKE 'production.leave_%'
+      AND payload->>'leaveId' IN (SELECT id::text FROM production.leave_requests WHERE note LIKE ${quote(`${marker}%`)});
+    DELETE FROM production.leave_requests WHERE note LIKE ${quote(`${marker}%`)};
+    COMMIT;
+  `);
+purgeLeaves();
+const since = dbNow();
 
 const admin = await session("MANAGER");
 const a = await session("MEMBER_A");
@@ -243,6 +256,7 @@ try {
     ok("requester notified of the decision", decided?.payload.status === "APPROVED", decided ?? "none");
   }
 } finally {
-  // Cleanup: remove every row this suite created.
-  localSql(`DELETE FROM production.leave_requests WHERE note LIKE ${quote(`${marker}%`)};`);
+  // Cleanup: remove every row this suite created, once the notifications it triggered have been delivered.
+  await settleOutbox(since);
+  purgeLeaves();
 }

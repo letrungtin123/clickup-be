@@ -1,10 +1,12 @@
 // My Tasks: tasks assigned to me across projects, keyset pages, overdue filter. Self-contained fixtures.
+import { cleanupWorkProjects, dbNow } from "./cleanup.mjs";
 import { session } from "./lib.mjs";
 const ok = (label, cond, extra = "") => console.log(`${cond ? "PASS" : "FAIL"}  ${label} ${extra}`);
 
 const mgr = await session("MANAGER");
 const me = (await mgr.call("GET", "/workspace/context")).body.user.id;
 const key = "M" + Math.random().toString(36).slice(2, 6).toUpperCase();
+const since = dbNow();
 const project = (await mgr.call("POST", "/projects", { key, name: `My tasks e2e ${key}`, visibility: "private" })).body;
 const listId = project.lists[0].id;
 const day = 86_400_000;
@@ -28,4 +30,6 @@ try {
   ok("overdue filter by priority", r.status === 200 && overdue.length === 3, `${overdue.length} items`);
 } finally {
   await mgr.call("DELETE", `/projects/${project.id}`);
+  // The seeded MANAGER lacks project.delete (the archive above is a 403): remove the fixture for real.
+  await cleanupWorkProjects(mgr, [project?.id], since);
 }
