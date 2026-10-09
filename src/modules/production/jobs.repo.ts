@@ -216,7 +216,8 @@ export const toProductionTask = (row: TaskRow, workflow: Workflow, relation: Tas
     updatedAt: toIso(row.updated_at),
     capabilities: {
       transitions: allowedTransitions(workflow, row.status_id, relation).map((option) => {
-        const entersDone = doneStatusIds.has(option.toStatusId) && !doneStatusIds.has(row.status_id);
+        // Quantity / OT hours are asked only at the first Done (they are locked afterwards, PD-014).
+        const entersDone = doneStatusIds.has(option.toStatusId) && !doneStatusIds.has(row.status_id) && row.done_at === null;
         return {
           ...option,
           asksQty: entersDone,
@@ -292,9 +293,10 @@ export const jobSelectSql = (sql: QuerySql) => sql`
   LEFT JOIN production.clients c ON c.organization_id = j.organization_id AND c.id = p.client_id
   LEFT JOIN production.statuses st ON st.organization_id = j.organization_id AND st.id = j.status_id
   LEFT JOIN LATERAL (
-    SELECT sum(t.qty_assigned) AS qty_assigned,
-      sum(coalesce(t.qty_done, 0)) FILTER (WHERE t.done_at IS NOT NULL) AS qty_done,
-      sum(coalesce(t.qty_done, 0)) FILTER (WHERE t.checked_at IS NOT NULL) AS qty_checked,
+    -- Image totals compare with total_images, so feedback redo tasks (FB_*) are not counted.
+    SELECT sum(t.qty_assigned) FILTER (WHERE t.kind = 'NORMAL') AS qty_assigned,
+      sum(coalesce(t.qty_done, 0)) FILTER (WHERE t.done_at IS NOT NULL AND t.kind = 'NORMAL') AS qty_done,
+      sum(coalesce(t.qty_done, 0)) FILTER (WHERE t.checked_at IS NOT NULL AND t.kind = 'NORMAL') AS qty_checked,
       count(*) AS task_count,
       count(*) FILTER (WHERE t.is_late AND t.done_at IS NULL) AS late_task_count
     FROM production.tasks t WHERE t.organization_id = j.organization_id AND t.job_id = j.id

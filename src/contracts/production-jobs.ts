@@ -168,6 +168,7 @@ export const JobSummarySchema = z.object({
   channelId: Id.nullable(),
   /** Derived from the tasks (least advanced) or FEEDBACK while client feedback is open; null = not split yet. */
   status: ProductionStatusRefSchema.nullable(),
+  /** Image totals of normal tasks only (feedback redo tasks are extra work, not part of total_images). */
   qtyAssigned: z.number().int(),
   qtyDone: z.number().int(),
   qtyChecked: z.number().int(),
