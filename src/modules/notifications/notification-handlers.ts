@@ -28,7 +28,7 @@ const loadTask = async (organizationId: string, taskId: string) => {
 };
 
 /** Keeps only users who can currently see the project (visibility, membership, RBAC). */
-const filterProjectViewers = async (organizationId: string, projectId: string, userIds: string[]) => {
+export const filterProjectViewers = async (organizationId: string, projectId: string, userIds: string[]) => {
   const unique = [...new Set(userIds)];
   if (unique.length === 0) {
     return [];
@@ -71,6 +71,24 @@ const taskTarget = (task: TaskInfo) => ({
 });
 
 
+/** Active org members whose role grants `permission` (superadmins always qualify). */
+const filterByPermission = async (organizationId: string, userIds: string[], permission: string) => {
+  if (userIds.length === 0) {
+    return [];
+  }
+  const rows = await getSql()<{ user_id: string }[]>`
+    SELECT om.user_id
+    FROM public.organization_memberships om
+    JOIN public.roles r ON r.id = om.role_id AND r.organization_id = om.organization_id AND r.deleted_at IS NULL
+    WHERE om.organization_id = ${organizationId} AND om.user_id = ANY(${userIds}::uuid[])
+      AND om.status = 'active' AND om.deleted_at IS NULL
+      AND (r.key = 'superadmin' OR EXISTS (
+        SELECT 1 FROM public.role_permissions rp WHERE rp.role_id = r.id AND rp.permission_key = ${permission}
+      ))
+  `;
+  return rows.map((row) => row.user_id);
+};
+
 type ChatContext = { name: string | null; kind: string; text: string | null; threadRootId: string | null };
 
 const loadChatMessage = async (event: DomainEventEnvelope, channelId: string, messageId: string) => {
@@ -109,7 +127,11 @@ const notifyChatMentions = async (event: DomainEventEnvelope, mentioned: string[
   if (!chat) {
     return;
   }
-  const recipients = chat.kind === "public" ? mentioned : await currentMembers(event, channelId, mentioned);
+  // Public channels may notify non-members, but only people whose role can see channels at all.
+  const recipients =
+    chat.kind === "public"
+      ? await filterByPermission(event.organizationId, mentioned, "channel.view")
+      : await currentMembers(event, channelId, mentioned);
   await deliverNotifications({
     organizationId: event.organizationId,
     recipientIds: recipients,

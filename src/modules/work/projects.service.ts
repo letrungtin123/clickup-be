@@ -15,7 +15,7 @@ import { nullableText, toIso, type QuerySql } from "../../lib/db-types.js";
 import { rankAtEnd, rankForPlacement } from "../../lib/rank.js";
 import { orgRoom } from "../../contracts/realtime.js";
 import { logger } from "../../lib/logger.js";
-import { evictUsersFromRoom, publishToRoom, publishToRooms, publishToUsers } from "../../realtime/publisher.js";
+import { evictUsersFromRoom, publishToRoom, publishToRooms, publishToUsers, resetRoom } from "../../realtime/publisher.js";
 import type { AccessContext } from "../access/access-context.js";
 import {
   assertPermission,
@@ -24,6 +24,7 @@ import {
   visibleProjectsPredicate
 } from "../access/resource-access.js";
 import { enqueueDomainEvents } from "../events/outbox.js";
+import { purgeNotificationsFor } from "../notifications/notifications.service.js";
 import { toColor, toList, toUserRef, type ListRow, type UserRefJson } from "./mappers.js";
 
 type ProjectRow = {
@@ -245,8 +246,8 @@ export const updateProject = async (
   assertPermission(context, Permission.ProjectUpdate);
   const sql = getSql();
 
-  await sql.begin(async (tx) => {
-    await assertProjectAccess(context, projectId, "manage", tx);
+  const previousVisibility = await sql.begin(async (tx) => {
+    const access = await assertProjectAccess(context, projectId, "manage", tx);
     if (input.key) {
       await assertProjectKeyFree(tx, context, input.key, projectId);
     }
@@ -272,9 +273,14 @@ export const updateProject = async (
         AND organization_id = ${context.organization.id}
         AND deleted_at IS NULL
     `;
+    return access.visibility;
   });
 
   publishStructure(projectId, "project");
+  if (previousVisibility === "public" && input.visibility === "private") {
+    // Non-members who were watching the public project must lose its live events now.
+    resetRoom({ type: "project", id: projectId });
+  }
   await publishSidebar(context, projectId, "project", { broadcast: input.visibility !== undefined });
   return await getProject(context, projectId);
 };
@@ -351,6 +357,8 @@ export const upsertProjectMember = async (
 
   const member = await sql.begin(async (tx) => {
     await assertProjectAccess(context, projectId, "manage", tx);
+    // Serialize membership changes per project so two managers cannot demote each other to zero.
+    await tx`SELECT 1 FROM public.projects WHERE id = ${projectId} AND organization_id = ${context.organization.id} FOR UPDATE`;
     const target = await tx<{ id: string }[]>`
       SELECT id FROM public.organization_memberships
       WHERE organization_id = ${context.organization.id} AND user_id = ${input.userId} AND status = 'active' AND deleted_at IS NULL
@@ -413,6 +421,8 @@ export const removeProjectMember = async (context: AccessContext, projectId: str
 
   const visibility = await sql.begin(async (tx) => {
     const access = await assertProjectAccess(context, projectId, "manage", tx);
+    // Serialize membership changes per project so two managers cannot demote each other to zero.
+    await tx`SELECT 1 FROM public.projects WHERE id = ${projectId} AND organization_id = ${context.organization.id} FOR UPDATE`;
     const current = await tx<{ access_level: ProjectAccessLevel }[]>`
       SELECT access_level FROM public.project_memberships
       WHERE organization_id = ${context.organization.id} AND project_id = ${projectId} AND user_id = ${userId} AND deleted_at IS NULL
@@ -435,6 +445,7 @@ export const removeProjectMember = async (context: AccessContext, projectId: str
   // Losing membership of a private project revokes live access immediately.
   if (visibility === "private") {
     evictUsersFromRoom([userId], { type: "project", id: projectId });
+    await purgeNotificationsFor({ organizationId: context.organization.id, userIds: [userId], projectId });
   }
   publishStructure(projectId, "members");
   await publishSidebar(context, projectId, "members", { extraUserIds: [userId] });

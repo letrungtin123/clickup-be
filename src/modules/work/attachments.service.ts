@@ -10,8 +10,10 @@ import {
   createSignedDownloadUrl,
   createSignedUploadUrl,
   getObjectInfo,
+  baseMime,
   inlineImageTypes,
   isBlockedMimeType,
+  isInlineImage,
   removeObjects,
   sanitizeFileName,
   storageSafeSegment
@@ -92,10 +94,19 @@ export const completeTaskUpload = async (context: AccessContext, attachmentId: s
   if (!info || info.size === null) {
     throw new AppError("ATTACHMENT_NOT_UPLOADED", "The file has not been uploaded yet.", 409);
   }
-  if (info.size > maxAttachmentBytes || info.size > Number(row.size_declared) * 1.01 + 1024) {
+  const discard = async () => {
     await removeObjects([row.storage_path]).catch(() => undefined);
     await sql`UPDATE public.task_attachments SET deleted_at = now() WHERE id = ${attachmentId}`;
+  };
+  if (info.size > maxAttachmentBytes || info.size > Number(row.size_declared) * 1.01 + 1024) {
+    await discard();
     throw new AppError("ATTACHMENT_TOO_LARGE", "The uploaded file is larger than allowed.", 400);
+  }
+  // Storage serves the Content-Type sent with the upload: it must match what was authorized.
+  const storedType = info.contentType ? baseMime(info.contentType) : null;
+  if (!storedType || storedType !== baseMime(row.mime_type) || isBlockedMimeType(storedType)) {
+    await discard();
+    throw new AppError("ATTACHMENT_TYPE_MISMATCH", "The uploaded file type does not match the declared type.", 400);
   }
 
   await sql.begin(async (tx) => {
@@ -144,7 +155,7 @@ export const createAttachmentUrls = async (context: AccessContext, ids: string[]
         id: row.id,
         url: await createSignedDownloadUrl(row.storage_path, {
           expiresIn: downloadTtlSeconds,
-          ...(inlineImageTypes.has(row.mime_type) ? {} : { downloadName: row.file_name })
+          ...(isInlineImage(row.mime_type) ? {} : { downloadName: row.file_name })
         }),
         expiresAt
       }))
@@ -156,7 +167,8 @@ export const deleteAttachment = async (context: AccessContext, attachmentId: str
   const row = await selectAttachment(context, attachmentId);
   const sql = getSql();
   const { access } = await authorizeTask(sql, context, row.task_id, "view");
-  if (row.uploaded_by_id !== context.user.id && !projectLevelAtLeast(access.level, "manage")) {
+  const isUploader = row.uploaded_by_id === context.user.id;
+  if (!(isUploader && projectLevelAtLeast(access.level, "submit")) && !projectLevelAtLeast(access.level, "manage")) {
     throw new AppError("FORBIDDEN", "You cannot delete this attachment.", 403);
   }
   await sql.begin(async (tx) => {

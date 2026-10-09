@@ -1,5 +1,6 @@
 import { getSql } from "../../db/client.js";
 import { logger } from "../../lib/logger.js";
+import { filterProjectViewers } from "./notification-handlers.js";
 import { deliverNotifications } from "./notifications.service.js";
 
 type DueRow = {
@@ -31,6 +32,7 @@ const scanWindow = async (kind: "task.due_soon" | "task.overdue") => {
         coalesce(array_agg(ta.assignee_user_id) FILTER (WHERE ta.assignee_user_id IS NOT NULL), '{}') AS assignee_ids
       FROM public.tasks t
       JOIN public.projects p ON p.id = t.project_id AND p.organization_id = t.organization_id AND p.deleted_at IS NULL AND p.archived_at IS NULL
+      JOIN public.lists l ON l.id = t.list_id AND l.organization_id = t.organization_id AND l.deleted_at IS NULL AND l.archived_at IS NULL
       LEFT JOIN public.task_assignees ta ON ta.task_id = t.id AND ta.organization_id = t.organization_id AND ta.removed_at IS NULL
       WHERE t.deleted_at IS NULL AND t.completed_at IS NULL AND t.due_at IS NOT NULL
         AND ${
@@ -43,13 +45,24 @@ const scanWindow = async (kind: "task.due_soon" | "task.overdue") => {
       ORDER BY t.due_at, t.id
       LIMIT ${batchSize}
     `;
+    // Assignees who lost access to the project (e.g. removed from a private project) get nothing.
+    const allowedByProject = new Map<string, Set<string>>();
     for (const row of rows) {
-      if (row.assignee_ids.length === 0) {
+      const key = `${row.organization_id}:${row.project_id}`;
+      if (!allowedByProject.has(key)) {
+        const candidates = rows.filter((other) => other.project_id === row.project_id).flatMap((other) => other.assignee_ids);
+        allowedByProject.set(key, new Set(await filterProjectViewers(row.organization_id, row.project_id, candidates)));
+      }
+    }
+    for (const row of rows) {
+      const allowed = allowedByProject.get(`${row.organization_id}:${row.project_id}`) ?? new Set<string>();
+      const recipients = row.assignee_ids.filter((id) => allowed.has(id));
+      if (recipients.length === 0) {
         continue;
       }
       delivered += await deliverNotifications({
         organizationId: row.organization_id,
-        recipientIds: row.assignee_ids,
+        recipientIds: recipients,
         type: kind,
         actorUserId: null,
         title: row.title,

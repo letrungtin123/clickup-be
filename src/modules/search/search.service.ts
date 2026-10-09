@@ -54,6 +54,8 @@ export const globalSearch = async (context: AccessContext, query: GlobalSearchQu
             OR ${tsQuery ? sql`t.search_vector @@ to_tsquery('simple', ${tsQuery})` : sql`FALSE`}
             OR public.immutable_unaccent(lower(t.title)) LIKE public.immutable_unaccent(${like})
           )
+        -- Bound the work for very broad queries; users refine instead of paging global search.
+        LIMIT 5000
       )
       SELECT m.id
       FROM matches m

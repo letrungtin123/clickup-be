@@ -65,6 +65,44 @@ export const publishToUsers = <Name extends EventName>(userIds: string[], event:
   publishToRooms([...new Set(userIds)].map(userRoom), event, payload);
 };
 
+/** Room name for every socket opened with one auth session (closed on logout). */
+export const sessionRoom = (sessionId: string) => `session:${sessionId}`;
+
+/** Disconnects every socket in the given raw rooms, cluster-wide. */
+export const disconnectRooms = (rooms: string[]) => {
+  if (rooms.length === 0) {
+    return;
+  }
+  try {
+    const redisEmitter = getEmitter();
+    if (redisEmitter) {
+      redisEmitter.in(rooms).disconnectSockets(true);
+    } else {
+      localServer?.in(rooms).disconnectSockets(true);
+    }
+  } catch (error) {
+    logger.warn({ err: error }, "Realtime disconnect failed");
+  }
+};
+
+/**
+ * Re-authorizes a whole room (e.g. project became private): everyone is told access was revoked
+ * and removed; clients re-join and only those still authorized get back in.
+ */
+export const resetRoom = (room: RealtimeRoomRef) => {
+  try {
+    publishToRooms([roomName(room)], "access:revoked", { room });
+    const redisEmitter = getEmitter();
+    if (redisEmitter) {
+      redisEmitter.in(roomName(room)).socketsLeave(roomName(room));
+    } else {
+      localServer?.in(roomName(room)).socketsLeave(roomName(room));
+    }
+  } catch (error) {
+    logger.warn({ err: error, room }, "Realtime room reset failed");
+  }
+};
+
 /** Disconnects every live socket of the given users, cluster-wide (account disabled, password reset). */
 export const disconnectUsers = (userIds: string[]) => {
   if (userIds.length === 0) {

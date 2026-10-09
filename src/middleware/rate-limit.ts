@@ -68,6 +68,26 @@ export const createApiRateLimit = () =>
     ...redisStore("api")
   });
 
+const loginEmail = (req: Request) => {
+  const body: unknown = req.body;
+  return typeof body === "object" && body !== null && "email" in body && typeof body.email === "string"
+    ? body.email.trim().toLowerCase().slice(0, 254)
+    : "";
+};
+
+/** Per-account guard (any source address): slows distributed guessing against one account. */
+export const createLoginAccountRateLimit = () =>
+  rateLimit({
+    windowMs: 15 * 60 * 1000,
+    limit: env.LOGIN_ACCOUNT_LIMIT_MAX,
+    skipSuccessfulRequests: true,
+    standardHeaders: "draft-8",
+    legacyHeaders: false,
+    keyGenerator: (req) => `acct:${loginEmail(req)}`,
+    handler: rejectWith("LOGIN_RATE_LIMITED", "Too many sign-in attempts. Try again in a few minutes."),
+    ...redisStore("login-account")
+  });
+
 /** Brute-force guard for credential endpoints, keyed by IP + normalized email; only failures count. */
 export const createLoginRateLimit = () =>
   rateLimit({
@@ -86,4 +106,17 @@ export const createLoginRateLimit = () =>
     },
     handler: rejectWith("LOGIN_RATE_LIMITED", "Too many sign-in attempts. Try again in a few minutes."),
     ...redisStore("login")
+  });
+
+/** Wrong current-password guesses on change-password, per signed-in user. */
+export const createPasswordChangeRateLimit = () =>
+  rateLimit({
+    windowMs: 15 * 60 * 1000,
+    limit: 5,
+    skipSuccessfulRequests: true,
+    standardHeaders: "draft-8",
+    legacyHeaders: false,
+    keyGenerator: (req) => `pwd:${(req as Partial<AuthenticatedRequest>).auth?.id ?? clientIp(req)}`,
+    handler: rejectWith("PASSWORD_CHANGE_RATE_LIMITED", "Too many attempts. Try again in a few minutes."),
+    ...redisStore("password-change")
   });

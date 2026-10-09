@@ -585,8 +585,8 @@ export const updateOrganizationMember = async (
   assertPermission(context, Permission.MemberManage);
   const sql = getSql();
 
-  const currentRows = await sql<{ user_id: string; role_key: string; status: EditableMembershipStatus | "invited" }[]>`
-    SELECT om.user_id, r.key AS role_key, om.status
+  const currentRows = await sql<{ user_id: string; role_id: string; role_key: string; status: EditableMembershipStatus | "invited" }[]>`
+    SELECT om.user_id, om.role_id, r.key AS role_key, om.status
     FROM public.organization_memberships om
     JOIN public.roles r
       ON r.id = om.role_id
@@ -615,6 +615,8 @@ export const updateOrganizationMember = async (
   if (current.role_key === "superadmin" && !context.hasFullOrganizationAuthority) {
     throw new AppError("PERMISSION_ESCALATION", "Only a superadmin can change a superadmin membership.", 403);
   }
+  // Nobody may disable or re-role someone who holds capabilities they do not hold themselves.
+  assertCanGrantPermissions(context, (await getManagedRoleById(sql, context, current.role_id)).permissions);
 
   if (current.role_key === "superadmin" && (input.status === "disabled" || input.roleId)) {
     await assertOrganizationWillKeepSuperadmin(sql, context, membershipId);

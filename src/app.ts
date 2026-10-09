@@ -4,7 +4,7 @@ import express, { type Express } from "express";
 import helmet from "helmet";
 import { pinoHttp } from "pino-http";
 
-import { corsOrigins } from "./config/env.js";
+import { corsOrigins, env } from "./config/env.js";
 import { requireCsrf } from "./middleware/csrf.js";
 import { errorHandler } from "./middleware/error-handler.js";
 import { notFound } from "./middleware/not-found.js";
@@ -18,8 +18,8 @@ export const createApp = (): Express => {
   const app = express();
 
   app.disable("x-powered-by");
-  // Exactly one reverse proxy (or none in dev) sits in front of the API.
-  app.set("trust proxy", 1);
+  // Only the configured number of reverse-proxy hops may set the client address.
+  app.set("trust proxy", env.TRUST_PROXY_HOPS);
   app.use(requestContext);
   app.use(
     pinoHttp({

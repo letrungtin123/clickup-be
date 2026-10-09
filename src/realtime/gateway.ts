@@ -22,11 +22,12 @@ import { getOptionalRedis, getRedisSubscriber } from "../lib/redis.js";
 import { assertPasswordCurrent, resolveAccessContext } from "../modules/access/access-context.js";
 import { accessTokenCookieName } from "../modules/auth/auth.cookies.js";
 import { verifyAccessToken } from "../modules/auth/supabase-auth.service.js";
-import { setLocalRealtimeServer } from "./publisher.js";
+import { sessionRoom, setLocalRealtimeServer } from "./publisher.js";
 import { authorizeRoom, type RoomAccess } from "./room-authorizers.js";
 
 type SocketData = {
   userId: string;
+  sessionId: string | null;
   organizationId: string;
   expiresAt: number;
   rooms: Map<string, Exclude<RoomAccess, null>>;
@@ -107,6 +108,7 @@ export const attachRealtimeGateway = (httpServer: HttpServer): GatewayServer => 
     socket.data.userId = context.user.id;
     socket.data.organizationId = context.organization.id;
     socket.data.expiresAt = session.expiresAt;
+    socket.data.sessionId = session.sessionId;
     socket.data.rooms = new Map();
     socket.data.lastTypingAt = new Map();
     socket.data.bucket = { tokens: eventBucketSize, updatedAt: Date.now() };
@@ -123,7 +125,11 @@ export const attachRealtimeGateway = (httpServer: HttpServer): GatewayServer => 
   });
 
   io.on("connection", (socket: GatewaySocket) => {
-    void socket.join([userRoom(socket.data.userId), orgRoom(socket.data.organizationId)]);
+    void socket.join([
+      userRoom(socket.data.userId),
+      orgRoom(socket.data.organizationId),
+      ...(socket.data.sessionId ? [sessionRoom(socket.data.sessionId)] : [])
+    ]);
     void touchPresence(socket).catch(() => undefined);
 
     // Force re-authentication when the access token expires; the client refreshes and reconnects.

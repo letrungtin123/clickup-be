@@ -257,13 +257,17 @@ export const denylistSession = async (session: Pick<VerifiedSession, "sessionId"
   }
 };
 
-export const revokeAuthSession = async (accessToken: string | null) => {
+/** Logs a session out everywhere it matters; returns its id so live sockets can be closed. */
+export const revokeAuthSession = async (accessToken: string | null): Promise<string | null> => {
   if (!accessToken) {
-    return;
+    return null;
   }
 
+  let sessionId: string | null = null;
   try {
-    await denylistSession(await verifyAccessToken(accessToken));
+    const session = await verifyAccessToken(accessToken);
+    sessionId = session.sessionId;
+    await denylistSession(session);
   } catch {
     // Expired or invalid tokens need no denylist entry.
   }
@@ -278,4 +282,5 @@ export const revokeAuthSession = async (accessToken: string | null) => {
     },
     () => null
   );
+  return sessionId;
 };

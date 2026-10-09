@@ -190,3 +190,22 @@ export const deliverNotifications = async (draft: NotificationDraft) => {
   }
   return inserted.length;
 };
+
+/** Removes inbox entries a user may no longer see (project or channel access revoked). */
+export const purgeNotificationsFor = async (input: {
+  organizationId: string;
+  userIds: string[];
+  projectId?: string;
+  channelId?: string;
+}) => {
+  if (input.userIds.length === 0 || (!input.projectId && !input.channelId)) {
+    return;
+  }
+  await getSql()`
+    DELETE FROM public.notifications
+    WHERE organization_id = ${input.organizationId}
+      AND recipient_user_id = ANY(${input.userIds}::uuid[])
+      AND (${input.projectId ?? null}::uuid IS NULL OR project_id = ${input.projectId ?? null}::uuid)
+      AND (${input.channelId ?? null}::uuid IS NULL OR channel_id = ${input.channelId ?? null}::uuid)
+  `;
+};

@@ -24,6 +24,7 @@ import { getSql } from "../../db/client.js";
 import { AppError } from "../../lib/app-error.js";
 import { escapeLike, nullableText, type QuerySql } from "../../lib/db-types.js";
 import { evictUsersFromRoom } from "../../realtime/publisher.js";
+import { purgeNotificationsFor } from "../notifications/notifications.service.js";
 import type { AccessContext } from "../access/access-context.js";
 import { assertPermission, hasPermission } from "../access/resource-access.js";
 import { enqueueDomainEvents, type DomainEventInput } from "../events/outbox.js";
@@ -406,6 +407,7 @@ export const deleteChannel = async (context: AccessContext, channelId: string) =
     toUsers: memberIds
   });
   evictUsersFromRoom(memberIds, channelRoom(channelId));
+  await purgeNotificationsFor({ organizationId: context.organization.id, userIds: memberIds, channelId });
   return { ok: true as const };
 };
 
@@ -552,6 +554,7 @@ const afterMemberRemoved = async (context: AccessContext, channelId: string, use
   });
   // Removed members stop receiving the channel's realtime events immediately.
   evictUsersFromRoom([userId], channelRoom(channelId));
+  await purgeNotificationsFor({ organizationId: context.organization.id, userIds: [userId], channelId });
 };
 
 export const leaveChannel = async (context: AccessContext, channelId: string) => {

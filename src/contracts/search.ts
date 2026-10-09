@@ -12,7 +12,7 @@ export const SearchGroupSchema = z.enum(searchGroups);
 export type SearchGroup = z.infer<typeof SearchGroupSchema>;
 
 export const GlobalSearchQuerySchema = z.object({
-  q: z.string().trim().min(1).max(200),
+  q: z.string().trim().min(2).max(200),
   groups: z
     .preprocess(
       (value) => (typeof value === "string" && value.length > 0 ? value.split(",").map((entry) => entry.trim()) : [...searchGroups]),

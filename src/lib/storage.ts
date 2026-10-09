@@ -37,17 +37,31 @@ const storageFetch = async (path: string, init: RequestInit) => {
 /** Raster formats safe to render inline. SVG/HTML are always downloaded, never rendered. */
 export const inlineImageTypes = new Set(["image/png", "image/jpeg", "image/gif", "image/webp", "image/avif"]);
 
+/** Active-content types are refused outright (defence in depth; everything non-raster is downloaded anyway). */
 const blockedTypes = new Set([
   "text/html",
   "application/xhtml+xml",
   "image/svg+xml",
+  "text/xml",
+  "application/xml",
   "application/javascript",
   "text/javascript",
+  "application/ecmascript",
+  "text/ecmascript",
   "application/x-msdownload",
-  "application/x-sh"
+  "application/x-sh",
+  "application/x-httpd-php"
 ]);
 
-export const isBlockedMimeType = (mimeType: string) => blockedTypes.has(mimeType.toLowerCase().split(";")[0]!.trim());
+export const baseMime = (mimeType: string) => mimeType.toLowerCase().split(";")[0]!.trim();
+
+export const isBlockedMimeType = (mimeType: string) => {
+  const base = baseMime(mimeType);
+  return blockedTypes.has(base) || base.endsWith("+xml");
+};
+
+/** Only verified raster images may be rendered inline; everything else is served as a download. */
+export const isInlineImage = (mimeType: string) => inlineImageTypes.has(baseMime(mimeType));
 
 let bucketReady: Promise<void> | undefined;
 

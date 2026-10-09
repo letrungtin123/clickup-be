@@ -33,6 +33,12 @@ const blockTypes = new Set([
   "codeBlock",
   "horizontalRule"
 ]);
+const inlineTypes = new Set(["text", "hardBreak", "mention"]);
+const listItemType: Record<string, "listItem" | "taskItem" | undefined> = {
+  bulletList: "listItem",
+  orderedList: "listItem",
+  taskList: "taskItem"
+};
 const markTypes = new Set(["bold", "italic", "strike", "underline", "code", "link"]);
 const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const safeHref = /^(https?:\/\/|mailto:)[^\s<>"']{1,2000}$/i;
@@ -156,25 +162,13 @@ export const sanitizeRichText = (input: unknown, limits: SanitizeLimits): Saniti
       attrs.start = Math.min(100_000, Math.max(1, Math.trunc(start)));
     }
 
-    const childrenAreInline = type === "paragraph" || type === "heading" || type === "codeBlock";
-    const content: RichTextNode[] = [];
-    if (Array.isArray(raw.content)) {
-      for (const child of raw.content) {
-        // Code blocks only hold plain text.
-        if (type === "codeBlock" && isRecord(child) && child.type !== "text") {
-          continue;
-        }
-        const sanitized = visit(child, depth + 1, childrenAreInline);
-        if (sanitized) {
-          content.push(type === "codeBlock" ? { type: "text", text: sanitized.text ?? "" } : sanitized);
-        }
-      }
-    }
-    if (!childrenAreInline && type !== "horizontalRule") {
+    const content = sanitizeChildren(raw.content, type, depth + 1);
+    if (type !== "horizontalRule") {
       textParts.push("\n");
     }
-    if (childrenAreInline) {
-      textParts.push("\n");
+    // An empty list is not a valid node; drop it.
+    if (listItemType[type] && content.length === 0) {
+      return null;
     }
 
     const node: RichTextNode = { type };
@@ -187,15 +181,105 @@ export const sanitizeRichText = (input: unknown, limits: SanitizeLimits): Saniti
     return node;
   };
 
-  const content: RichTextNode[] = [];
-  if (Array.isArray(input.content)) {
-    for (const child of input.content) {
-      const sanitized = visit(child, 1, false);
-      if (sanitized) {
-        content.push(sanitized);
+  /**
+   * Enforces the editor schema's parent/child rules so a stored document can always be loaded:
+   * textblocks hold inline nodes only, code blocks plain text only, lists only their item type,
+   * items start with a paragraph, and stray inline nodes at block level are wrapped in paragraphs.
+   */
+  function sanitizeChildren(rawChildren: unknown, parentType: string, depth: number): RichTextNode[] {
+    const children = Array.isArray(rawChildren) ? rawChildren : [];
+    const out: RichTextNode[] = [];
+
+    if (parentType === "paragraph" || parentType === "heading") {
+      for (const child of children) {
+        const node = visit(child, depth, true);
+        if (node) {
+          out.push(node);
+        }
+      }
+      return out;
+    }
+    if (parentType === "codeBlock") {
+      for (const child of children) {
+        if (isRecord(child) && child.type === "text") {
+          const node = visit(child, depth, true);
+          if (node?.text) {
+            out.push({ type: "text", text: node.text });
+          }
+        }
+      }
+      return out;
+    }
+    if (parentType === "horizontalRule") {
+      return out;
+    }
+
+    const itemType = listItemType[parentType];
+    const place = (node: RichTextNode) => {
+      const isItem = node.type === "listItem" || node.type === "taskItem";
+      if (itemType) {
+        if (node.type === itemType) {
+          out.push(node);
+        } else {
+          const inner = isItem ? (node.content ?? []) : [node];
+          out.push({ type: itemType, ...(itemType === "taskItem" ? { attrs: { checked: false } } : {}), content: inner });
+        }
+        return;
+      }
+      if (isItem) {
+        // Items outside their list are flattened into their parent.
+        out.push(...(node.content ?? []));
+        return;
+      }
+      out.push(node);
+    };
+
+    let pendingInline: RichTextNode[] = [];
+    const flush = () => {
+      if (pendingInline.length > 0) {
+        place({ type: "paragraph", content: pendingInline });
+        pendingInline = [];
+      }
+    };
+    for (const child of children) {
+      const childType = isRecord(child) && typeof child.type === "string" ? child.type : "";
+      if (inlineTypes.has(childType)) {
+        const node = visit(child, depth, true);
+        if (node) {
+          pendingInline.push(node);
+        }
+        continue;
+      }
+      flush();
+      const node = visit(child, depth, false);
+      if (node) {
+        place(node);
       }
     }
+    flush();
+
+    if (parentType === "listItem" || parentType === "taskItem") {
+      if (out[0]?.type !== "paragraph") {
+        out.unshift({ type: "paragraph" });
+      }
+      // Items inside items are only valid within a nested list.
+      return out.filter((node) => node.type !== "listItem" && node.type !== "taskItem");
+    }
+    if (parentType === "blockquote" && out.length === 0) {
+      out.push({ type: "paragraph" });
+    }
+    if (itemType) {
+      // List items must start with a paragraph.
+      for (const item of out) {
+        if (item.content?.[0]?.type !== "paragraph") {
+          item.content = [{ type: "paragraph" }, ...(item.content ?? [])];
+        }
+      }
+    }
+    return out;
   }
+
+  const content = sanitizeChildren(input.content, "doc", 1);
 
   const text = textParts
     .join("")

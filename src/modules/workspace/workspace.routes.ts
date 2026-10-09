@@ -19,10 +19,12 @@ import {
   UpdateRoleRequestSchema,
   WorkspaceContextSchema
 } from "../../contracts/schemas.js";
-import { readCookie } from "../../lib/cookies.js";
 import { requireSupabaseUser, type AuthenticatedRequest } from "../../middleware/auth.js";
-import { clearAuthCookies, refreshTokenCookieName, setAuthCookies } from "../auth/auth.cookies.js";
-import { refreshAuthSession } from "../auth/supabase-auth.service.js";
+import { createPasswordChangeRateLimit } from "../../middleware/rate-limit.js";
+import { clearAuthCookies, setAuthCookies } from "../auth/auth.cookies.js";
+import { signInWithPassword } from "../auth/supabase-auth.service.js";
+import { setAuthUserBanned } from "../auth/supabase-admin.service.js";
+import { disconnectUsers } from "../../realtime/publisher.js";
 import { assertPasswordCurrent, invalidateAccessContexts, resolveAccessContext } from "../access/access-context.js";
 import { changeOwnPassword, createOrganizationMember, resetMemberPassword, revokeUserSessions } from "./members.service.js";
 import {
@@ -37,6 +39,7 @@ import {
 } from "./workspace.service.js";
 
 export const workspaceRoutes: ExpressRouter = Router();
+const passwordChangeRateLimit = createPasswordChangeRateLimit();
 
 const getAuthenticatedUserId = (req: Request) => {
   return (req as unknown as AuthenticatedRequest).auth.id;
@@ -143,6 +146,13 @@ workspaceRoutes.patch("/organization/members/:membershipId", async (req, res, ne
     await invalidateAccessContexts();
     if (input.status === "disabled") {
       await revokeUserSessions(payload.user.id);
+      await setAuthUserBanned(payload.user.id, true).catch(() => undefined);
+    } else if (input.status === "active") {
+      await setAuthUserBanned(payload.user.id, false).catch(() => undefined);
+    }
+    if (input.roleId) {
+      // Live room subscriptions were authorized with the old role: force a re-authenticated reconnect.
+      disconnectUsers([payload.user.id]);
     }
     res.json(OrganizationMemberSchema.parse(payload));
   } catch (error) {
@@ -171,22 +181,24 @@ workspaceRoutes.post("/organization/members/:membershipId/reset-password", async
   }
 });
 
-workspaceRoutes.post("/auth/change-password", async (req, res, next) => {
+workspaceRoutes.post("/auth/change-password", passwordChangeRateLimit, async (req, res, next) => {
   try {
     const input = ChangePasswordRequestSchema.parse(req.body);
     const auth = (req as unknown as AuthenticatedRequest).auth;
     const context = await resolveAccessContext(auth.id);
     await changeOwnPassword(context, auth.sessionId, input);
-    // Older access tokens are now revoked; rotate this session's cookies so the user stays signed in.
-    const refreshToken = readCookie(req, refreshTokenCookieName);
+    // A password change ends every session (GoTrue included); sign this browser straight back in
+    // with the new password so the user stays signed in with a fresh session.
     let reauthenticate = true;
-    if (refreshToken) {
+    if (context.user.email) {
       try {
-        setAuthCookies(res, (await refreshAuthSession(refreshToken)).tokens);
+        setAuthCookies(res, (await signInWithPassword({ email: context.user.email, password: input.newPassword })).tokens);
         reauthenticate = false;
       } catch {
         clearAuthCookies(res);
       }
+    } else {
+      clearAuthCookies(res);
     }
     res.json(ChangePasswordResponseSchema.parse({ ok: true, reauthenticate }));
   } catch (error) {

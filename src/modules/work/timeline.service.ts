@@ -4,7 +4,8 @@ import type { Comment, CreateCommentRequest, TimelineItem, TimelinePage } from "
 import { getSql } from "../../db/client.js";
 import { AppError } from "../../lib/app-error.js";
 import { decodeCursor, encodeCursor, toIso, type QuerySql } from "../../lib/db-types.js";
-import { inlineImageTypes } from "../../lib/storage.js";
+import { logger } from "../../lib/logger.js";
+import { inlineImageTypes, removeObjects } from "../../lib/storage.js";
 import { publishToRoom } from "../../realtime/publisher.js";
 import type { AccessContext } from "../access/access-context.js";
 import { assertPermission, projectLevelAtLeast } from "../access/resource-access.js";
@@ -254,10 +255,12 @@ export const createComment = async (context: AccessContext, taskId: string, inpu
 };
 
 export const updateComment = async (context: AccessContext, taskId: string, commentId: string, doc: unknown): Promise<Comment> => {
+  assertPermission(context, Permission.TaskComment);
   const body = sanitizeComment(doc);
   const sql = getSql();
   const result = await sql.begin(async (tx) => {
-    const { task } = await authorizeTask(tx, context, taskId, "view");
+    // Editing can add mentions (notifications): same bar as commenting.
+    const { task } = await authorizeTask(tx, context, taskId, "submit");
     const comment = await loadComment(tx, context, taskId, commentId);
     if (comment.author_user_id !== context.user.id) {
       throw new AppError("FORBIDDEN", "Only the author can edit this comment.", 403);
@@ -285,18 +288,30 @@ export const updateComment = async (context: AccessContext, taskId: string, comm
 
 export const deleteComment = async (context: AccessContext, taskId: string, commentId: string) => {
   const sql = getSql();
-  const projectId = await sql.begin(async (tx) => {
+  const result = await sql.begin(async (tx) => {
     const { task, access } = await authorizeTask(tx, context, taskId, "view");
     const comment = await loadComment(tx, context, taskId, commentId);
-    if (comment.author_user_id !== context.user.id && !projectLevelAtLeast(access.level, "manage")) {
+    const isAuthor = comment.author_user_id === context.user.id;
+    if (!(isAuthor && projectLevelAtLeast(access.level, "submit")) && !projectLevelAtLeast(access.level, "manage")) {
       throw new AppError("FORBIDDEN", "You cannot delete this comment.", 403);
     }
-    await tx`
+    const removed = await tx<{ id: string }[]>`
       UPDATE public.task_comments SET deleted_at = now(), deleted_by = ${context.user.id}
       WHERE organization_id = ${context.organization.id} AND (id = ${commentId} OR parent_comment_id = ${commentId}) AND deleted_at IS NULL
+      RETURNING id
     `;
-    return task.project_id;
+    // Files of deleted comments stop being downloadable and their objects are removed.
+    const files = await tx<{ storage_path: string }[]>`
+      UPDATE public.task_attachments SET deleted_at = now(), deleted_by = ${context.user.id}
+      WHERE organization_id = ${context.organization.id} AND comment_id = ANY(${removed.map((row) => row.id)}::uuid[]) AND deleted_at IS NULL
+      RETURNING storage_path
+    `;
+    return { projectId: task.project_id, paths: files.map((file) => file.storage_path) };
   });
+  if (result.paths.length > 0) {
+    removeObjects(result.paths).catch((error: unknown) => logger.warn({ err: error, commentId }, "Comment attachment cleanup failed"));
+  }
+  const projectId = result.projectId;
   publishTimeline(projectId, taskId, context.user.id);
   return { ok: true as const };
 };

@@ -13,20 +13,22 @@ import {
   type AuthenticatedRequest
 } from "../../middleware/auth.js";
 import { issueCsrfToken } from "../../middleware/csrf.js";
-import { createLoginRateLimit } from "../../middleware/rate-limit.js";
+import { disconnectRooms, sessionRoom } from "../../realtime/publisher.js";
+import { createLoginAccountRateLimit, createLoginRateLimit } from "../../middleware/rate-limit.js";
 import { accessTokenCookieName, clearAuthCookies, refreshTokenCookieName, setAuthCookies } from "./auth.cookies.js";
 import { refreshAuthSession, revokeAuthSession, signInWithPassword } from "./supabase-auth.service.js";
 
 export const createAuthRoutes = (): ExpressRouter => {
   const authRoutes = Router();
   const loginRateLimit = createLoginRateLimit();
+  const loginAccountRateLimit = createLoginAccountRateLimit();
 
   authRoutes.get("/auth/csrf", (req, res) => {
     res.setHeader("cache-control", "no-store");
     res.json({ csrfToken: issueCsrfToken(req, res) });
   });
 
-  authRoutes.post("/auth/login", loginRateLimit, async (req, res, next) => {
+  authRoutes.post("/auth/login", loginRateLimit, loginAccountRateLimit, async (req, res, next) => {
     try {
       const input = LoginRequestSchema.parse(req.body);
       const session = await signInWithPassword(input);
@@ -57,7 +59,10 @@ export const createAuthRoutes = (): ExpressRouter => {
     try {
       const accessToken = getAccessTokenFromRequest(req) ?? readCookie(req, accessTokenCookieName);
       clearAuthCookies(res);
-      await revokeAuthSession(accessToken);
+      const sessionId = await revokeAuthSession(accessToken);
+      if (sessionId) {
+        disconnectRooms([sessionRoom(sessionId)]);
+      }
       res.json(LogoutResponseSchema.parse({ ok: true }));
     } catch (error) {
       clearAuthCookies(res);

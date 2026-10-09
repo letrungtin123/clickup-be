@@ -25,6 +25,10 @@ const EnvSchema = z
     RATE_LIMIT_WINDOW_MS: z.coerce.number().int().min(1000).default(60_000),
     RATE_LIMIT_MAX: z.coerce.number().int().min(1).default(300),
     LOGIN_RATE_LIMIT_MAX: z.coerce.number().int().min(1).default(10),
+    /** Failed sign-ins per account (any IP) before a temporary lockout. */
+    LOGIN_ACCOUNT_LIMIT_MAX: z.coerce.number().int().min(1).default(20),
+    /** Reverse-proxy hops in front of the API whose X-Forwarded-For is trusted. */
+    TRUST_PROXY_HOPS: z.coerce.number().int().min(0).max(5).default(1),
     REDIS_URL: z.string().url().optional(),
     RABBITMQ_URL: z.string().url().optional(),
     ACCESS_CONTEXT_CACHE_TTL_SECONDS: z.coerce.number().int().min(0).max(3600).default(60)

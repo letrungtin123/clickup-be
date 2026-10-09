@@ -1,0 +1,10 @@
+import { session } from "./lib.mjs";
+const ok = (label, cond, extra = "") => console.log(`${cond ? "PASS" : "FAIL"}  ${label} ${extra}`);
+const mgr = await session("MANAGER");
+let r = await mgr.call("GET", "/tasks/mine?limit=5");
+ok("my tasks (PERF assigned to manager)", r.status === 200 && r.body.items.length === 5, `${r.body.items?.[0]?.key} due ${r.body.items?.[0]?.dueAt}`);
+const t0 = performance.now();
+r = await mgr.call("GET", `/tasks/mine?limit=50&cursor=${r.body.pageInfo.nextCursor}`);
+ok("page 2", r.status === 200 && r.body.items.length === 50, `${(performance.now() - t0).toFixed(0)}ms`);
+r = await mgr.call("GET", "/tasks/mine?due=overdue&limit=10&sort=priority");
+ok("overdue by priority", r.status === 200, `${r.body.items?.length} items`);
