@@ -69,3 +69,23 @@ describe("enqueueNotificationEmails", () => {
     expect(db.state.calls.some((call) => call.text.startsWith("INSERT INTO public.outbox_events"))).toBe(true);
   });
 });
+
+describe("enqueueNotificationEmails — knowledge base (PD-031)", () => {
+  it("queues @mentions and critical new versions, never other knowledge notices", async () => {
+    db.state.rows = [{ id: "ffffffff-ffff-4fff-8fff-ffffffffffff", recipient_user_id: user }];
+    const queued = await enqueueNotificationEmails(org, [
+      { ...row("ffffffff-ffff-4fff-8fff-ffffffffffff", "knowledge.updated"), payload: { criticalVersion: true } },
+      { ...row("12121212-1212-4121-8121-121212121212", "knowledge.updated"), payload: { broadcast: true } },
+      row("13131313-1313-4131-8131-131313131313", "knowledge.commented"),
+      row("14141414-1414-4141-8141-141414141414", "knowledge.mentioned")
+    ]);
+    expect(queued).toBe(1);
+    const update = db.state.calls.find((call) => call.text.startsWith("UPDATE public.notifications"))!;
+    expect(update.values[0]).toEqual(["ffffffff-ffff-4fff-8fff-ffffffffffff", "14141414-1414-4141-8141-141414141414"]);
+    // The statement re-checks the type, or the critical-version payload of knowledge.updated.
+    expect(update.text).toContain("n.payload @>");
+    expect(update.values).toContain("knowledge.updated");
+    expect(update.values).toContain(JSON.stringify({ criticalVersion: true }));
+    expect(update.values[1] as string[]).not.toContain("knowledge.updated");
+  });
+});

@@ -40,6 +40,22 @@ export const notificationTypes = [
    */
   "production.leader_removed",
   /**
+   * Knowledge base (PD-031). Target: knowledgeSpaceId + knowledgeItemId (+ commentId for comments). Payload:
+   * { spaceName, importance, ... }. E-mailed only: knowledge.mentioned, and knowledge.updated when
+   * payload.criticalVersion is true (new version of an active "Rất quan trọng" item).
+   *   knowledge.mentioned          payload.source "comment" | "body"
+   *   knowledge.commented / replied  followers / the parent comment's author
+   *   knowledge.updated            payload { version, newVersion, published, broadcast, criticalVersion }
+   *   knowledge.status_changed     payload { statusName, statusGroup }
+   *   knowledge.approval_requested to space managers; payload { statusName }
+   */
+  "knowledge.mentioned",
+  "knowledge.commented",
+  "knowledge.replied",
+  "knowledge.updated",
+  "knowledge.status_changed",
+  "knowledge.approval_requested",
+  /**
    * Ops alert to production Admins + organization admins: a worker queue parked messages it could not process.
    * Payload: { queue, count }. At most one per queue per hour. Web only (never e-mailed).
    */
@@ -57,7 +73,10 @@ export const NotificationTargetSchema = z.object({
   messageId: Id.nullable(),
   /** Production module targets (production.* types). */
   productionTaskId: Id.nullable().default(null),
-  jobId: Id.nullable().default(null)
+  jobId: Id.nullable().default(null),
+  /** Knowledge base targets (knowledge.* types): the item page (FE route /k/<spaceId>/i/<itemId>). */
+  knowledgeSpaceId: Id.nullable().default(null),
+  knowledgeItemId: Id.nullable().default(null)
 });
 
 export const NotificationSchema = z.object({

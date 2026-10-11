@@ -9,7 +9,7 @@ import type { QuerySql } from "./db-types.js";
  */
 export type RankScope = {
   /** Fully qualified table, e.g. "public.tasks". Never user input. */
-  table: "public.tasks" | "public.lists" | "public.projects";
+  table: "public.tasks" | "public.lists" | "public.projects" | "knowledge.spaces" | "knowledge.categories";
   /** Static SQL predicate columns and their values that define the sibling set. */
   where: Record<string, string | null>;
   /** Row being moved (excluded from neighbour lookups). */
@@ -18,9 +18,12 @@ export type RankScope = {
 
 type Neighbour = { rank: string } | undefined;
 
+/** Tables whose rows are never soft-deleted or archived (no deleted_at / archived_at columns). */
+const tablesWithoutSoftDelete = new Set<RankScope["table"]>(["knowledge.categories"]);
+
 const buildWhere = (sql: QuerySql, scope: RankScope) => {
   const entries = Object.entries(scope.where);
-  let fragment = sql`deleted_at IS NULL AND archived_at IS NULL`;
+  let fragment = tablesWithoutSoftDelete.has(scope.table) ? sql`TRUE` : sql`deleted_at IS NULL AND archived_at IS NULL`;
   for (const [column, value] of entries) {
     fragment =
       value === null

@@ -1,6 +1,7 @@
 import { getSql } from "../../db/client.js";
 import { logger } from "../../lib/logger.js";
 import type { DomainEventEnvelope } from "../events/outbox.js";
+import { knowledgeNotificationHandlers } from "../knowledge/notifications.js";
 import { productionNotificationHandlers } from "../production/notifications.js";
 import { deliverNotifications, refreshNotificationExcerpts, removeNotificationsAbout } from "./notifications.service.js";
 
@@ -424,6 +425,8 @@ const handlers: Record<string, Handler> = {
 
 // Production module events (PLAN §8) share the notifications consumer.
 Object.assign(handlers, productionNotificationHandlers);
+// Knowledge base events (PD-031).
+Object.assign(handlers, knowledgeNotificationHandlers);
 
 export const notificationBindings = Object.keys(handlers);
 

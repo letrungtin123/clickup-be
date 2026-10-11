@@ -65,7 +65,7 @@ const runLatenessScan = () => {
     await closeDatabase();
     await closeRedis();
   `;
-  const result = spawnSync(process.execPath, ["node_modules/tsx/dist/cli.mjs", "--input-type=module", "--eval", code], { cwd: backendRoot, encoding: "utf8", timeout: 90_000 });
+  const result = spawnSync(process.execPath, ["node_modules/tsx/dist/cli.mjs", "--input-type=module", "--eval", code], { cwd: backendRoot, encoding: "utf8", timeout: 90_000, env: { ...process.env, DB_POOL_MAX: "2" } });
   if (result.status !== 0) {
     console.log(`WARN lateness scan exited ${result.status}: ${(result.stderr || "").split("\n").slice(-3).join(" ")}`);
   }

@@ -400,11 +400,10 @@ try {
   }
 
   // --- Rate limit (last: it burns B's quota) -------------------------------------------------------
-  let limited = null;
-  for (let i = 0; i < 22 && !limited; i += 1) {
-    const res = await send(B, DM.id, `burst ${i}`);
-    if (res.status === 429) limited = res;
-  }
+  // The quota is 20 sends per 10 s window: send the burst in parallel so it always lands in one window, even when
+  // a loaded full run makes sequential sends slow enough to straddle two windows.
+  const burst = await Promise.all(Array.from({ length: 24 }, (_, i) => send(B, DM.id, `burst ${i}`)));
+  const limited = burst.find((res) => res.status === 429) ?? null;
   check("send rate limit 429 CHAT_RATE_LIMITED", limited?.body?.error?.code === "CHAT_RATE_LIMITED", limited);
 
   // --- Delete channel ----------------------------------------------------------------------------

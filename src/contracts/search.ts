@@ -8,7 +8,8 @@ import { ColorTokenSchema, TaskStatusRefSchema, UserRefSchema } from "./work.js"
 const Id = z.string().uuid();
 const IsoDate = z.string().datetime({ offset: true });
 
-export const searchGroups = ["tasks", "projects", "lists", "people", "messages"] as const;
+/** "knowledge": knowledge items the caller can read (PD-031): active + retired for readers, drafts for submit+. */
+export const searchGroups = ["tasks", "projects", "lists", "people", "messages", "knowledge"] as const;
 export const SearchGroupSchema = z.enum(searchGroups);
 export type SearchGroup = z.infer<typeof SearchGroupSchema>;
 
@@ -50,12 +51,26 @@ export const MessageSearchHitSchema = z.object({
   createdAt: IsoDate
 });
 
+/** Knowledge item hit: active first, drafts next (submit+ only), retired ("Hết hiệu lực") last. Open the item page (FE route /k/<spaceId>/i/<id>). */
+export const KnowledgeSearchHitSchema = z.object({
+  id: Id,
+  spaceId: Id,
+  spaceName: z.string(),
+  title: z.string(),
+  summary: z.string().nullable(),
+  importance: z.enum(["normal", "important", "critical"]),
+  status: z.object({ id: Id, name: z.string(), color: ColorTokenSchema, group: z.enum(["draft", "active", "retired"]) }),
+  updatedAt: IsoDate
+});
+export type KnowledgeSearchHit = z.infer<typeof KnowledgeSearchHitSchema>;
+
 export const GlobalSearchResultSchema = z.object({
   tasks: z.array(TaskSearchHitSchema),
   projects: z.array(ProjectSearchHitSchema),
   lists: z.array(ListSearchHitSchema),
   people: z.array(UserRefSchema),
-  messages: z.array(MessageSearchHitSchema)
+  messages: z.array(MessageSearchHitSchema),
+  knowledge: z.array(KnowledgeSearchHitSchema).default([])
 });
 export type GlobalSearchResult = z.infer<typeof GlobalSearchResultSchema>;
 export type MessageSearchHit = z.infer<typeof MessageSearchHitSchema>;

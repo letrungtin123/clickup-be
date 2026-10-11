@@ -136,6 +136,72 @@ export const purgeProductionProjects = (projectIds) => {
   `);
 };
 
+/**
+ * Hard-deletes knowledge spaces of the knowledge suite ("E2E KB …", created by a dev account) with everything in them
+ * and every notification about them. Replica mode: item_versions and audit_log are append-only by trigger (e2e
+ * fixtures only); FK actions are off too, so every table is deleted explicitly. Upload objects are removed by the
+ * suite through the API first (cleanupKnowledgeSpaces).
+ */
+export const purgeKnowledgeSpaces = (spaceIds) => {
+  const ids = sqlList(spaceIds);
+  if (!ids) return;
+  const set = sqlList(localSql(`SELECT id FROM knowledge.spaces WHERE id IN (${ids}) AND created_by IN ${devUsers} AND name ~ '^E2E KB '`));
+  if (!set) return;
+  localSql(`
+    BEGIN;
+    SET LOCAL session_replication_role = replica;
+    DELETE FROM public.notifications WHERE type LIKE 'knowledge.%' AND payload->>'knowledgeSpaceId' IN (${set});
+    DELETE FROM knowledge.audit_log WHERE space_id IN (${set});
+    DELETE FROM knowledge.item_attachments WHERE space_id IN (${set});
+    DELETE FROM knowledge.followers WHERE space_id IN (${set});
+    DELETE FROM knowledge.comments WHERE space_id IN (${set});
+    DELETE FROM knowledge.item_versions WHERE space_id IN (${set});
+    DELETE FROM knowledge.items WHERE space_id IN (${set});
+    DELETE FROM knowledge.categories WHERE space_id IN (${set});
+    DELETE FROM knowledge.statuses WHERE space_id IN (${set});
+    DELETE FROM knowledge.space_members WHERE space_id IN (${set});
+    DELETE FROM knowledge.spaces WHERE id IN (${set});
+    COMMIT;
+  `);
+};
+
+/** Suite cleanup for knowledge spaces: uploaded objects through the API, then wait for notifications, then hard delete. */
+export const cleanupKnowledgeSpaces = async (s, spaceIds, since) => {
+  const ids = spaceIds.filter(Boolean);
+  if (ids.length === 0) return;
+  const files = localSql(`
+    SELECT a.id || '|' || a.item_id || '|' || (i.deleted_at IS NOT NULL)::text
+    FROM knowledge.item_attachments a JOIN knowledge.items i ON i.id = a.item_id
+    WHERE a.space_id IN (${sqlList(ids)}) AND a.deleted_at IS NULL
+  `).map((row) => row.split("|"));
+  for (const [attachmentId, itemId, trashed] of files) {
+    try {
+      if (trashed === "true") {
+        await s.call("POST", `/knowledge/items/${itemId}/purge`, { reason: "Dọn dữ liệu e2e" });
+      } else {
+        await s.call("DELETE", `/knowledge/attachments/${attachmentId}`);
+      }
+    } catch {
+      // API unreachable: the SQL purge below still removes the rows (the objects stay in the bucket).
+    }
+  }
+  await settleOutbox(since);
+  purgeKnowledgeSpaces(ids);
+};
+
+/**
+ * Knowledge permissions the knowledge suite granted to a dev account's role for its run (granted_by = that dev
+ * account): removed again by the suite, or here when it crashed. knowledge.view is never touched.
+ */
+export const revokeSuiteKnowledgeGrants = () =>
+  localSql(`
+    DELETE FROM public.role_permissions
+    WHERE permission_key IN ('knowledge.create', 'knowledge.update', 'knowledge.delete', 'knowledge.manage_members')
+      AND granted_by IN ${devUsers}
+      AND role_id IN (SELECT id FROM public.roles WHERE key IN ('manager', 'member', 'truong_nhom_du_an'))
+    RETURNING role_id
+  `);
+
 /** Soft-deletes accounts created by members.e2e (never the seeded dev accounts, superadmins or @test.local). */
 export const softDeleteTestAccounts = (emails) => {
   const set = sqlList(emails.map((email) => email.toLowerCase()));
@@ -284,6 +350,18 @@ export const sweepLeftovers = async () => {
   `);
   purgeChannels(channels);
   note("channels/DMs", channels.length);
+
+  // Knowledge spaces of the knowledge suite and the permissions it granted for its run.
+  const knowledgeSpaces = localSql(`SELECT id FROM knowledge.spaces WHERE created_by IN ${devUsers} AND name ~ '^E2E KB '`);
+  if (knowledgeSpaces.length > 0) {
+    purgeKnowledgeSpaces(knowledgeSpaces);
+    note("knowledge spaces", knowledgeSpaces.length);
+  }
+  const grants = count(revokeSuiteKnowledgeGrants());
+  if (grants > 0) {
+    bumpAuthz();
+    note("knowledge permission grants", grants);
+  }
 
   // Accounts created by members.e2e / accounts.e2e.
   const accounts = localSql(`

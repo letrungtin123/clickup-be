@@ -58,7 +58,14 @@ export const createApp = (): Express => {
       }
     })
   );
-  app.use(express.json({ limit: "1mb" }));
+  // Knowledge item bodies (long articles with tables, PD-031) may be larger than any other JSON request.
+  const defaultJson = express.json({ limit: "1mb" });
+  const knowledgeItemJson = express.json({ limit: "4mb" });
+  const knowledgeItemPath = /^\/api\/v1\/knowledge\/(?:spaces\/[^/]+\/items|items\/[^/]+)\/?$/;
+  app.use((req, res, next) => {
+    const parse = (req.method === "POST" || req.method === "PATCH") && knowledgeItemPath.test(req.path) ? knowledgeItemJson : defaultJson;
+    parse(req, res, next);
+  });
   app.use(healthRoutes);
   app.use("/api/v1", createApiRateLimit(), requireCsrf, createApiRoutes());
   app.use(notFound);

@@ -52,7 +52,7 @@ try {
   const scan = spawnSync(process.execPath, [
     "--import", "tsx", "--input-type=module", "-e",
     "const m = await import('./src/modules/notifications/deadline-scheduler.ts'); const first = await m.runDeadlineScan(); const second = await m.runDeadlineScan(); console.log('SCAN ' + JSON.stringify({ first, second })); process.exit(0);"
-  ], { cwd: process.cwd(), encoding: "utf8", timeout: 60_000, env: { ...process.env, LOG_LEVEL: "silent" } });
+  ], { cwd: process.cwd(), encoding: "utf8", timeout: 60_000, env: { ...process.env, LOG_LEVEL: "silent", DB_POOL_MAX: "2" } });
   const scanLine = (scan.stdout ?? "").split(/\r?\n/).find((line) => line.startsWith("SCAN ")) ?? "";
   ok("deadline scan runs (set-based)", scan.status === 0 && scanLine.length > 0, scanLine || (scan.stderr ?? "").split(/\r?\n/).slice(-3).join(" "));
   const reminders = localSql(`

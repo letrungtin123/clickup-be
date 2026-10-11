@@ -8,11 +8,30 @@ import { notificationTypes, type NotificationType } from "../../contracts/notifi
  * covers chat @mentions, thread replies and being added to a channel — and system alerts stay in the app (an
  * SMTP problem must not feed its own alert loop). Web delivery is unaffected: every type is always in the inbox.
  */
-const neverEmailed = (type: string) => type.startsWith("chat.") || type.startsWith("channel.") || type.startsWith("system.");
+const knowledgeAlwaysEmailed = new Set<string>(["knowledge.mentioned"]);
+
+const neverEmailed = (type: string) =>
+  type.startsWith("chat.") ||
+  type.startsWith("channel.") ||
+  type.startsWith("system.") ||
+  // Knowledge base (PD-031): only @mentions always; new versions of critical items by payload (below).
+  (type.startsWith("knowledge.") && !knowledgeAlwaysEmailed.has(type));
 
 export const emailableNotificationTypes: readonly NotificationType[] = notificationTypes.filter((type) => !neverEmailed(type));
 
 export const isEmailableNotificationType = (type: string) => (emailableNotificationTypes as readonly string[]).includes(type);
+
+/**
+ * E-mailed only with this payload (PD-031): knowledge.updated for a new version of an active "Rất quan trọng" item
+ * (payload.criticalVersion = true). Every other knowledge.updated (and status / comment / approval notice) stays in
+ * the inbox and the bell.
+ */
+export const conditionalEmailType = "knowledge.updated";
+export const conditionalEmailPayload = { criticalVersion: true } as const;
+
+/** Whether one notification row may be e-mailed: its type, or the critical-version payload of knowledge.updated. */
+export const isEmailableNotification = (row: { type: string; payload?: Record<string, unknown> | null }) =>
+  isEmailableNotificationType(row.type) || (row.type === conditionalEmailType && row.payload?.criticalVersion === true);
 
 /**
  * Digest policy (PD-013, SPEC §6): at most one notification e-mail per user per window. The window

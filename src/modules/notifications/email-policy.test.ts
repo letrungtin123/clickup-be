@@ -2,7 +2,15 @@ import { describe, expect, it } from "vitest";
 
 import { emailConfigured, isDeliverableAddress, isPermanentMailError, PermanentMailError, toSubjectLine } from "../../lib/mailer.js";
 import { notificationTypes } from "../../contracts/notifications.js";
-import { createMemoryWindowStore, digestWindowKey, emailableNotificationTypes, isEmailableNotificationType, recipientSkipReason } from "./email-policy.js";
+import {
+  conditionalEmailType,
+  createMemoryWindowStore,
+  digestWindowKey,
+  emailableNotificationTypes,
+  isEmailableNotification,
+  isEmailableNotificationType,
+  recipientSkipReason
+} from "./email-policy.js";
 
 describe("emailConfigured", () => {
   it("is on only when both SMTP_HOST and SMTP_FROM are set", () => {
@@ -124,5 +132,27 @@ describe("which notification types may be e-mailed (SPEC: chat never e-mails)", 
     expect(emailableNotificationTypes.every((type) => (notificationTypes as readonly string[]).includes(type))).toBe(true);
     expect(emailableNotificationTypes.some((type) => type.startsWith("chat.") || type.startsWith("channel."))).toBe(false);
     expect(isEmailableNotificationType("something.new")).toBe(false);
+  });
+});
+
+describe("knowledge base e-mails (PD-031: only @mentions and new versions of critical items)", () => {
+  it("e-mails knowledge @mentions", () => {
+    expect(isEmailableNotificationType("knowledge.mentioned")).toBe(true);
+    expect(isEmailableNotification({ type: "knowledge.mentioned", payload: {} })).toBe(true);
+  });
+
+  it("keeps comments, replies, status changes and approval requests in the app", () => {
+    for (const type of ["knowledge.commented", "knowledge.replied", "knowledge.status_changed", "knowledge.approval_requested"]) {
+      expect(isEmailableNotificationType(type)).toBe(false);
+      expect(isEmailableNotification({ type, payload: { criticalVersion: true } })).toBe(false);
+    }
+  });
+
+  it("e-mails knowledge.updated only for a new version of a critical item", () => {
+    expect(isEmailableNotificationType("knowledge.updated")).toBe(false);
+    expect(isEmailableNotification({ type: "knowledge.updated", payload: { criticalVersion: true } })).toBe(true);
+    expect(isEmailableNotification({ type: "knowledge.updated", payload: { criticalVersion: false, broadcast: true } })).toBe(false);
+    expect(isEmailableNotification({ type: "knowledge.updated" })).toBe(false);
+    expect(conditionalEmailType).toBe("knowledge.updated");
   });
 });

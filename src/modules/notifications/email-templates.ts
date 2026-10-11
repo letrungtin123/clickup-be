@@ -82,6 +82,13 @@ const formatDay = (value: unknown) => {
 
 /** Web path a notification opens (relative to APP_PUBLIC_URL). */
 export const notificationPath = (notification: EmailNotification) => {
+  // Knowledge base (PD-031): the item page /k/<space>/i/<item> (FE route), on the comments tab for a comment.
+  const knowledgeSpaceId = uuid(notification.payload.knowledgeSpaceId);
+  const knowledgeItemId = uuid(notification.payload.knowledgeItemId);
+  if (knowledgeSpaceId && knowledgeItemId) {
+    const commentId = uuid(notification.payload.commentId);
+    return `/k/${knowledgeSpaceId}/i/${knowledgeItemId}${commentId ? `?tab=comments&comment=${commentId}` : ""}`;
+  }
   const productionTaskId = uuid(notification.payload.productionTaskId);
   if (productionTaskId) {
     return `/production/tasks/${productionTaskId}`;
@@ -164,6 +171,23 @@ const taskFacts = (c: Context): Fact[] => [
   ["Công việc", c.title],
   ["Dự án", c.projectName]
 ];
+
+const importanceLabels: Record<string, string> = { normal: "Bình thường", important: "Quan trọng", critical: "Rất quan trọng" };
+
+/** Knowledge item templates: "Kho" and "Mức quan trọng" facts, the item title in the subject. */
+const knowledgeTemplate = (n: EmailNotification, c: Context, headline: string, excerpt: string | null = null): Template => {
+  const importance = text(n.payload.importance);
+  return {
+    headline,
+    subject: `${headline}: ${c.title}`,
+    facts: [
+      ["Mục", c.title],
+      ["Kho", text(n.payload.spaceName)],
+      ["Mức quan trọng", importance ? (importanceLabels[importance] ?? null) : null]
+    ],
+    excerpt
+  };
+};
 
 const leaveParts: Record<string, string> = { FULL_DAY: "Cả ngày", MORNING: "Buổi sáng", AFTERNOON: "Buổi chiều" };
 
@@ -318,6 +342,25 @@ const templates = {
       excerpt: c.excerpt
     };
   },
+  // Knowledge base (PD-031). E-mailed: knowledge.mentioned, and knowledge.updated for critical new versions.
+  "knowledge.mentioned": (n, c) => knowledgeTemplate(n, c, `${c.actor} đã nhắc đến bạn trong mục tri thức`, c.excerpt),
+  "knowledge.commented": (n, c) => knowledgeTemplate(n, c, `${c.actor} đã bình luận trong mục tri thức`, c.excerpt),
+  "knowledge.replied": (n, c) => knowledgeTemplate(n, c, `${c.actor} đã trả lời bình luận của bạn`, c.excerpt),
+  "knowledge.updated": (n, c) => {
+    const version = num(n.payload.version);
+    const headline =
+      n.payload.criticalVersion === true
+        ? `Mục "Rất quan trọng" có phiên bản mới${version !== null ? ` (v${version})` : ""}`
+        : n.payload.published === true && n.payload.newVersion !== true
+          ? `${c.actor} đã ban hành mục tri thức`
+          : `${c.actor} đã cập nhật mục tri thức${version !== null ? ` (v${version})` : ""}`;
+    return knowledgeTemplate(n, c, headline);
+  },
+  "knowledge.status_changed": (n, c) => {
+    const status = text(n.payload.statusName);
+    return knowledgeTemplate(n, c, status ? `${c.actor} đã chuyển mục tri thức sang ${status}` : `${c.actor} đã đổi trạng thái mục tri thức`);
+  },
+  "knowledge.approval_requested": (n, c) => knowledgeTemplate(n, c, `${c.actor} gửi duyệt mục tri thức`),
   // Never e-mailed (email-policy.ts); present so every type renders.
   "system.dead_letter": (n, c) => {
     const queue = text(n.payload.queue);

@@ -2,6 +2,7 @@ import { Router, type Router as ExpressRouter } from "express";
 
 import { createAuthRoutes } from "./modules/auth/auth.routes.js";
 import { createChatRoutes } from "./modules/chat/chat.routes.js";
+import { createKnowledgeRoutes } from "./modules/knowledge/knowledge.routes.js";
 import { metaRoutes } from "./modules/meta/meta.routes.js";
 import { createNotificationRoutes } from "./modules/notifications/notifications.routes.js";
 import "./modules/production/unique-errors.js";
@@ -26,6 +27,8 @@ export const createApiRoutes = (): ExpressRouter => {
   apiRoutes.use(createSearchRoutes());
   // Chat routes are mounted here by the chat module (createChatRoutes).
   apiRoutes.use(createChatRoutes());
+  // Knowledge base (PD-031).
+  apiRoutes.use(createKnowledgeRoutes());
   apiRoutes.use(createProductionRoutes());
   apiRoutes.use(createProductionScoreRoutes());
   apiRoutes.use(createProductionReportRoutes()); // before the job routes: /production/jobs/export

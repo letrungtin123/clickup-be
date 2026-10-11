@@ -225,3 +225,38 @@ describe("renderDigestEmail", () => {
     expect(mail.html.match(/Mở trong Nesso Work/g)).toHaveLength(3);
   });
 });
+
+describe("knowledge base notifications (PD-031)", () => {
+  const space = "88888888-8888-4888-8888-888888888888";
+  const item = "99999999-9999-4999-8999-999999999999";
+  const comment = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  const knowledge = (type: string, payload: Record<string, unknown> = {}) =>
+    make({
+      type,
+      title: "Quy trình retouch",
+      body: "Bước 3 thiếu",
+      payload: { knowledgeSpaceId: space, knowledgeItemId: item, spaceName: "Quy trình Sản xuất", importance: "critical", ...payload }
+    });
+
+  it("links to the item page, and to the comment when there is one", () => {
+    expect(notificationPath(knowledge("knowledge.updated"))).toBe(`/k/${space}/i/${item}`);
+    expect(notificationPath(knowledge("knowledge.mentioned", { commentId: comment }))).toBe(`/k/${space}/i/${item}?tab=comments&comment=${comment}`);
+    expect(notificationPath(knowledge("knowledge.updated", { knowledgeItemId: "../x" }))).toBe("/inbox");
+  });
+
+  it("renders Vietnamese headlines with the space and the importance", () => {
+    const mentioned = renderNotificationSection(knowledge("knowledge.mentioned", { commentId: comment }), base);
+    expect(mentioned.headline).toBe("Linh đã nhắc đến bạn trong mục tri thức");
+    expect(mentioned.subject).toBe("Linh đã nhắc đến bạn trong mục tri thức: Quy trình retouch");
+    expect(mentioned.facts).toContainEqual({ label: "Kho", value: "Quy trình Sản xuất" });
+    expect(mentioned.facts).toContainEqual({ label: "Mức quan trọng", value: "Rất quan trọng" });
+    expect(mentioned.excerpt).toBe("Bước 3 thiếu");
+    expect(renderNotificationSection(knowledge("knowledge.updated", { criticalVersion: true, version: 4 }), base).headline).toBe(
+      'Mục "Rất quan trọng" có phiên bản mới (v4)'
+    );
+    expect(renderNotificationSection(knowledge("knowledge.status_changed", { statusName: "Đã ban hành" }), base).headline).toBe(
+      "Linh đã chuyển mục tri thức sang Đã ban hành"
+    );
+    expect(renderNotificationSection(knowledge("knowledge.approval_requested"), base).headline).toBe("Linh gửi duyệt mục tri thức");
+  });
+});

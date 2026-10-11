@@ -7,9 +7,12 @@ import { z } from "zod";
  * Shared verbatim between FE and BE.
  */
 
+/** Attribute values; `number[]` only for table cell `colwidth` (knowledge profile). */
+export type RichTextAttrValue = string | number | boolean | null | number[];
+
 export type RichTextNode = {
   type: string;
-  attrs?: Record<string, string | number | boolean | null>;
+  attrs?: Record<string, RichTextAttrValue>;
   content?: RichTextNode[];
   marks?: { type: string; attrs?: Record<string, string | null> }[];
   text?: string;
@@ -59,6 +62,49 @@ export const commentLimits: SanitizeLimits = { maxTextLength: 20_000, maxNodes: 
 export const descriptionLimits: SanitizeLimits = { maxTextLength: 100_000, maxNodes: 20_000, maxDepth: 12, maxMentions: 50 };
 export const messageLimits: SanitizeLimits = { maxTextLength: 10_000, maxNodes: 2_000, maxDepth: 8, maxMentions: 50 };
 
+/**
+ * Knowledge item bodies (PD-031 addendum, 2026-10-11): long articles with tables. The plain text (table cells, image
+ * placeholders and mention labels included) is limited to 200 000 characters (database CHECK on body_text); the
+ * request body of the knowledge item endpoints may be up to 4 MB.
+ */
+export const knowledgeBodyLimits: SanitizeLimits = { maxTextLength: 200_000, maxNodes: 60_000, maxDepth: 16, maxMentions: 50 };
+
+/**
+ * Tables and images of the "knowledge" profile (knowledge item bodies only; task descriptions, comments and chat use
+ * the shared schema). Node spec — what the server stores:
+ *
+ *   table        content: tableRow+ (no attrs). ≤ maxTables per document, ≤ maxRows rows, ≤ maxColumns columns
+ *                (column map with colspan / rowspan, like prosemirror-tables). Not allowed inside a table cell.
+ *   tableRow     content: (tableHeader | tableCell)+ (no attrs).
+ *   tableHeader / tableCell
+ *                attrs: { colspan: int 1–maxSpan, rowspan: int 1–maxSpan (clamped to the rows left),
+ *                         colwidth: int[] (length = colspan; 1–maxColumnWidth px, 0 = no fixed width) | null }
+ *                content: (paragraph | heading | bulletList | orderedList | blockquote)+ — an empty cell gets an
+ *                empty paragraph; inside a cell a codeBlock becomes a paragraph, a taskList a bulletList, and tables,
+ *                images and horizontal rules are dropped.
+ *   image        block leaf. attrs: { attachmentId: uuid (required, lower case), alt: string ≤ imageAltLength | null,
+ *                width: int imageMinWidth–imageMaxWidth | null }. Never a `src` or any other attribute (no URL is ever
+ *                stored: the client asks POST /knowledge/attachments/urls). Allowed wherever a block is (document,
+ *                blockquote, list items) except table cells; ≤ maxImages distinct attachments per document.
+ *
+ * Plain text: each table row is one line "cell | cell | cell" (cell blocks joined by spaces), an image reads
+ * "[Ảnh: alt]" (or "[Ảnh]"). @mentions inside cells work as anywhere else.
+ */
+export const knowledgeBodySpec = {
+  maxTables: 20,
+  maxRows: 60,
+  maxColumns: 12,
+  maxSpan: 12,
+  maxColumnWidth: 2000,
+  maxImages: 100,
+  imageAltLength: 200,
+  imageMinWidth: 40,
+  imageMaxWidth: 2000
+} as const;
+
+/** "default" = the shared schema; "knowledge" = also tables and images (knowledgeBodySpec). */
+export type RichTextProfile = "default" | "knowledge";
+
 export class RichTextError extends Error {
   constructor(message: string) {
     super(message);
@@ -66,7 +112,13 @@ export class RichTextError extends Error {
   }
 }
 
-export type SanitizeResult = { doc: RichTextDoc; text: string; mentions: string[] };
+export type SanitizeResult = {
+  doc: RichTextDoc;
+  text: string;
+  mentions: string[];
+  /** "knowledge" profile only: attachment ids of the images, unique, in document order. */
+  images?: string[];
+};
 
 export type SanitizeOptions = {
   /**
@@ -74,20 +126,55 @@ export type SanitizeOptions = {
    * from here (clients cannot spoof "@CEO"), and mentions of ids missing from the map become plain text.
    */
   mentionLabels?: ReadonlyMap<string, string>;
+  /** "knowledge" also keeps tables and images (knowledge item bodies only). Default: the shared schema. */
+  profile?: RichTextProfile;
 };
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
+
+/** Blocks a table cell may hold (knowledge profile). */
+const cellBlockTypes = new Set(["paragraph", "heading", "bulletList", "orderedList", "listItem", "blockquote"]);
+
+const clampInt = (value: unknown, min: number, max: number): number | null =>
+  typeof value === "number" && Number.isFinite(value) ? Math.min(max, Math.max(min, Math.round(value))) : null;
+
+/** Cell column widths: one entry per spanned column, 0 = no fixed width; null when nothing is set. */
+const sanitizeColwidth = (raw: unknown, colspan: number): number[] | null => {
+  if (!Array.isArray(raw)) {
+    return null;
+  }
+  const entries: unknown[] = raw;
+  const widths: number[] = [];
+  for (let index = 0; index < colspan; index += 1) {
+    const value = entries[index];
+    widths.push(typeof value === "number" && Number.isFinite(value) && value >= 1 ? Math.min(knowledgeBodySpec.maxColumnWidth, Math.round(value)) : 0);
+  }
+  return widths.some((width) => width > 0) ? widths : null;
+};
 
 export const sanitizeRichText = (input: unknown, limits: SanitizeLimits, options: SanitizeOptions = {}): SanitizeResult => {
   if (!isRecord(input) || input.type !== "doc") {
     throw new RichTextError("Document must be a rich text doc.");
   }
 
+  const knowledge = options.profile === "knowledge";
   let nodeCount = 0;
   let textLength = 0;
+  let tableCount = 0;
   const mentions = new Set<string>();
+  const images = new Set<string>();
   const textParts: string[] = [];
+
+  const enter = (depth: number) => {
+    nodeCount += 1;
+    if (nodeCount > limits.maxNodes) {
+      throw new RichTextError("Document is too large.");
+    }
+    if (depth > limits.maxDepth) {
+      throw new RichTextError("Document is nested too deeply.");
+    }
+  };
 
   const sanitizeMarks = (raw: unknown): RichTextNode["marks"] => {
     if (!Array.isArray(raw)) {
@@ -111,19 +198,126 @@ export const sanitizeRichText = (input: unknown, limits: SanitizeLimits, options
     return marks.length > 0 ? marks : undefined;
   };
 
-  const visit = (raw: unknown, depth: number, inline: boolean): RichTextNode | null => {
+  /** Image block (knowledge profile): the attachment id, an optional alt text and display width — nothing else. */
+  const visitImage = (raw: Record<string, unknown>): RichTextNode | null => {
+    const attrs = isRecord(raw.attrs) ? raw.attrs : {};
+    const id = typeof attrs.attachmentId === "string" ? attrs.attachmentId : "";
+    if (!uuidPattern.test(id)) {
+      return null;
+    }
+    const attachmentId = id.toLowerCase();
+    images.add(attachmentId);
+    if (images.size > knowledgeBodySpec.maxImages) {
+      throw new RichTextError(`Nội dung có tối đa ${knowledgeBodySpec.maxImages} ảnh.`);
+    }
+    const alt =
+      typeof attrs.alt === "string"
+        ? attrs.alt.replace(labelControlCharacters, " ").replace(/\s+/g, " ").trim().slice(0, knowledgeBodySpec.imageAltLength).trim()
+        : "";
+    const width = clampInt(attrs.width, knowledgeBodySpec.imageMinWidth, knowledgeBodySpec.imageMaxWidth);
+    const placeholder = alt.length > 0 ? `[Ảnh: ${alt}]` : "[Ảnh]";
+    textLength += placeholder.length;
+    textParts.push(placeholder, "\n");
+    return { type: "image", attrs: { attachmentId, alt: alt.length > 0 ? alt : null, width } };
+  };
+
+  /** Table cell: block content (cellBlockTypes); its text becomes one entry of the row line. */
+  const visitCell = (raw: Record<string, unknown>, type: string, depth: number): RichTextNode => {
+    enter(depth);
+    const attrs = isRecord(raw.attrs) ? raw.attrs : {};
+    const colspan = clampInt(attrs.colspan, 1, knowledgeBodySpec.maxSpan) ?? 1;
+    const rowspan = clampInt(attrs.rowspan, 1, knowledgeBodySpec.maxSpan) ?? 1;
+    const start = textParts.length;
+    const content = sanitizeChildren(raw.content, type, depth + 1, true);
+    const cellText = textParts
+      .splice(start)
+      .join("")
+      .split("\n")
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0)
+      .join(" ");
+    textParts.push(cellText);
+    return {
+      type,
+      attrs: { colspan, rowspan, colwidth: sanitizeColwidth(attrs.colwidth, colspan) },
+      content: content.length > 0 ? content : [{ type: "paragraph" }]
+    };
+  };
+
+  const visitRow = (raw: Record<string, unknown>, depth: number): RichTextNode | null => {
+    enter(depth);
+    const start = textParts.length;
+    const cells: RichTextNode[] = [];
+    for (const child of Array.isArray(raw.content) ? raw.content : []) {
+      if (isRecord(child) && (child.type === "tableCell" || child.type === "tableHeader")) {
+        cells.push(visitCell(child, child.type, depth + 1));
+      }
+    }
+    const cellTexts = textParts.splice(start);
+    if (cells.length === 0) {
+      return null;
+    }
+    textParts.push(`${cellTexts.join(" | ")}\n`);
+    return { type: "tableRow", content: cells };
+  };
+
+  /** Table (knowledge profile): rows of cells; the column map (colspan / rowspan) is at most maxColumns wide. */
+  const visitTable = (raw: Record<string, unknown>, depth: number): RichTextNode | null => {
+    tableCount += 1;
+    if (tableCount > knowledgeBodySpec.maxTables) {
+      throw new RichTextError(`Nội dung có tối đa ${knowledgeBodySpec.maxTables} bảng.`);
+    }
+    const rows: RichTextNode[] = [];
+    for (const child of Array.isArray(raw.content) ? raw.content : []) {
+      if (!isRecord(child) || child.type !== "tableRow") {
+        continue;
+      }
+      const row = visitRow(child, depth + 1);
+      if (!row) {
+        continue;
+      }
+      if (rows.length >= knowledgeBodySpec.maxRows) {
+        throw new RichTextError(`Mỗi bảng có tối đa ${knowledgeBodySpec.maxRows} hàng.`);
+      }
+      rows.push(row);
+    }
+    if (rows.length === 0) {
+      return null;
+    }
+    // Column map like prosemirror-tables: cells fill the first free column; row spans reserve columns below.
+    const occupied: boolean[][] = rows.map(() => []);
+    rows.forEach((row, rowIndex) => {
+      let column = 0;
+      for (const cell of row.content ?? []) {
+        const attrs = cell.attrs!;
+        while (occupied[rowIndex]![column]) {
+          column += 1;
+        }
+        const colspan = attrs.colspan as number;
+        const rowspan = Math.min(attrs.rowspan as number, rows.length - rowIndex);
+        attrs.rowspan = rowspan;
+        if (column + colspan > knowledgeBodySpec.maxColumns) {
+          throw new RichTextError(`Mỗi bảng có tối đa ${knowledgeBodySpec.maxColumns} cột.`);
+        }
+        for (let r = rowIndex; r < rowIndex + rowspan; r += 1) {
+          for (let c = column; c < column + colspan; c += 1) {
+            occupied[r]![c] = true;
+          }
+        }
+        column += colspan;
+      }
+    });
+    textParts.push("\n");
+    return { type: "table", content: rows };
+  };
+
+  const visit = (raw: unknown, depth: number, inline: boolean, inCell = false): RichTextNode | null => {
     if (!isRecord(raw) || typeof raw.type !== "string") {
       return null;
     }
-    nodeCount += 1;
-    if (nodeCount > limits.maxNodes) {
-      throw new RichTextError("Document is too large.");
-    }
-    if (depth > limits.maxDepth) {
-      throw new RichTextError("Document is nested too deeply.");
-    }
+    enter(depth);
 
-    const type = raw.type;
+    let type = raw.type;
 
     if (type === "text") {
       const text = typeof raw.text === "string" ? raw.text.replace(strayControlCharacters, "") : "";
@@ -169,6 +363,22 @@ export const sanitizeRichText = (input: unknown, limits: SanitizeLimits, options
       return { type, attrs: { id: userId, label } };
     }
 
+    if (knowledge && !inline) {
+      if (type === "image") {
+        return inCell ? null : visitImage(raw);
+      }
+      if (type === "table") {
+        return inCell ? null : visitTable(raw, depth);
+      }
+      if (inCell) {
+        // Cells hold simple blocks: code becomes a paragraph, a checklist a bullet list; the rest is dropped.
+        type = type === "codeBlock" ? "paragraph" : type === "taskList" ? "bulletList" : type === "taskItem" ? "listItem" : type;
+        if (!cellBlockTypes.has(type)) {
+          return null;
+        }
+      }
+    }
+
     if (inline || !blockTypes.has(type)) {
       return null;
     }
@@ -190,7 +400,7 @@ export const sanitizeRichText = (input: unknown, limits: SanitizeLimits, options
       attrs.start = Math.min(100_000, Math.max(1, Math.trunc(start)));
     }
 
-    const content = sanitizeChildren(raw.content, type, depth + 1);
+    const content = sanitizeChildren(raw.content, type, depth + 1, inCell);
     if (type !== "horizontalRule") {
       textParts.push("\n");
     }
@@ -214,7 +424,7 @@ export const sanitizeRichText = (input: unknown, limits: SanitizeLimits, options
    * textblocks hold inline nodes only, code blocks plain text only, lists only their item type,
    * items start with a paragraph, and stray inline nodes at block level are wrapped in paragraphs.
    */
-  function sanitizeChildren(rawChildren: unknown, parentType: string, depth: number): RichTextNode[] {
+  function sanitizeChildren(rawChildren: unknown, parentType: string, depth: number, inCell = false): RichTextNode[] {
     const children = Array.isArray(rawChildren) ? rawChildren : [];
     const out: RichTextNode[] = [];
 
@@ -279,7 +489,7 @@ export const sanitizeRichText = (input: unknown, limits: SanitizeLimits, options
         continue;
       }
       flush();
-      const node = visit(child, depth, false);
+      const node = visit(child, depth, false, inCell);
       if (node) {
         place(node);
       }
@@ -318,7 +528,21 @@ export const sanitizeRichText = (input: unknown, limits: SanitizeLimits, options
     throw new RichTextError("Nội dung quá dài.");
   }
 
-  return { doc: { type: "doc", content }, text, mentions: [...mentions] };
+  const result: SanitizeResult = { doc: { type: "doc", content }, text, mentions: [...mentions] };
+  if (knowledge) {
+    result.images = [...images];
+  }
+  return result;
+};
+
+/** Knowledge item body: the "knowledge" profile (tables, images) with knowledgeBodyLimits by default. */
+export const sanitizeKnowledgeBody = (
+  input: unknown,
+  options: Omit<SanitizeOptions, "profile"> = {},
+  limits: SanitizeLimits = knowledgeBodyLimits
+): SanitizeResult & { images: string[] } => {
+  const result = sanitizeRichText(input, limits, { ...options, profile: "knowledge" });
+  return { ...result, images: result.images ?? [] };
 };
 
 /** Builds a minimal document from plain text (used by clients that only send text). */

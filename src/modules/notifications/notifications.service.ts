@@ -44,7 +44,9 @@ const toNotification = (row: NotificationRow): Notification => ({
     channelId: row.channel_id,
     messageId: row.message_id,
     productionTaskId: typeof row.payload.productionTaskId === "string" ? row.payload.productionTaskId : null,
-    jobId: typeof row.payload.jobId === "string" ? row.payload.jobId : null
+    jobId: typeof row.payload.jobId === "string" ? row.payload.jobId : null,
+    knowledgeSpaceId: typeof row.payload.knowledgeSpaceId === "string" ? row.payload.knowledgeSpaceId : null,
+    knowledgeItemId: typeof row.payload.knowledgeItemId === "string" ? row.payload.knowledgeItemId : null
   },
   payload: row.payload,
   createdAt: toIso(row.created_at),
@@ -106,6 +108,32 @@ const recipientCanSeeSql = (sql: QuerySql) => sql`
         vc.kind IN ('dm', 'group_dm')
         OR vcr.key = 'superadmin'
         OR EXISTS (SELECT 1 FROM public.role_permissions vcrp WHERE vcrp.role_id = vcr.id AND vcrp.permission_key = 'channel.view')
+      )
+  ))
+  -- Knowledge base (PD-031): only while the recipient can still read the space (knowledge.view + public space,
+  -- membership or superadmin; the space is neither archived nor deleted).
+  AND (n.type NOT LIKE 'knowledge.%' OR EXISTS (
+    SELECT 1
+    FROM knowledge.spaces ks
+    JOIN public.organization_memberships kom
+      ON kom.organization_id = ks.organization_id AND kom.user_id = n.recipient_user_id
+      AND kom.status = 'active' AND kom.deleted_at IS NULL
+    JOIN public.roles kr ON kr.id = kom.role_id AND kr.organization_id = kom.organization_id
+    WHERE ks.id = (CASE WHEN n.payload->>'knowledgeSpaceId' ~ '^[0-9a-f-]{36}$' THEN (n.payload->>'knowledgeSpaceId')::uuid END)
+      AND ks.organization_id = n.organization_id
+      AND ks.deleted_at IS NULL AND ks.archived_at IS NULL
+      AND (
+        kr.key = 'superadmin'
+        OR (
+          EXISTS (SELECT 1 FROM public.role_permissions krp WHERE krp.role_id = kr.id AND krp.permission_key = 'knowledge.view')
+          AND (
+            ks.visibility = 'public'
+            OR EXISTS (
+              SELECT 1 FROM knowledge.space_members ksm
+              WHERE ksm.space_id = ks.id AND ksm.user_id = n.recipient_user_id
+            )
+          )
+        )
       )
   ))
 `;

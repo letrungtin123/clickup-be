@@ -1,5 +1,5 @@
 import { Permission } from "../../contracts/permissions.js";
-import type { GlobalSearchQuery, GlobalSearchResult, MessageSearchHit } from "../../contracts/search.js";
+import type { GlobalSearchQuery, GlobalSearchResult, KnowledgeSearchHit, MessageSearchHit } from "../../contracts/search.js";
 import { getSql } from "../../db/client.js";
 import { escapeLike, toIso, toPrefixTsQuery } from "../../lib/db-types.js";
 import { logger } from "../../lib/logger.js";
@@ -16,6 +16,13 @@ type MessageSearchProvider = (context: AccessContext, q: string, limit: number) 
 let messageProvider: MessageSearchProvider | undefined;
 export const registerMessageSearchProvider = (provider: MessageSearchProvider) => {
   messageProvider = provider;
+};
+
+/** Knowledge items (PD-031) come from the knowledge module the same way; it applies space / draft visibility. */
+type KnowledgeSearchProvider = (context: AccessContext, q: string, limit: number) => Promise<KnowledgeSearchHit[]>;
+let knowledgeProvider: KnowledgeSearchProvider | undefined;
+export const registerKnowledgeSearchProvider = (provider: KnowledgeSearchProvider) => {
+  knowledgeProvider = provider;
 };
 
 const keyPattern = /^([A-Za-z][A-Za-z0-9]{1,11})-(\d{1,12})$/;
@@ -163,7 +170,26 @@ export const globalSearch = async (context: AccessContext, query: GlobalSearchQu
     }
   };
 
-  const [taskHits, projectHits, listHits, peopleHits, messageHits] = await Promise.all([tasks(), projects(), lists(), people(), messages()]);
-  return { tasks: taskHits, projects: projectHits, lists: listHits, people: peopleHits, messages: messageHits };
+  const knowledge = async () => {
+    if (!groups.has("knowledge") || !knowledgeProvider) {
+      return [];
+    }
+    try {
+      return await knowledgeProvider(context, query.q, limit);
+    } catch (error) {
+      logger.warn({ err: error }, "Knowledge search provider failed");
+      return [];
+    }
+  };
+
+  const [taskHits, projectHits, listHits, peopleHits, messageHits, knowledgeHits] = await Promise.all([
+    tasks(),
+    projects(),
+    lists(),
+    people(),
+    messages(),
+    knowledge()
+  ]);
+  return { tasks: taskHits, projects: projectHits, lists: listHits, people: peopleHits, messages: messageHits, knowledge: knowledgeHits };
 };
 

@@ -33,7 +33,7 @@ export const errorHandler: ErrorRequestHandler = (error, req, res, next) => {
   };
 
   if (error instanceof AppError) {
-    send(error.statusCode, error.code, error.message);
+    send(error.statusCode, error.code, error.message, error.details ? { details: error.details } : undefined);
     return;
   }
 

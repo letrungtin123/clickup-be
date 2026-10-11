@@ -8,6 +8,7 @@ import type {
   ChatReactionEvent,
   ChatReadEvent
 } from "./chat.js";
+import type { KnowledgeChangedEvent } from "./knowledge.js";
 import type { NotificationArchivedEvent, NotificationNewEvent, NotificationReadEvent } from "./notifications.js";
 
 /**
@@ -15,8 +16,11 @@ import type { NotificationArchivedEvent, NotificationNewEvent, NotificationReadE
  * Realtime messages are hints for the client cache; PostgreSQL stays authoritative.
  */
 
-/** "production": the organization's production module (id = organization id; production roles only). */
-export const RealtimeRoomTypeSchema = z.enum(["project", "channel", "task", "production"]);
+/**
+ * "production": the organization's production module (id = organization id; production roles only).
+ * "knowledge": one knowledge space (id = space id; members, and readers of public spaces).
+ */
+export const RealtimeRoomTypeSchema = z.enum(["project", "channel", "task", "production", "knowledge"]);
 export type RealtimeRoomType = z.infer<typeof RealtimeRoomTypeSchema>;
 
 export const RealtimeRoomRefSchema = z.object({
@@ -107,6 +111,8 @@ export type ServerToClientEvents = {
   "production:changed": (event: ProductionChangedEvent) => void;
   /** Leave calendar changed (cache hint for the production room; refetch /production/leave). */
   "production:leave": (event: { at: string }) => void;
+  /** Knowledge space / item changed (cache hint, ids only; contracts/knowledge.ts KnowledgeChangedEvent). */
+  "knowledge:changed": (event: KnowledgeChangedEvent) => void;
   "chat:message": (event: ChatMessageEvent) => void;
   "chat:message:updated": (event: ChatMessageUpdatedEvent) => void;
   "chat:message:deleted": (event: ChatMessageDeletedEvent) => void;

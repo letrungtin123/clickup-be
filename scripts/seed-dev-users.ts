@@ -53,7 +53,8 @@ const rolePermissions: Record<SeedUser["role"], string[]> = {
     "task.view", "task.create", "task.update", "task.delete", "task.assign",
     "status.view", "status.create", "status.update", "status.delete",
     "channel.view", "channel.create", "channel.update", "channel.manage_members",
-    "knowledge.view",
+    // Quản lý: new knowledge spaces, their settings and members — not knowledge.delete (PD-031 addendum, 0410).
+    "knowledge.view", "knowledge.create", "knowledge.update", "knowledge.manage_members",
     "task.comment", "member.view", "member.manage"
   ],
   member: [
