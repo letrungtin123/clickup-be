@@ -1,4 +1,7 @@
+import { closeDayOfPeriod, kpiPeriodOfDay, kpiPeriodRange, type KpiCloseDays } from "../../contracts/production-scores.js";
 import { addDays, businessDay } from "./time.js";
+
+export type { KpiCloseDays };
 
 /**
  * Score and KPI rules (docs/retouch/SPEC.md Phase 3, PLAN §5–§6, PD-010) as pure functions.
@@ -120,21 +123,18 @@ export const shiftPeriod = (period: string, months: number) => {
   return `${Math.floor(index / 12)}-${pad((index % 12) + 1)}`;
 };
 
-/** Period ("YYYY-MM") of a business day: the month of the next close day (day ≤ close day → this month). */
-export const periodOfDay = (day: string, closeDay: number) => {
-  const [year, month, date] = splitDay(day);
-  const period = `${year}-${pad(month)}`;
-  return date > closeDay ? shiftPeriod(period, 1) : period;
-};
+/**
+ * Period ("YYYY-MM") of a business day: the month of the next close day (day ≤ close day → this month).
+ * `closeDay` is one day for every period, or the close-day versions of the organization (G15: a new close day
+ * applies from the next period, so periods never overlap or leave gaps).
+ */
+export const periodOfDay = (day: string, closeDay: KpiCloseDays) => kpiPeriodOfDay(day, closeDay);
 
 /** SPEC §5.2 `period_month`: first day of the period containing `at` (business timezone). */
-export const periodMonth = (at: Date, closeDay: number) => `${periodOfDay(businessDay(at), closeDay)}-01`;
+export const periodMonth = (at: Date, closeDay: KpiCloseDays) => `${periodOfDay(businessDay(at), closeDay)}-01`;
 
-/** Business days covered by a period: (previous close day + 1) … close day, inclusive. */
-export const periodRange = (period: string, closeDay: number) => ({
-  from: addDays(`${shiftPeriod(period, -1)}-${pad(closeDay)}`, 1),
-  to: `${period}-${pad(closeDay)}`
-});
+/** Business days covered by a period: (previous period's close day + 1) … its close day, inclusive. */
+export const periodRange = (period: string, closeDay: KpiCloseDays) => kpiPeriodRange(period, closeDay);
 
 /** Monthly periods summed by a KPI period type (quarters and years accumulate months). */
 export const periodsIn = (periodType: KpiPeriodType, period: string): string[] => {
@@ -314,7 +314,7 @@ export const forecast = (input: {
   target: number | null;
   pointsOfficial: number;
   period: string;
-  closeDay: number;
+  closeDay: KpiCloseDays;
   today: string;
   prorateLeave: boolean;
   leaveDays: number | null;
@@ -484,7 +484,7 @@ export type SettlementUserInput = {
 };
 
 /** Settles every given person for a period. Deterministic: the same inputs always give the same rows. */
-export const settlePeriod = (input: { period: string; closeDay: number; prorateLeave: boolean; users: readonly SettlementUserInput[] }) => {
+export const settlePeriod = (input: { period: string; closeDay: KpiCloseDays; prorateLeave: boolean; users: readonly SettlementUserInput[] }) => {
   const { from, to } = periodRange(input.period, input.closeDay);
   const workingDays = countWorkingDays(from, to);
   return {
@@ -508,10 +508,10 @@ export const settlePeriod = (input: { period: string; closeDay: number; prorateL
 };
 
 /** SPEC §8.3: a period closes at 23:59 business time on its close day. */
-export const periodCloseInstant = (period: string, closeDay: number) => new Date(`${period}-${pad(closeDay)}T23:59:00+07:00`);
+export const periodCloseInstant = (period: string, closeDay: KpiCloseDays) => new Date(`${period}-${pad(closeDayOfPeriod(closeDay, period))}T23:59:00+07:00`);
 
 /** The most recent period whose close instant is not after `now`. */
-export const latestClosedPeriod = (now: Date, closeDay: number) => {
+export const latestClosedPeriod = (now: Date, closeDay: KpiCloseDays) => {
   const current = periodOfDay(businessDay(now), closeDay);
   return now.getTime() >= periodCloseInstant(current, closeDay).getTime() ? current : shiftPeriod(current, -1);
 };
@@ -523,7 +523,7 @@ export const autoSettleCatchUpDays = 7;
  * The cron settles a period once it closed, unless a run already happened at or after the close
  * (automatic or by an Admin). Runs before the close are provisional and do not count.
  */
-export const shouldAutoSettle = (input: { now: Date; period: string; closeDay: number; hasFinalRun: boolean }) => {
+export const shouldAutoSettle = (input: { now: Date; period: string; closeDay: KpiCloseDays; hasFinalRun: boolean }) => {
   const elapsed = input.now.getTime() - periodCloseInstant(input.period, input.closeDay).getTime();
   return !input.hasFinalRun && elapsed >= 0 && elapsed <= autoSettleCatchUpDays * 86_400_000;
 };
@@ -540,6 +540,79 @@ export type KpiReportMonth = {
 /** Rollup key of a monthly period: "2026-Q4" or "2026". */
 export const rollupKey = (periodType: "QUARTER" | "YEAR", period: string) =>
   periodType === "YEAR" ? period.slice(0, 4) : `${period.slice(0, 4)}-Q${Math.floor((Number(period.slice(5, 7)) - 1) / 3) + 1}`;
+
+/**
+ * SPEC §8.4 quarter / year of one person over the WHOLE quarter/year (G8): points = sum of its months that have
+ * a figure (settled or provisional); target = the explicit QUARTER/YEAR target, else the sum of the monthly
+ * targets of every month of it (the applied target of months with a figure, the effective MONTH target of the
+ * others, e.g. months not started yet). `complete` = every month has started; `settled` = every month is settled.
+ */
+export const rollupKpiPeriod = (input: {
+  periodType: "QUARTER" | "YEAR";
+  /** Any month of the quarter / year. */
+  period: string;
+  months: readonly KpiReportMonth[];
+  monthTargets: readonly TargetVersion[];
+  explicitTarget: number | null;
+  started: (period: string) => boolean;
+  settled: (period: string) => boolean;
+}) => {
+  const all = periodsIn(input.periodType, input.period);
+  const byPeriod = new Map(input.months.map((month) => [month.period, month]));
+  const included = all.filter((period) => byPeriod.has(period));
+  let target = input.explicitTarget;
+  if (target === null) {
+    const monthly = all
+      .map((period) => (byPeriod.has(period) ? byPeriod.get(period)!.target : effectiveTarget(input.monthTargets, "MONTH", period)))
+      .filter((value): value is number => value !== null);
+    target = monthly.length > 0 ? fromCents(monthly.reduce((total, value) => total + toCents(value), 0)) : null;
+  }
+  return {
+    key: rollupKey(input.periodType, input.period),
+    periods: included,
+    complete: all.every((period) => input.started(period)),
+    settled: all.every((period) => input.settled(period)),
+    ...rollupKpi(
+      included.map((period) => byPeriod.get(period)!),
+      target
+    )
+  };
+};
+
+export type KpiFiguresLike = {
+  target: number | null;
+  pointsOfficial: number;
+  khoanPointsConverted: number;
+  totalPoints: number;
+  khoanMoney: number | null;
+  /** Month rows: met the KPI; rollups: computed from percent (no target → met). */
+  met?: boolean;
+  percent: number | null;
+};
+
+/**
+ * Team / organization total of KPI figures (PLAN §6 "theo NV, team"): sums of targets (null when nobody has one),
+ * points, converted Khoán points, totals and money (null when no money is visible); percent = total / target.
+ */
+export const sumKpiFigures = (items: readonly KpiFiguresLike[]) => {
+  const cents = (pick: (item: KpiFiguresLike) => number) => items.reduce((total, item) => total + toCents(pick(item)), 0);
+  const targets = items.filter((item) => item.target !== null);
+  const target = targets.length > 0 ? fromCents(targets.reduce((total, item) => total + toCents(item.target!), 0)) : null;
+  const totalPoints = fromCents(cents((item) => item.totalPoints));
+  const money = items.filter((item) => item.khoanMoney !== null);
+  return {
+    memberCount: items.length,
+    withTargetCount: targets.length,
+    metCount: items.filter((item) => item.met ?? (item.target === null || (item.percent ?? 0) >= 100)).length,
+    target,
+    pointsOfficial: fromCents(cents((item) => item.pointsOfficial)),
+    khoanPointsConverted: fromCents(cents((item) => item.khoanPointsConverted)),
+    totalPoints,
+    percent: percentKpi(totalPoints, target),
+    difference: target === null ? null : fromCents(toCents(totalPoints) - toCents(target)),
+    khoanMoney: money.length > 0 ? money.reduce((total, item) => total + (item.khoanMoney ?? 0), 0) + 0 : null
+  };
+};
 
 /** SPEC §8.4: quarter / year = sum of the months, against the explicit QUARTER/YEAR target or the sum of monthly targets. */
 export const rollupKpi = (months: readonly KpiReportMonth[], explicitTarget: number | null) => {

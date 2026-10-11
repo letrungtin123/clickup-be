@@ -36,6 +36,7 @@ try {
   csrf = (await call("GET", "/auth/csrf")).body.csrfToken;
   r = await call("POST", "/auth/login", { email, password: temp });
   ok("new user logs in with temp password", r.status === 200);
+  if (r.status === 200) csrf = (await call("GET", "/auth/csrf")).body.csrfToken; // rotated at sign-in (SEC2-23)
   r = await call("GET", "/workspace/context");
   ok("context flags mustChangePassword", r.body?.mustChangePassword === true);
   r = await call("GET", "/projects");
@@ -60,6 +61,7 @@ try {
   ok("disable member", r.status === 200 && r.body.status === "disabled");
   csrf = (await call("GET", "/auth/csrf")).body.csrfToken;
   r = await call("POST", "/auth/login", { email, password: "BrandNewPass2026" });
+  if (r.status === 200) csrf = (await call("GET", "/auth/csrf")).body.csrfToken; // rotated at sign-in (SEC2-23)
   r = await call("GET", "/projects");
   ok("disabled member gets no access", r.status === 403 || r.status === 401, `${r.status} ${r.body?.error?.code}`);
 

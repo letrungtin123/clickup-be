@@ -405,16 +405,8 @@ export const createTask = async (context: AccessContext, projectId: string, inpu
       ...assigneeIds.map((userId) => ({ taskId: row.id, action: "TASK_ASSIGNEE_ADDED", targetType: "user", targetId: userId }))
     ]);
 
-    const events: DomainEventInput[] = [
-      {
-        organizationId: context.organization.id,
-        type: "task.created",
-        aggregateType: "task",
-        aggregateId: row.id,
-        actorUserId: context.user.id,
-        payload: { projectId, listId: input.listId, parentTaskId, title: input.title, assigneeIds }
-      }
-    ];
+    // Only events a consumer handles are emitted (the creation itself is recorded in task_activities).
+    const events: DomainEventInput[] = [];
     if (assigneeIds.length > 0) {
       events.push({
         organizationId: context.organization.id,
@@ -584,7 +576,6 @@ export const updateTask = async (context: AccessContext, taskId: string, input: 
     }
     if (input.dueAt !== undefined && !sameInstant(input.dueAt, isoOrNull(task.due_at))) {
       activities.push({ taskId, action: "TASK_DUE_DATE_CHANGED", previousValue: { dueAt: isoOrNull(task.due_at) }, newValue: { dueAt: input.dueAt } });
-      events.push({ ...base, type: "task.due_changed", payload: { projectId: task.project_id, title: input.title ?? task.title, dueAt: input.dueAt } });
     }
     if (statusChanged && nextStatus) {
       activities.push({
@@ -807,16 +798,6 @@ export const deleteTask = async (context: AccessContext, taskId: string) => {
       WHERE id = ANY(${subtree.map((node) => node.id)}::uuid[]) AND organization_id = ${context.organization.id}
     `;
     await insertActivities(tx, context, [{ taskId, action: "TASK_DELETED", newValue: { subtaskCount: subtree.length - 1 } }]);
-    await enqueueDomainEvents(tx, [
-      {
-        organizationId: context.organization.id,
-        type: "task.deleted",
-        aggregateType: "task",
-        aggregateId: taskId,
-        actorUserId: context.user.id,
-        payload: { projectId: current.project_id, title: current.title, taskIds: subtree.map((node) => node.id) }
-      }
-    ]);
     return current;
   });
   publishTaskChanged({ id: taskId, projectId: task.project_id, listId: task.list_id, parentTaskId: task.parent_task_id }, "deleted", context.user.id);

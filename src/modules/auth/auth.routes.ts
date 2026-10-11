@@ -15,29 +15,37 @@ import {
   requireSupabaseUser,
   type AuthenticatedRequest
 } from "../../middleware/auth.js";
-import { issueCsrfToken } from "../../middleware/csrf.js";
+import { issueCsrfToken, rotateCsrfToken } from "../../middleware/csrf.js";
 import { disconnectRooms, sessionRoom } from "../../realtime/publisher.js";
-import { createLoginAccountRateLimit, createLoginRateLimit } from "../../middleware/rate-limit.js";
+import {
+  createLoginAccountRateLimit,
+  createLoginIpRateLimits,
+  createLoginRateLimit
+} from "../../middleware/rate-limit.js";
 import { accessTokenCookieName, clearAuthCookies, refreshTokenCookieName, setAuthCookies } from "./auth.cookies.js";
 import { createGoogleAuthRoutes } from "./google-auth.routes.js";
+import { withFailurePadding } from "./login-timing.js";
 import { refreshAuthSession, revokeAuthSession, signInWithPassword } from "./supabase-auth.service.js";
 
 export const createAuthRoutes = (): ExpressRouter => {
   const authRoutes = Router();
   const loginRateLimit = createLoginRateLimit();
   const loginAccountRateLimit = createLoginAccountRateLimit();
+  const loginIpRateLimits = createLoginIpRateLimits();
 
   authRoutes.get("/auth/csrf", (req, res) => {
     res.setHeader("cache-control", "no-store");
     res.json({ csrfToken: issueCsrfToken(req, res) });
   });
 
-  authRoutes.post("/auth/login", loginRateLimit, loginAccountRateLimit, async (req, res, next) => {
+  // Per-address failure caps first (SEC2-02), then IP+email and per-account.
+  authRoutes.post("/auth/login", ...loginIpRateLimits, loginRateLimit, loginAccountRateLimit, async (req, res, next) => {
     try {
-      const input = LoginRequestSchema.parse(req.body);
-      const session = await signInWithPassword(input);
+      // Every failure (invalid input or credentials, banned, provider error) takes the same minimum time (SEC2-07).
+      const session = await withFailurePadding(() => signInWithPassword(LoginRequestSchema.parse(req.body)));
 
       setAuthCookies(res, session.tokens);
+      rotateCsrfToken(res);
       res.json(AuthSessionSchema.parse({ user: session.user }));
     } catch (error) {
       next(error);
@@ -60,6 +68,8 @@ export const createAuthRoutes = (): ExpressRouter => {
   });
 
   authRoutes.post("/auth/logout", async (req, res, next) => {
+    // Whoever signs in next on this browser starts with a fresh CSRF token (SEC2-23), even if revocation fails.
+    rotateCsrfToken(res);
     try {
       const accessToken = getAccessTokenFromRequest(req) ?? readCookie(req, accessTokenCookieName);
       clearAuthCookies(res);

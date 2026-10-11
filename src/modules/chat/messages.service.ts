@@ -9,6 +9,7 @@ import type {
   MessageHistory,
   MessageHistoryQuery,
   ReactionResult,
+  ReactionUsers,
   ReadState,
   SendMessageRequest,
   ThreadPage,
@@ -651,6 +652,47 @@ export const setReaction = async (context: AccessContext, messageId: string, emo
     });
   }
   return { messageId, emoji, count: outcome.count, reactedByMe: add };
+};
+
+/**
+ * Who reacted (reaction chip tooltip on desktop, reactions sheet on phones). Same visibility as reading the
+ * message; emails are never included. A deleted message has no reactions to show.
+ */
+export const getReactionUsers = async (context: AccessContext, messageId: string): Promise<ReactionUsers> => {
+  const sql = getSql();
+  const base = (
+    await sql<{ channel_id: string; deleted_at: Date | null }[]>`
+      SELECT channel_id, deleted_at FROM public.messages
+      WHERE organization_id = ${context.organization.id} AND id = ${messageId}
+    `
+  )[0];
+  if (!base) {
+    throw messageNotFound();
+  }
+  const readable = await loadChannel(sql, context, base.channel_id);
+  if (!readable?.caps.canRead) {
+    throw messageNotFound();
+  }
+  if (base.deleted_at) {
+    return { messageId, items: [] };
+  }
+  const rows = await sql<{ emoji: string; user_id: string; display_name: string; avatar_url: string | null }[]>`
+    SELECT r.emoji, r.user_id, u.display_name, u.avatar_url,
+      min(r.created_at) OVER (PARTITION BY r.emoji) AS first_at
+    FROM public.message_reactions r
+    JOIN public.app_users u ON u.id = r.user_id
+    WHERE r.organization_id = ${context.organization.id} AND r.message_id = ${messageId}
+    ORDER BY first_at, r.emoji, r.created_at, r.user_id
+  `;
+  const items = new Map<string, ReactionUsers["items"][number]>();
+  for (const row of rows) {
+    const item = items.get(row.emoji) ?? { emoji: row.emoji, count: 0, reactedByMe: false, users: [] };
+    item.count += 1;
+    item.reactedByMe ||= row.user_id === context.user.id;
+    item.users.push({ id: row.user_id, displayName: row.display_name, email: null, avatarUrl: row.avatar_url });
+    items.set(row.emoji, item);
+  }
+  return { messageId, items: [...items.values()] };
 };
 
 // Read state -------------------------------------------------------------------------------------

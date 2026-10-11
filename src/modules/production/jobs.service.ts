@@ -14,9 +14,9 @@ import { getSql } from "../../db/client.js";
 import { AppError } from "../../lib/app-error.js";
 import { escapeLike, type QuerySql } from "../../lib/db-types.js";
 import type { AccessContext } from "../access/access-context.js";
-import { assertProductionMember, assertProductionRole, hasProductionRole, isProductionAdmin } from "./access.js";
+import { assertProductionMember, assertProductionRole, hasProductionRole, isProductionAdmin, leadsJob } from "./access.js";
 import { cursorInstantSql, decodeTimeCursor, encodeTimeCursor } from "./cursor.js";
-import { resolveCustomValues, setEntityTags } from "./custom-fields.js";
+import { anyTagSql, customFieldFilterSql, resolveCustomFieldFilters, resolveCustomValues, setEntityTags } from "./custom-fields.js";
 import { syncJobChat } from "./job-chat.service.js";
 import {
   assertJobVisible,
@@ -30,7 +30,7 @@ import {
   taskSelectSql,
   toFeedback,
   toJobSummary,
-  toProductionTask,
+  toProductionTasks,
   type JobRow,
   type TaskRow
 } from "./jobs.repo.js";
@@ -60,6 +60,61 @@ const assertProject = async (sql: QuerySql, organizationId: string, projectId: s
   }
 };
 
+// Job history ---------------------------------------------------------------------------------------------
+
+type JobEditRow = {
+  code: string;
+  name: string | null;
+  project_id: string;
+  leader_id: string;
+  deadline: Date;
+  total_images: number;
+  drive_link: string | null;
+  custom_values: Record<string, unknown>;
+  archived_at: Date | null;
+};
+
+const jobTagIds = async (sql: QuerySql, organizationId: string, jobId: string) =>
+  (
+    await sql<{ tag_id: string }[]>`
+      SELECT tag_id FROM production.entity_tags WHERE organization_id = ${organizationId} AND entity = 'JOB' AND entity_id = ${jobId}
+    `
+  ).map((row) => row.tag_id);
+
+/**
+ * What a job edit changed, as the from / to values of its history row (only the changed fields): code, name,
+ * projectId, deadline (ISO), leaderId, totalImages, driveLink, customValues, tagIds (sorted), archived.
+ * Null when nothing changed. Pure (unit tested).
+ */
+export const jobEditChanges = (
+  before: JobEditRow,
+  after: JobEditRow,
+  tags: { before: readonly string[]; after: readonly string[] } | null
+): { from: Record<string, unknown>; to: Record<string, unknown> } | null => {
+  const from: Record<string, unknown> = {};
+  const to: Record<string, unknown> = {};
+  const track = (key: string, previous: unknown, next: unknown) => {
+    if (JSON.stringify(previous) !== JSON.stringify(next)) {
+      from[key] = previous;
+      to[key] = next;
+    }
+  };
+  const sortedValues = (values: Record<string, unknown>) => Object.fromEntries(Object.entries(values).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)));
+  track("code", before.code, after.code);
+  track("name", before.name, after.name);
+  track("projectId", before.project_id, after.project_id);
+  track("deadline", new Date(before.deadline).toISOString(), new Date(after.deadline).toISOString());
+  track("leaderId", before.leader_id, after.leader_id);
+  track("totalImages", before.total_images, after.total_images);
+  track("driveLink", before.drive_link, after.drive_link);
+  track("customValues", sortedValues(before.custom_values), sortedValues(after.custom_values));
+  if (tags) {
+    track("tagIds", [...new Set(tags.before)].sort(), [...new Set(tags.after)].sort());
+  }
+  track("archived", before.archived_at !== null, after.archived_at !== null);
+  return Object.keys(to).length > 0 ? { from, to } : null;
+};
+
 // Reads ---------------------------------------------------------------------------------------------------
 
 /**
@@ -74,6 +129,7 @@ export const listJobs = async (context: AccessContext, query: JobQuery): Promise
   const organizationId = context.organization.id;
   const cursor = decodeTimeCursor(query.cursor);
   const like = query.q ? `%${escapeLike(query.q.toLowerCase())}%` : null;
+  const plans = await resolveCustomFieldFilters(sql, organizationId, "JOB", query.cf);
   const rows = await sql<JobRow[]>`
     WITH page AS MATERIALIZED (
       SELECT j.id FROM production.jobs j
@@ -91,11 +147,8 @@ export const listJobs = async (context: AccessContext, query: JobQuery): Promise
                   AND t.is_late AND t.done_at IS NULL AND t.closed_at IS NULL)`
             : sql``
         }
-        ${
-          query.tagId
-            ? sql`AND EXISTS (SELECT 1 FROM production.entity_tags et WHERE et.organization_id = j.organization_id AND et.entity = 'JOB' AND et.entity_id = j.id AND et.tag_id = ${query.tagId})`
-            : sql``
-        }
+        ${query.tagId?.length ? sql`AND ${anyTagSql(sql, "JOB", "j.id", "j.organization_id", query.tagId)}` : sql``}
+        ${plans.length > 0 ? sql`AND ${customFieldFilterSql(sql, "j.custom_values", plans)}` : sql``}
         ${like ? sql`AND public.immutable_unaccent(lower(j.code || ' ' || coalesce(j.name, ''))) LIKE public.immutable_unaccent(${like})` : sql``}
         ${cursor ? sql`AND (j.created_at, j.id) < (${cursorInstantSql(sql, cursor.at)}, ${cursor.id}::uuid)` : sql``}
       ORDER BY j.created_at DESC, j.id DESC
@@ -144,7 +197,8 @@ export const getJobDetail = async (context: AccessContext, jobId: string, sql: Q
     loadWorkflowModel(sql, organizationId)
   ]);
   const involved = taskRows.some((task) => task.assignee_id === context.user.id || task.qc_id === context.user.id);
-  const isLeader = row.leader_id === context.user.id;
+  // SEC2-04: leadership counts only while the caller still holds LEADER (or ADMIN).
+  const isLeader = leadsJob(context, row.leader_id);
   if (!canSeeAllJobs(context) && !involved && !isLeader) {
     throw jobNotFound();
   }
@@ -152,7 +206,7 @@ export const getJobDetail = async (context: AccessContext, jobId: string, sql: Q
   const manage = isLeader || isProductionAdmin(context);
   return {
     ...toJobSummary(row),
-    tasks: taskRows.map((task) => toProductionTask(task, workflow, relationOf(context, task))),
+    tasks: await toProductionTasks(sql, context, workflow, taskRows),
     feedbacks: feedbackRows.map(toFeedback),
     capabilities: {
       canEdit: !archived && (manage || isAccountOrAdmin(context)),
@@ -202,15 +256,16 @@ export const updateJob = async (context: AccessContext, jobId: string, input: Up
   const sql = getSql();
   const previousLeader = await sql.begin(async (tx) => {
     const job = (
-      await tx<{ leader_id: string; custom_values: Record<string, unknown>; archived_at: Date | null }[]>`
-        SELECT leader_id, custom_values, archived_at FROM production.jobs WHERE organization_id = ${organizationId} AND id = ${jobId} FOR UPDATE
+      await tx<JobEditRow[]>`
+        SELECT code, name, project_id, leader_id, deadline, total_images, drive_link, custom_values, archived_at
+        FROM production.jobs WHERE organization_id = ${organizationId} AND id = ${jobId} FOR UPDATE
       `
     )[0];
     if (!job) {
       throw jobNotFound();
     }
     const accountOrAdmin = isAccountOrAdmin(context);
-    const isLeader = job.leader_id === context.user.id;
+    const isLeader = leadsJob(context, job.leader_id);
     if (!accountOrAdmin && !isLeader) {
       throw hasProductionRole(context, "LEADER") ? new AppError("FORBIDDEN", "Chỉ Account, Quản trị hoặc Leader của job được sửa job.", 403) : jobNotFound();
     }
@@ -246,8 +301,37 @@ export const updateJob = async (context: AccessContext, jobId: string, input: Up
         updated_at = now()
       WHERE organization_id = ${organizationId} AND id = ${jobId}
     `;
+    const previousTags = input.tagIds ? await jobTagIds(tx, organizationId, jobId) : [];
     if (input.tagIds) {
       await setEntityTags(tx, organizationId, "JOB", jobId, input.tagIds);
+    }
+    // PLAN §8/§10: job edits show in the job's history (job-level task_logs row, action JOB).
+    const after = (await tx<JobEditRow[]>`
+      SELECT code, name, project_id, leader_id, deadline, total_images, drive_link, custom_values, archived_at
+      FROM production.jobs WHERE organization_id = ${organizationId} AND id = ${jobId}
+    `)[0]!;
+    const change = jobEditChanges(job, after, input.tagIds ? { before: previousTags, after: [...new Set(input.tagIds)] } : null);
+    if (change) {
+      const names = change.to.leaderId === undefined && change.to.projectId === undefined ? [] : await tx<{ kind: string; id: string; name: string }[]>`
+        SELECT 'leader' AS kind, au.id, au.display_name AS name FROM public.app_users au
+        WHERE ${change.to.leaderId !== undefined} AND au.id IN (${job.leader_id}::uuid, ${after.leader_id}::uuid)
+        UNION ALL
+        SELECT 'project', p.id, p.code FROM production.projects p
+        WHERE ${change.to.projectId !== undefined} AND p.organization_id = ${organizationId} AND p.id IN (${job.project_id}::uuid, ${after.project_id}::uuid)
+      `;
+      const nameOf = (kind: string, id: string) => names.find((row) => row.kind === kind && row.id === id)?.name ?? null;
+      if (change.to.leaderId !== undefined) {
+        change.from.leaderName = nameOf("leader", job.leader_id);
+        change.to.leaderName = nameOf("leader", after.leader_id);
+      }
+      if (change.to.projectId !== undefined) {
+        change.from.projectCode = nameOf("project", job.project_id);
+        change.to.projectCode = nameOf("project", after.project_id);
+      }
+      await tx`
+        INSERT INTO production.task_logs (organization_id, task_id, job_id, user_id, action, from_value, to_value)
+        VALUES (${organizationId}, NULL, ${jobId}, ${context.user.id}, 'JOB', ${tx.json(change.from as never)}, ${tx.json(change.to as never)})
+      `;
     }
     return job.leader_id;
   });
@@ -359,7 +443,7 @@ export const reassignFeedback = async (context: AccessContext, feedbackId: strin
     }
     await assertJobVisible(tx, context, feedback.job_id);
     const job = await loadJobForTasks(tx, organizationId, feedback.job_id, true);
-    if (job.leader_id !== context.user.id && !isProductionAdmin(context)) {
+    if (!leadsJob(context, job.leader_id) && !isProductionAdmin(context)) {
       throw new AppError("FORBIDDEN", "Chỉ Leader của job (hoặc Quản trị) được giao lại feedback.", 403);
     }
     if (feedback.status === "RESOLVED") {
@@ -379,7 +463,7 @@ export const reassignFeedback = async (context: AccessContext, feedbackId: strin
   await syncJobChat(context, result.jobId);
   const workflow = await loadWorkflowModel(sql, organizationId);
   const rows = await selectTasks(sql, organizationId, result.ids);
-  return { tasks: rows.map((row) => toProductionTask(row, workflow, relationOf(context, row))), warnings: result.warnings };
+  return { tasks: await toProductionTasks(sql, context, workflow, rows), warnings: result.warnings };
 };
 
 /**

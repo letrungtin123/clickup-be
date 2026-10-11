@@ -253,7 +253,18 @@ try {
   const channelId = r.body.channelId;
   ok("leader opens job C's chat", r.status === 200 && r.body.created === true, r.body);
   const members = () => localSql(`SELECT user_id FROM public.channel_members WHERE channel_id = '${channelId}' AND deleted_at IS NULL`);
-  ok("chat members: leader + worker", members().sort().join() === [ids.leader, ids.staff].sort().join(), members());
+  // PD-022: leader, creator, assignees / QCs and every active production ACCOUNT holder.
+  const accountIds = localSql(`
+    SELECT DISTINCT ur.user_id FROM production.user_roles ur
+    JOIN public.organization_memberships om ON om.organization_id = ur.organization_id AND om.user_id = ur.user_id
+      AND om.status = 'active' AND om.deleted_at IS NULL
+    WHERE ur.role_code = 'ACCOUNT'
+  `);
+  ok(
+    "chat members: leader + worker + every Account (PD-022)",
+    members().sort().join() === [...new Set([ids.leader, ids.staff, ...accountIds])].sort().join(),
+    members()
+  );
   r = await admin.call("GET", `/channels/${channelId}`);
   const adminSawBefore = r.status;
   r = await admin.call("POST", `/production/jobs/${jobC.id}/chat`);

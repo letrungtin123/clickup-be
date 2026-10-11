@@ -459,19 +459,30 @@ try {
   x = await download(admin, "GET", "/production/kpi/export?from=2019-05");
   ok("KPI export validates its query", x.status === 400);
 
-  // PR-17: the report's KPI period follows the CURRENT close day — like the board and the settlement
+  // PR-17 + PD-028: a new close day applies from the next period; past periods keep their boundaries, and the
+  // report, the board and the settlement agree on them. 2019 stays on day 25: May 6–10 and May 13–17 are both 2019-05.
   await admin.call("PATCH", "/production/settings", { kpiCloseDay: 10 });
   r = await query(admin, { dimensions: ["period"], measures: ["points", "task_count"], ...may });
   const byPeriod = Object.fromEntries((r.body.rows ?? []).map((item) => [item.period, item]));
   ok(
-    "PR-17: close day 10 → May 6–10 in 2019-05, May 13–17 in 2019-06, for scores and tasks alike",
-    r.status === 200 && byPeriod["2019-05"]?.points === 125 && byPeriod["2019-05"].task_count === 10 && byPeriod["2019-06"]?.points === 105 && byPeriod["2019-06"].task_count === 10,
+    "PD-028: changing the close day does not move past periods (scores and tasks alike)",
+    r.status === 200 && byPeriod["2019-05"]?.points === 230 && byPeriod["2019-05"].task_count === 20 && !byPeriod["2019-06"],
     JSON.stringify(r.body.rows)
   );
-  const boardJune = (await admin.call("GET", "/production/scores/board?period=2019-06")).body;
+  const settingsAfter = (await admin.call("GET", "/production/settings")).body;
+  ok(
+    "PD-028: the new close day is scheduled from the next period",
+    settingsAfter.kpiCloseDays?.some((version) => version.closeDay === 10 && version.fromPeriod !== null && version.fromPeriod > new Date().toISOString().slice(0, 7)),
+    JSON.stringify(settingsAfter.kpiCloseDays)
+  );
+  const boardMay = (await admin.call("GET", "/production/scores/board?period=2019-05")).body;
   r = await query(admin, { dimensions: ["period", "user"], measures: ["points"], ...may });
-  const juneStaff = r.body.rows?.find((item) => item.period === "2019-06" && item.user === staffId);
-  ok("PR-17: … the same figure as the board's period", juneStaff?.points === boardJune.items?.find((item) => item.user.id === staffId)?.pointsOfficial && juneStaff.points === 105, JSON.stringify(juneStaff));
+  const mayStaff = r.body.rows?.find((item) => item.period === "2019-05" && item.user === staffId);
+  ok(
+    "PR-17: … the report shows the same figure as the board's period",
+    mayStaff !== undefined && mayStaff.points === boardMay.items?.find((item) => item.user.id === staffId)?.pointsOfficial,
+    JSON.stringify(mayStaff)
+  );
   await admin.call("PATCH", "/production/settings", { kpiCloseDay: originalSettings.kpiCloseDay });
 
   // Saved report delete

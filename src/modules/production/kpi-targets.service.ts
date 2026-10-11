@@ -15,7 +15,7 @@ import { toIso, type QuerySql } from "../../lib/db-types.js";
 import type { AccessContext } from "../access/access-context.js";
 import { toUserRef, type UserRefJson } from "../work/mappers.js";
 import { assertProductionAdmin } from "./access.js";
-import { loadSettings } from "./catalog.service.js";
+import { closeDaysOf, loadSettings } from "./catalog.service.js";
 import { isAlignedPeriod, parseKpiTargetCsv } from "./kpi-targets.js";
 import { effectiveVersion, periodOfDay, type KpiPeriodType } from "./scoring.js";
 import { businessDay } from "./time.js";
@@ -103,7 +103,7 @@ export const getKpiTargetMatrix = async (context: AccessContext, query: { year?:
   const sql = getSql();
   const organizationId = org(context);
   const settings = await loadSettings(sql, organizationId);
-  const year = query.year ?? Number(periodOfDay(businessDay(new Date()), settings.kpiCloseDay).slice(0, 4));
+  const year = query.year ?? Number(periodOfDay(businessDay(new Date()), closeDaysOf(settings)).slice(0, 4));
   const periods = Array.from({ length: 12 }, (_, index) => `${year}-${String(index + 1).padStart(2, "0")}`);
 
   const [members, targetRows] = await Promise.all([

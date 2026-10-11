@@ -1,11 +1,14 @@
 import type { z } from "zod";
 
 import type {
+  ClientQuery,
   CreditImportRequestSchema,
   CreditImportResult,
   CustomValues,
   SetCreditRuleRequestSchema,
+  KpiCloseDayVersion,
   ProductionMe,
+  ProductionMemberQuery,
   ProductionRole,
   ProductionSettings,
   UpdateProductionMemberRequestSchema,
@@ -21,6 +24,7 @@ import type {
   UpdateProductionSettingsRequestSchema
 } from "../../contracts/production-catalog.js";
 import { productionRoleCodes } from "../../contracts/production-catalog.js";
+import { closeDayOfPeriod, kpiPeriodOfDay } from "../../contracts/production-scores.js";
 import { getSql } from "../../db/client.js";
 import { AppError } from "../../lib/app-error.js";
 import { toIso, type QuerySql } from "../../lib/db-types.js";
@@ -31,7 +35,7 @@ import { toColor } from "../work/mappers.js";
 import { assertProductionAdmin, assertProductionMember, assertProductionRole, isProductionAdmin, productionRolesOf } from "./access.js";
 import { cachedConfig, invalidateProductionConfig } from "./catalog-cache.js";
 import { deleteCreditRuleVersion, importCreditRules, listRuleHistory, listRulesAt, setCreditRule, startNewVersion } from "./credit-rules.js";
-import { resolveCustomValues, setEntityTags } from "./custom-fields.js";
+import { matchesCustomFieldFilters, resolveCustomFieldFilters, resolveCustomValues, setEntityTags } from "./custom-fields.js";
 import { businessDay, isValidDay } from "./time.js";
 import { systemStatusCodes } from "./workflow.js";
 
@@ -40,7 +44,7 @@ const org = (context: AccessContext) => context.organization.id;
 
 // Settings ----------------------------------------------------------------------------------------
 
-const settingKeys: Record<keyof ProductionSettings, string> = {
+const settingKeys: Record<Exclude<keyof ProductionSettings, "kpiCloseDays">, string> = {
   kpiCloseDay: "kpi_close_day",
   scoresPublic: "scores_public",
   moneyPublic: "money_public",
@@ -55,6 +59,7 @@ const settingKeys: Record<keyof ProductionSettings, string> = {
 
 const defaults: ProductionSettings = {
   kpiCloseDay: 25,
+  kpiCloseDays: [{ fromPeriod: null, closeDay: 25 }],
   scoresPublic: true,
   moneyPublic: false,
   kpiProrateLeave: false,
@@ -70,10 +75,26 @@ const defaults: ProductionSettings = {
 export const loadSettings = (sql: QuerySql, organizationId: string): Promise<ProductionSettings> =>
   cachedConfig("settings", organizationId, () => readSettings(sql, organizationId));
 
+/**
+ * KPI close-day versions of the organization (production.kpi_close_days, migration 20261011_0220), oldest first;
+ * the first one applies to every earlier period (fromPeriod null).
+ */
+const readCloseDays = async (sql: QuerySql, organizationId: string): Promise<KpiCloseDayVersion[]> =>
+  (
+    await sql<{ period: string; close_day: number }[]>`
+      SELECT to_char(effective_period, 'YYYY-MM') AS period, close_day
+      FROM production.kpi_close_days WHERE organization_id = ${organizationId}
+      ORDER BY effective_period
+    `
+  ).map((row, index) => ({ fromPeriod: index === 0 ? null : row.period, closeDay: row.close_day }));
+
 const readSettings = async (sql: QuerySql, organizationId: string): Promise<ProductionSettings> => {
-  const rows = await sql<{ key: string; value: unknown }[]>`
-    SELECT key, value FROM production.settings WHERE organization_id = ${organizationId}
-  `;
+  const [rows, closeDays] = await Promise.all([
+    sql<{ key: string; value: unknown }[]>`
+      SELECT key, value FROM production.settings WHERE organization_id = ${organizationId}
+    `,
+    readCloseDays(sql, organizationId)
+  ]);
   const byKey = new Map(rows.map((row) => [row.key, row.value]));
   const result = { ...defaults } as Record<string, unknown>;
   for (const [field, key] of Object.entries(settingKeys)) {
@@ -81,7 +102,52 @@ const readSettings = async (sql: QuerySql, organizationId: string): Promise<Prod
       result[field] = byKey.get(key);
     }
   }
-  return result as ProductionSettings;
+  const settings = result as ProductionSettings;
+  settings.kpiCloseDays = closeDays.length > 0 ? closeDays : [{ fromPeriod: null, closeDay: settings.kpiCloseDay }];
+  return settings;
+};
+
+/** Close-day versions of the settings, for every period computation (scoring.ts, contracts kpiPeriodRange). */
+export const closeDaysOf = (settings: { kpiCloseDay?: number | undefined; kpiCloseDays?: KpiCloseDayVersion[] | undefined }): KpiCloseDayVersion[] =>
+  settings.kpiCloseDays && settings.kpiCloseDays.length > 0
+    ? settings.kpiCloseDays
+    : [{ fromPeriod: null, closeDay: settings.kpiCloseDay ?? defaults.kpiCloseDay }];
+
+const shiftMonth = (period: string, months: number) => {
+  const index = Number(period.slice(0, 4)) * 12 + Number(period.slice(5, 7)) - 1 + months;
+  return `${Math.floor(index / 12)}-${String((index % 12) + 1).padStart(2, "0")}`;
+};
+
+/**
+ * G15: a new close day applies from the NEXT KPI period; the current period keeps its boundaries. Writes the version
+ * for (current period + 1) and drops versions scheduled after it; no version is kept when the day equals the one
+ * already in force for that period (changing back is a no-op). Call inside the settings transaction.
+ */
+const scheduleCloseDay = async (tx: QuerySql, organizationId: string, closeDay: number, userId: string, today: string) => {
+  let versions = await readCloseDays(tx, organizationId);
+  if (versions.length === 0) {
+    // Organizations created after the migration: record the day in force so far as the baseline.
+    const stored = (await tx<{ value: unknown }[]>`SELECT value FROM production.settings WHERE organization_id = ${organizationId} AND key = 'kpi_close_day'`)[0];
+    const baseline = typeof stored?.value === "number" ? stored.value : defaults.kpiCloseDay;
+    await tx`
+      INSERT INTO production.kpi_close_days (organization_id, effective_period, close_day)
+      VALUES (${organizationId}, DATE '2000-01-01', ${baseline}) ON CONFLICT DO NOTHING
+    `;
+    versions = [{ fromPeriod: null, closeDay: baseline }];
+  }
+  const effective = shiftMonth(kpiPeriodOfDay(today, versions), 1);
+  // Saving the settings form re-sends the configured day: nothing to do when it already applies from the next period.
+  if (closeDayOfPeriod(versions, effective) === closeDay && !versions.some((version) => version.fromPeriod !== null && version.fromPeriod > effective)) {
+    return;
+  }
+  await tx`DELETE FROM production.kpi_close_days WHERE organization_id = ${organizationId} AND effective_period >= ${`${effective}-01`}::date`;
+  const kept = versions.filter((version) => version.fromPeriod === null || version.fromPeriod < effective);
+  if (closeDayOfPeriod(kept, effective) !== closeDay) {
+    await tx`
+      INSERT INTO production.kpi_close_days (organization_id, effective_period, close_day, created_by)
+      VALUES (${organizationId}, ${`${effective}-01`}::date, ${closeDay}, ${userId})
+    `;
+  }
 };
 
 export const getSettings = async (context: AccessContext) => {
@@ -93,11 +159,14 @@ export const updateSettings = async (context: AccessContext, input: In<typeof Up
   assertProductionAdmin(context);
   const sql = getSql();
   await sql.begin(async (tx) => {
+    if (input.kpiCloseDay !== undefined) {
+      await scheduleCloseDay(tx, org(context), input.kpiCloseDay, context.user.id, businessDay(new Date()));
+    }
     for (const [field, value] of Object.entries(input)) {
       if (value === undefined) {
         continue;
       }
-      const key = settingKeys[field as keyof ProductionSettings];
+      const key = settingKeys[field as keyof typeof settingKeys];
       await tx`
         INSERT INTO production.settings (organization_id, key, value, updated_by)
         VALUES (${org(context)}, ${key}, ${tx.json(value)}, ${context.user.id})
@@ -125,7 +194,9 @@ export const getProductionMe = async (context: AccessContext): Promise<Productio
     isAdmin: isProductionAdmin(context),
     teamId: profile?.team_id ?? null,
     settings: {
-      kpiCloseDay: settings.kpiCloseDay,
+      // The close day of the current period (a new day applies from the next period, G15); kpiCloseDays has them all.
+      kpiCloseDay: closeDayOfPeriod(closeDaysOf(settings), kpiPeriodOfDay(businessDay(new Date()), closeDaysOf(settings))),
+      kpiCloseDays: closeDaysOf(settings),
       scoresPublic: settings.scoresPublic,
       moneyPublic: settings.moneyPublic,
       chatAttachmentsEnabled: settings.chatAttachmentsEnabled,
@@ -178,17 +249,29 @@ const toMember = (row: MemberRow) => ({
 });
 
 /** Admins manage everyone; Leaders/Accounts need the list to assign work and pick QC. */
-export const listMembers = async (context: AccessContext) => {
+export const listMembers = async (context: AccessContext, query: ProductionMemberQuery = { cf: [] }) => {
   assertProductionRole(context, "LEADER", "ACCOUNT", "QC");
-  const rows = await selectMembers(getSql(), org(context), null);
   const admin = isProductionAdmin(context);
+  const tagIds = query.tagId ?? [];
+  // Members' custom values and tags are Admin data (others get them empty), so only Admins filter by them.
+  if (!admin && (tagIds.length > 0 || query.cf.length > 0)) {
+    throw customFieldsForbidden();
+  }
+  const sql = getSql();
+  const plans = await resolveCustomFieldFilters(sql, org(context), "USER", query.cf);
+  const rows = await selectMembers(sql, org(context), null);
   return {
     items: rows
       .map(toMember)
       .filter((member) => admin || member.roles.length > 0)
+      .filter((member) => matchesCustomFieldFilters(member.customValues, plans) && (tagIds.length === 0 || member.tagIds.some((id) => tagIds.includes(id))))
       .map((member) => (admin ? member : { ...member, customValues: {}, tagIds: [] }))
   };
 };
+
+/** Filtering by members' custom fields / tags outside the Admin role. */
+export const customFieldsForbidden = () =>
+  new AppError("CUSTOM_FIELDS_FORBIDDEN", "Chỉ Quản trị lọc theo trường tuỳ biến hoặc tag của nhân viên.", 403);
 
 export const updateMember = async (context: AccessContext, userId: string, input: In<typeof UpdateProductionMemberRequestSchema>) => {
   assertProductionAdmin(context);
@@ -274,9 +357,12 @@ export const upsertTeam = async (context: AccessContext, id: string | null, inpu
 
 type ClientRow = { id: string; name: string; note: string | null; active: boolean; custom_values: CustomValues; tag_ids: string[] | null; project_count: number };
 
-export const listClients = async (context: AccessContext) => {
+export const listClients = async (context: AccessContext, query: ClientQuery = { cf: [] }) => {
   assertProductionRole(context, "ACCOUNT", "LEADER");
-  const rows = await getSql()<ClientRow[]>`
+  const sql = getSql();
+  const plans = await resolveCustomFieldFilters(sql, org(context), "CLIENT", query.cf);
+  const tagIds = query.tagId ?? [];
+  const rows = await sql<ClientRow[]>`
     SELECT c.id, c.name, c.note, c.active, c.custom_values,
       (SELECT array_agg(et.tag_id) FROM production.entity_tags et WHERE et.organization_id = c.organization_id AND et.entity = 'CLIENT' AND et.entity_id = c.id) AS tag_ids,
       (SELECT count(*)::int FROM production.projects p WHERE p.organization_id = c.organization_id AND p.client_id = c.id) AS project_count
@@ -284,7 +370,9 @@ export const listClients = async (context: AccessContext) => {
     ORDER BY c.active DESC, c.name LIMIT 2000
   `;
   return {
-    items: rows.map((row) => ({
+    items: rows
+      .filter((row) => matchesCustomFieldFilters(row.custom_values, plans) && (tagIds.length === 0 || (row.tag_ids ?? []).some((id) => tagIds.includes(id))))
+      .map((row) => ({
       id: row.id,
       name: row.name,
       note: row.note,

@@ -43,9 +43,13 @@ const markTypes = new Set(["bold", "italic", "strike", "underline", "code", "lin
 const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 // eslint-disable-next-line no-control-regex -- control characters are rejected in links
 const safeHref = /^(https?:\/\/|mailto:)[^\s<>"'\u0000-\u001f\u007f]{1,2000}$/i;
-/** Control characters other than tab / line breaks are dropped (NUL is not storable in PostgreSQL text/jsonb). */
+/**
+ * Dropped from text: control characters other than tab / line breaks (NUL is not storable in PostgreSQL
+ * text/jsonb) and bidi overrides / isolates U+202A–U+202E, U+2066–U+2069 (SEC2-12: they make a message read
+ * differently from what it is). Same ranges as names, mention labels and file names.
+ */
 // eslint-disable-next-line no-control-regex -- stripping control characters is intended
-const strayControlCharacters = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g;
+const strayControlCharacters = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f\u202a-\u202e\u2066-\u2069]/g;
 // eslint-disable-next-line no-control-regex -- stripping control characters is intended
 const labelControlCharacters = /[\u0000-\u001f\u007f\u202a-\u202e\u2066-\u2069]/g;
 
@@ -155,7 +159,7 @@ export const sanitizeRichText = (input: unknown, limits: SanitizeLimits, options
         textParts.push(text);
         return { type: "text", text };
       }
-      const label = options.mentionLabels?.get(userId)?.slice(0, 160) ?? clientLabel;
+      const label = options.mentionLabels?.get(userId)?.replace(labelControlCharacters, "").slice(0, 160) ?? clientLabel;
       mentions.add(userId);
       if (mentions.size > limits.maxMentions) {
         throw new RichTextError("Too many mentions.");

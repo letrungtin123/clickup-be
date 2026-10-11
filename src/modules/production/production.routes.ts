@@ -6,6 +6,7 @@ import {
   AddAllowedEmailsResultSchema,
   AllowedEmailCollectionSchema,
   ClientCollectionSchema,
+  ClientQuerySchema,
   CreditImportRequestSchema,
   CreditImportResultSchema,
   CreditMatrixSchema,
@@ -18,6 +19,7 @@ import {
   ProcessCollectionSchema,
   ProductionMeSchema,
   ProductionMemberCollectionSchema,
+  ProductionMemberQuerySchema,
   ProductionMemberSchema,
   ProductionProjectCollectionSchema,
   ProductionSettingsSchema,
@@ -39,11 +41,12 @@ import {
   UpsertShiftRequestSchema,
   UpsertStatusRequestSchema,
   UpsertTagRequestSchema,
-  UpsertTeamRequestSchema
+  UpsertTeamRequestSchema,
+  withCustomFieldFilters
 } from "../../contracts/production-catalog.js";
 import { AppError } from "../../lib/app-error.js";
 import { requireSupabaseUser } from "../../middleware/auth.js";
-import { handle, param } from "../work/http.js";
+import { handle, param } from "./http.js";
 import {
   addAllowedEmails,
   createCreditVersion,
@@ -124,7 +127,10 @@ export const createProductionRoutes = (): ExpressRouter => {
   routes.get("/production/me", handle(async (context) => ProductionMeSchema.parse(await getProductionMe(context))));
 
   // Members
-  routes.get("/production/members", handle(async (context) => ProductionMemberCollectionSchema.parse(await listMembers(context))));
+  routes.get(
+    "/production/members",
+    handle(async (context, req) => ProductionMemberCollectionSchema.parse(await listMembers(context, ProductionMemberQuerySchema.parse(withCustomFieldFilters(req.query)))))
+  );
   routes.patch(
     "/production/members/:userId",
     handle(async (context, req) =>
@@ -148,7 +154,10 @@ export const createProductionRoutes = (): ExpressRouter => {
   );
 
   // Clients
-  routes.get("/production/clients", handle(async (context) => ClientCollectionSchema.parse(await listClients(context))));
+  routes.get(
+    "/production/clients",
+    handle(async (context, req) => ClientCollectionSchema.parse(await listClients(context, ClientQuerySchema.parse(withCustomFieldFilters(req.query)))))
+  );
   routes.post(
     "/production/clients",
     handle(async (context, req) => ClientCollectionSchema.parse(await upsertClient(context, null, UpsertClientRequestSchema.parse(req.body))), 201)

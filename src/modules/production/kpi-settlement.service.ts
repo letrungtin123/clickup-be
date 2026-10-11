@@ -2,11 +2,14 @@ import type {
   KpiReport,
   KpiReportRollup,
   KpiReportRow,
+  KpiReportTotal,
   KpiSettlement,
   KpiSettlementList,
   KpiSettlementRun,
   KpiSettlementRunResult
 } from "../../contracts/production-scores.js";
+import { closeDayOfPeriod } from "../../contracts/production-scores.js";
+import type { CustomFieldFilter, CustomValues } from "../../contracts/production-catalog.js";
 import { getSql } from "../../db/client.js";
 import { AppError } from "../../lib/app-error.js";
 import { toIso, toNullableIso, type QuerySql } from "../../lib/db-types.js";
@@ -14,18 +17,23 @@ import type { AccessContext } from "../access/access-context.js";
 import { enqueueDomainEvents } from "../events/outbox.js";
 import { toUserRef, type UserRefJson } from "../work/mappers.js";
 import { assertProductionAdmin, assertProductionMember, isProductionAdmin } from "./access.js";
-import { loadSettings } from "./catalog.service.js";
+import { matchesCustomFieldFilters, resolveCustomFieldFilters } from "./custom-fields.js";
+import { closeDaysOf, customFieldsForbidden, loadSettings } from "./catalog.service.js";
 import { kpiSettledEvent } from "./kpi-settlement-notifications.js";
 import { approvedLeaveDaysByUser } from "./leave.service.js";
 import {
   effectiveTarget,
   latestClosedPeriod,
   percentKpi,
+  periodOfDay,
   periodRange,
+  periodsIn,
   rollupKey,
-  rollupKpi,
+  rollupKpiPeriod,
+  sumKpiFigures,
   settlePeriod,
   shiftPeriod,
+  type KpiCloseDays,
   type KpiPeriodType,
   type SettlementResult,
   type TargetVersion
@@ -72,7 +80,7 @@ export const computeSettlement = async (
   sql: QuerySql,
   organizationId: string,
   period: string,
-  options: { closeDay: number; prorateLeave: boolean; onlyUserIds?: string[] | null }
+  options: { closeDay: KpiCloseDays; prorateLeave: boolean; onlyUserIds?: string[] | null }
 ) => {
   const { from, to } = periodRange(period, options.closeDay);
   const only = options.onlyUserIds ?? null;
@@ -129,7 +137,7 @@ export const settleMonth = async (
 ) => {
   await tx`SELECT pg_advisory_xact_lock(hashtextextended(${settlementLockKey(organizationId)}, 0))`;
   const settings = await loadSettings(tx, organizationId);
-  const result = await computeSettlement(tx, organizationId, period, { closeDay: settings.kpiCloseDay, prorateLeave: settings.kpiProrateLeave });
+  const result = await computeSettlement(tx, organizationId, period, { closeDay: closeDaysOf(settings), prorateLeave: settings.kpiProrateLeave });
   const met = result.items.filter((item) => item.met).length;
   const run = (
     await tx<{ id: string }[]>`
@@ -137,7 +145,7 @@ export const settleMonth = async (
         organization_id, period_month, period_from, period_to, close_day, trigger, run_by, reason, prorate_leave,
         user_count, met_count, not_met_count, khoan_money_total, khoan_points_converted_total
       ) VALUES (
-        ${organizationId}, ${`${period}-01`}::date, ${result.from}::date, ${result.to}::date, ${settings.kpiCloseDay}, ${options.trigger},
+        ${organizationId}, ${`${period}-01`}::date, ${result.from}::date, ${result.to}::date, ${closeDayOfPeriod(closeDaysOf(settings), period)}, ${options.trigger},
         ${options.runBy}, ${options.reason}, ${settings.kpiProrateLeave}, ${result.items.length}, ${met}, ${result.items.length - met},
         ${result.items.reduce((sum, item) => sum + item.khoanMoney, 0)},
         ${Math.round(result.items.reduce((sum, item) => sum + item.khoanPointsConverted * 100, 0)) / 100}
@@ -322,7 +330,7 @@ export const runKpiSettlement = async (context: AccessContext, input: { period: 
   assertProductionAdmin(context);
   const sql = getSql();
   const settings = await loadSettings(sql, org(context));
-  if (periodRange(input.period, settings.kpiCloseDay).from > businessDay(new Date())) {
+  if (periodRange(input.period, closeDaysOf(settings)).from > businessDay(new Date())) {
     throw new AppError("KPI_PERIOD_NOT_STARTED", "Kỳ này chưa bắt đầu, chưa thể chốt KPI.", 400);
   }
   const { runId } = await sql.begin(
@@ -342,7 +350,7 @@ export const listKpiSettlements = async (context: AccessContext, query: { period
   const sql = getSql();
   const admin = isProductionAdmin(context);
   const settings = await loadSettings(sql, org(context));
-  const period = query.period ?? latestClosedPeriod(new Date(), settings.kpiCloseDay);
+  const period = query.period ?? latestClosedPeriod(new Date(), closeDaysOf(settings));
   const [rows, runs] = await Promise.all([
     selectSettlements(sql, org(context), { fromPeriod: period, toPeriod: period, userIds: admin ? null : [context.user.id] }),
     admin ? selectRuns(sql, org(context), { period, limit: 1 }) : Promise.resolve([])
@@ -385,30 +393,68 @@ const reportRow = (userId: string, period: string, settled: boolean, item: Omit<
 /**
  * GET /production/kpi/report — user × period: target, official points, converted Khoán credits, total,
  * % đạt, vượt/thiếu, Khoán money (ADMIN and the owner). Settled periods come from kpi_settlements; periods
- * without a run yet show what a settlement would give now (`settled: false`). Quarter/year rollups sum
- * the months of the range against explicit QUARTER/YEAR targets when present.
+ * without a run yet show what a settlement would give now (`settled: false`).
+ *
+ * Quarter / year rollups (SPEC §8.4 "Quý/năm = cộng các tháng", G8) always cover the WHOLE quarter / year the
+ * range touches — the months outside the selected range are read too — so a Q3 column is the same whatever range
+ * is shown: sum of its started months against the explicit QUARTER/YEAR target, else the sum of the monthly
+ * targets of all its months (`complete` / `settled` flags tell whether it is final).
+ *
+ * ADMIN also gets team and organization totals (PLAN §6 "theo NV, team") and may filter people by team, USER tags
+ * (any of them) and USER custom fields (e.g. cf.nang_luc=A). Others see only themselves and cannot use the
+ * tag / custom-field filters (403 CUSTOM_FIELDS_FORBIDDEN: members' custom values are Admin data).
  */
-export const getKpiReport = async (context: AccessContext, query: { from: string; to: string; teamId?: string | undefined }): Promise<KpiReport> => {
+export const getKpiReport = async (
+  context: AccessContext,
+  query: { from: string; to: string; teamId?: string | undefined; tagId?: string[] | undefined; cf?: CustomFieldFilter[] | undefined },
+  /** rollups: false skips the quarter / year rollups and the extra months they read (dashboard card). */
+  options: { rollups?: boolean } = {}
+): Promise<KpiReport> => {
   assertProductionMember(context);
   const periods = periodsBetween(query.from, query.to);
   if (query.from > query.to || periods.length > maxReportPeriods) {
     throw new AppError("INVALID_RANGE", `Khoảng kỳ không hợp lệ (từ ≤ đến, tối đa ${maxReportPeriods} kỳ).`, 400);
   }
+  const admin = isProductionAdmin(context);
+  const tagIds = query.tagId ?? [];
+  if (!admin && (tagIds.length > 0 || (query.cf?.length ?? 0) > 0)) {
+    throw customFieldsForbidden();
+  }
   const sql = getSql();
   const organizationId = org(context);
-  const admin = isProductionAdmin(context);
   const onlyUserIds = admin ? null : [context.user.id];
   const settings = await loadSettings(sql, organizationId);
+  const closeDays = closeDaysOf(settings);
   const today = businessDay(new Date());
+  const started = (period: string) => periodRange(period, closeDays).from <= today;
+  const plans = await resolveCustomFieldFilters(sql, organizationId, "USER", query.cf);
 
-  const [settledRows, runPeriods] = await Promise.all([
-    selectSettlements(sql, organizationId, { fromPeriod: query.from, toPeriod: query.to, userIds: onlyUserIds }),
+  // Every month of the years the range touches (rollups cover whole quarters / years).
+  const withRollups = options.rollups !== false;
+  const years = withRollups ? [...new Set(periods.map((period) => period.slice(0, 4)))] : [];
+  const readPeriods = [...new Set([...periods, ...years.flatMap((year) => periodsIn("YEAR", `${year}-01`))])].sort();
+  const readFrom = readPeriods[0]!;
+  const readTo = readPeriods[readPeriods.length - 1]!;
+
+  const [settledRows, runPeriods, firstData] = await Promise.all([
+    selectSettlements(sql, organizationId, { fromPeriod: readFrom, toPeriod: readTo, userIds: onlyUserIds }),
     sql<{ period: string }[]>`
       SELECT DISTINCT to_char(period_month, 'YYYY-MM') AS period FROM production.kpi_settlement_runs
-      WHERE organization_id = ${organizationId} AND period_month BETWEEN ${`${query.from}-01`}::date AND ${`${query.to}-01`}::date
+      WHERE organization_id = ${organizationId} AND period_month BETWEEN ${`${readFrom}-01`}::date AND ${`${readTo}-01`}::date
+    `,
+    // Months before the first score entry and the first MONTH target have no figures: no need to compute them.
+    sql<{ first_day: string | null; first_target: string | null }[]>`
+      SELECT
+        (SELECT to_char(min(business_day), 'YYYY-MM-DD') FROM production.score_entries WHERE organization_id = ${organizationId}) AS first_day,
+        (SELECT to_char(min(effective_from), 'YYYY-MM') FROM production.kpi_targets WHERE organization_id = ${organizationId} AND period_type = 'MONTH') AS first_target
     `
   ]);
   const settledPeriods = new Set(runPeriods.map((row) => row.period));
+  const firstPeriods = [
+    firstData[0]?.first_day ? periodOfDay(firstData[0].first_day, closeDays) : null,
+    firstData[0]?.first_target ?? null
+  ].filter((value): value is string => value !== null);
+  const dataFrom = firstPeriods.length > 0 ? firstPeriods.sort()[0]! : null;
   const viewer = { id: context.user.id, admin };
   const rows: KpiReportRow[] = settledRows.map((row) => {
     const settlement = toSettlement(row, viewer);
@@ -416,21 +462,20 @@ export const getKpiReport = async (context: AccessContext, query: { from: string
   });
   const userInfo = new Map<string, UserRefJson>(settledRows.map((row) => [row.id, row]));
 
-  for (const period of periods.filter((item) => !settledPeriods.has(item) && periodRange(item, settings.kpiCloseDay).from <= today)) {
-    const provisional = await computeSettlement(sql, organizationId, period, {
-      closeDay: settings.kpiCloseDay,
-      prorateLeave: settings.kpiProrateLeave,
-      onlyUserIds
-    });
+  for (const period of readPeriods.filter((item) => !settledPeriods.has(item) && started(item) && dataFrom !== null && item >= dataFrom)) {
+    const provisional = await computeSettlement(sql, organizationId, period, { closeDay: closeDays, prorateLeave: settings.kpiProrateLeave, onlyUserIds });
     for (const item of provisional.items) {
       rows.push(reportRow(item.userId, period, false, item, admin || item.userId === context.user.id));
     }
   }
 
-  const userIds = [...new Set(rows.map((row) => row.userId))];
+  const inRange = new Set(periods);
+  const userIds = [...new Set(rows.filter((row) => inRange.has(row.period)).map((row) => row.userId))];
   const people = userIds.length
-    ? await sql<(UserRefJson & { team_id: string | null; team_name: string | null })[]>`
-        SELECT au.id, au.display_name, au.email, au.avatar_url, mp.team_id, tm.name AS team_name
+    ? await sql<(UserRefJson & { team_id: string | null; team_name: string | null; custom_values: CustomValues | null; tag_ids: string[] | null })[]>`
+        SELECT au.id, au.display_name, au.email, au.avatar_url, mp.team_id, tm.name AS team_name, mp.custom_values,
+          (SELECT array_agg(et.tag_id) FROM production.entity_tags et
+            WHERE et.organization_id = ${organizationId} AND et.entity = 'USER' AND et.entity_id = au.id) AS tag_ids
         FROM public.app_users au
         LEFT JOIN production.member_profiles mp ON mp.organization_id = ${organizationId} AND mp.user_id = au.id
         LEFT JOIN production.teams tm ON tm.organization_id = ${organizationId} AND tm.id = mp.team_id
@@ -440,38 +485,85 @@ export const getKpiReport = async (context: AccessContext, query: { from: string
   for (const person of people) {
     userInfo.set(person.id, person);
   }
+  const profileOf = new Map(people.map((person) => [person.id, person]));
   const teamOf = new Map(people.map((person) => [person.id, { teamId: person.team_id, teamName: person.team_name }]));
-  const visibleUsers = userIds.filter((userId) => !query.teamId || teamOf.get(userId)?.teamId === query.teamId);
+  const visibleUsers = userIds.filter((userId) => {
+    const person = profileOf.get(userId);
+    return (
+      (!query.teamId || person?.team_id === query.teamId) &&
+      (tagIds.length === 0 || (person?.tag_ids ?? []).some((tagId) => tagIds.includes(tagId))) &&
+      matchesCustomFieldFilters(person?.custom_values, plans)
+    );
+  });
   const visible = new Set(visibleUsers);
   const finalRows = rows
-    .filter((row) => visible.has(row.userId))
+    .filter((row) => visible.has(row.userId) && inRange.has(row.period))
     .sort((a, b) => (a.period < b.period ? -1 : a.period > b.period ? 1 : b.totalPoints - a.totalPoints));
 
-  const explicitTargets = await loadTargets(sql, organizationId, visibleUsers, ["QUARTER", "YEAR"]);
+  const targets = await loadTargets(sql, organizationId, visibleUsers, ["MONTH", "QUARTER", "YEAR"]);
   const rollups: KpiReportRollup[] = [];
-  for (const userId of visibleUsers) {
-    const mine = finalRows.filter((row) => row.userId === userId);
+  for (const userId of withRollups ? visibleUsers : []) {
+    const mine = rows.filter((row) => row.userId === userId);
     for (const periodType of ["QUARTER", "YEAR"] as const) {
-      const groups = new Map<string, KpiReportRow[]>();
-      for (const row of mine) {
-        const key = rollupKey(periodType, row.period);
-        groups.set(key, [...(groups.get(key) ?? []), row]);
+      const anchors = new Map<string, string>();
+      for (const period of periods) {
+        anchors.set(rollupKey(periodType, period), period);
       }
-      for (const [key, months] of groups) {
-        const explicit = effectiveTarget(explicitTargets.get(userId) ?? [], periodType, months[0]!.period);
-        const totals = rollupKpi(
-          months.map((month) => ({ ...month, khoanMoney: month.khoanMoney ?? 0 })),
-          explicit
-        );
+      for (const [key, anchor] of anchors) {
+        const months = mine.filter((row) => rollupKey(periodType, row.period) === key);
+        const explicit = effectiveTarget(targets.get(userId) ?? [], periodType, periodsIn(periodType, anchor)[0]!);
+        const rollup = rollupKpiPeriod({
+          periodType,
+          period: anchor,
+          months: months.map((month) => ({ ...month, khoanMoney: month.khoanMoney ?? 0 })),
+          monthTargets: targets.get(userId) ?? [],
+          explicitTarget: explicit,
+          started,
+          settled: (period) => settledPeriods.has(period)
+        });
         rollups.push({
           userId,
           periodType,
-          key,
-          periods: months.map((month) => month.period),
+          ...rollup,
           explicitTarget: explicit !== null,
-          ...totals,
-          khoanMoney: admin || userId === context.user.id ? totals.khoanMoney : null
+          khoanMoney: admin || userId === context.user.id ? rollup.khoanMoney : null
         });
+      }
+    }
+  }
+
+  // Team and organization totals (ADMIN): per month of the range and per quarter / year.
+  const totals: KpiReportTotal[] = [];
+  if (admin) {
+    const groups: { scope: "TEAM" | "ORG"; teamId: string | null; teamName: string | null; members: Set<string> }[] = [];
+    const teams = new Map<string, { teamId: string | null; teamName: string | null; members: Set<string> }>();
+    for (const userId of visibleUsers) {
+      const team = teamOf.get(userId) ?? { teamId: null, teamName: null };
+      const entry = teams.get(team.teamId ?? "") ?? { ...team, members: new Set<string>() };
+      entry.members.add(userId);
+      teams.set(team.teamId ?? "", entry);
+    }
+    groups.push(
+      ...[...teams.values()]
+        .sort((a, b) => (a.teamName === null ? 1 : b.teamName === null ? -1 : a.teamName.localeCompare(b.teamName, "vi")))
+        .map((team) => ({ scope: "TEAM" as const, ...team })),
+      { scope: "ORG", teamId: null, teamName: null, members: visible }
+    );
+    for (const group of groups) {
+      for (const period of periods) {
+        const items = finalRows.filter((row) => row.period === period && group.members.has(row.userId));
+        if (items.length > 0) {
+          totals.push({ scope: group.scope, teamId: group.teamId, teamName: group.teamName, periodType: "MONTH", key: period, ...sumKpiFigures(items) });
+        }
+      }
+      for (const periodType of ["QUARTER", "YEAR"] as const) {
+        const keys = [...new Set(rollups.filter((item) => item.periodType === periodType).map((item) => item.key))];
+        for (const key of keys) {
+          const items = rollups.filter((item) => item.periodType === periodType && item.key === key && group.members.has(item.userId));
+          if (items.length > 0) {
+            totals.push({ scope: group.scope, teamId: group.teamId, teamName: group.teamName, periodType, key, ...sumKpiFigures(items) });
+          }
+        }
       }
     }
   }
@@ -490,6 +582,7 @@ export const getKpiReport = async (context: AccessContext, query: { from: string
       };
     }),
     rows: finalRows,
-    rollups
+    rollups,
+    totals
   };
 };

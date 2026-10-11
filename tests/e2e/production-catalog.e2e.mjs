@@ -125,7 +125,8 @@ try {
   });
   ok("import with createMissing", r.body.ok === true && r.body.imported === 2 && r.body.createdProjects.join() === `${code}NEW`, JSON.stringify(r.body));
   ok("imported version effective 2026-07-01", (await cell(admin, "2026-07-01"))?.creditPerImage === 4);
-  r = await admin.call("POST", "/production/credit-rules/versions", { effectiveFrom: "2026-08-01" });
+  // A date no score has reached yet: realistic seed data uses the current prices up to today.
+  r = await admin.call("POST", "/production/credit-rules/versions", { effectiveFrom: "2027-08-01" });
   ok("new version copies every current rule", r.status === 201 && r.body.created >= 2, JSON.stringify(r.body));
   r = await b.call("POST", "/production/credit-rules/import", { csv: "project_code,process_name,credit\nA,B,1", effectiveFrom: "2026-07-01" });
   ok("STAFF cannot import (403)", r.status === 403);

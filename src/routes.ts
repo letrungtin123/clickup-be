@@ -10,6 +10,7 @@ import { createProductionLeaveRoutes } from "./modules/production/leave.routes.j
 import { createProductionRoutes } from "./modules/production/production.routes.js";
 import { createProductionReportRoutes } from "./modules/production/reports.routes.js";
 import { createProductionScoreRoutes } from "./modules/production/scores.routes.js";
+import { createProductionUserAdminRoutes } from "./modules/production/users-admin.routes.js";
 import { createSearchRoutes } from "./modules/search/search.routes.js";
 import { createWorkRoutes } from "./modules/work/work.routes.js";
 import { workspaceRoutes } from "./modules/workspace/workspace.routes.js";
@@ -30,6 +31,7 @@ export const createApiRoutes = (): ExpressRouter => {
   apiRoutes.use(createProductionReportRoutes()); // before the job routes: /production/jobs/export
   apiRoutes.use(createProductionJobRoutes());
   apiRoutes.use(createProductionLeaveRoutes());
+  apiRoutes.use(createProductionUserAdminRoutes());
 
   return apiRoutes;
 };

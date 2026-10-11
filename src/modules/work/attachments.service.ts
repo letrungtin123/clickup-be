@@ -58,8 +58,9 @@ export const createTaskUpload = async (context: AccessContext, taskId: string, i
     VALUES (${attachmentId}, ${context.organization.id}, ${task.project_id}, ${taskId}, ${objectPath}, ${fileName}, ${mimeType},
             ${input.sizeBytes}, ${context.user.id})
   `;
-  const uploadUrl = await createSignedUploadUrl(objectPath);
-  return { attachmentId, uploadUrl, expiresAt: new Date(Date.now() + 2 * 60 * 60 * 1000).toISOString() };
+  // expiresAt is the real expiry of the signed upload token (SEC2-26), not a nominal window.
+  const { url: uploadUrl, expiresAt } = await createSignedUploadUrl(objectPath);
+  return { attachmentId, uploadUrl, expiresAt };
 };
 
 const selectAttachment = async (context: AccessContext, attachmentId: string) => {

@@ -6,7 +6,7 @@ import { toIso, toNullableIso, type QuerySql } from "../../lib/db-types.js";
 import type { AccessContext } from "../access/access-context.js";
 import { toColor, toUserRef, type UserRefJson } from "../work/mappers.js";
 import { userJsonSql } from "../work/tasks.repo.js";
-import { productionRolesOf } from "./access.js";
+import { leadsJob, productionRolesOf } from "./access.js";
 import { cachedConfig } from "./catalog-cache.js";
 import { cursorTextSql } from "./cursor.js";
 import { allowedTransitions, finishedStatusIds, statusById, type TaskRelation, type Workflow } from "./workflow.js";
@@ -194,7 +194,8 @@ export const relationOf = (
   roles: productionRolesOf(context),
   isAssignee: task.assignee_id === context.user.id,
   isQc: task.qc_id === context.user.id,
-  isJobLeader: task.job_leader_id === context.user.id,
+  // SEC2-04: leading the job counts only while the caller still holds LEADER (or ADMIN).
+  isJobLeader: leadsJob(context, task.job_leader_id),
   jobHasOpenFeedback: task.job_open_feedback ?? false,
   jobArchived: task.job_archived ?? false
 });
@@ -211,7 +212,11 @@ export const canSeeAllJobs = (context: AccessContext) => {
   return roles.has("ADMIN") || roles.has("ACCOUNT") || roles.has("LEADER");
 };
 
-/** 404 unless the caller may see the job (all-jobs roles, its leader, or someone working/checking in it). */
+/**
+ * 404 unless the caller may see the job: all-jobs roles (Account / Leader / Admin — every job leader who
+ * still holds LEADER is one of them) or someone working/checking in it. A leader who lost the LEADER role no
+ * longer sees the job through `leader_id` alone (SEC2-04).
+ */
 export const assertJobVisible = async (sql: QuerySql, context: AccessContext, jobId: string) => {
   if (canSeeAllJobs(context)) {
     return;
@@ -219,9 +224,9 @@ export const assertJobVisible = async (sql: QuerySql, context: AccessContext, jo
   const rows = await sql`
     SELECT 1 FROM production.jobs j
     WHERE j.organization_id = ${context.organization.id} AND j.id = ${jobId}
-      AND (j.leader_id = ${context.user.id} OR EXISTS (
+      AND EXISTS (
         SELECT 1 FROM production.tasks t WHERE t.organization_id = j.organization_id AND t.job_id = j.id
-          AND (t.assignee_id = ${context.user.id} OR t.qc_id = ${context.user.id})))
+          AND (t.assignee_id = ${context.user.id} OR t.qc_id = ${context.user.id}))
   `;
   if (rows.length === 0) {
     throw new AppError("JOB_NOT_FOUND", "Không tìm thấy job.", 404);
@@ -230,7 +235,61 @@ export const assertJobVisible = async (sql: QuerySql, context: AccessContext, jo
 
 export const jobArchivedError = () => new AppError("JOB_ARCHIVED", "Job đã lưu trữ — khôi phục trước khi thay đổi.", 409);
 
-export const toProductionTask = (row: TaskRow, workflow: Workflow, relation: TaskRelation): ProductionTask => {
+/** Per-caller extras of a task card (PLAN §7 "Task của tôi": điểm từng task, xem note QC). */
+export type TaskExtras = Pick<ProductionTask, "myCredits" | "lastQcFail">;
+const noExtras: TaskExtras = { myCredits: [], lastQcFail: null };
+
+/**
+ * The caller's recorded points (score ledger per role and pay mode, adjustments included) and the latest QC fail
+ * (note, time, QC) of each task — two queries for a whole page of tasks.
+ */
+export const loadTaskExtras = async (sql: QuerySql, organizationId: string, userId: string, rows: readonly TaskRow[]) => {
+  const result = new Map<string, TaskExtras>();
+  if (rows.length === 0) {
+    return result;
+  }
+  const ids = rows.map((row) => row.id);
+  const failed = rows.filter((row) => row.qc_fail_count > 0).map((row) => row.id);
+  const [credits, fails] = await Promise.all([
+    sql<{ task_id: string; role: "WORKER" | "QC"; pay_mode: "POINTS" | "MONEY_IF_KPI"; credits: string; qty: number }[]>`
+      SELECT task_id, role, pay_mode, sum(credits)::text AS credits, sum(qty)::int AS qty
+      FROM production.score_entries
+      WHERE organization_id = ${organizationId} AND user_id = ${userId} AND task_id = ANY(${ids}::uuid[])
+      GROUP BY task_id, role, pay_mode
+      ORDER BY task_id, role
+    `,
+    failed.length === 0
+      ? Promise.resolve([])
+      : sql<{ task_id: string; note: string | null; created_at: Date; by_user: UserRefJson | null }[]>`
+          SELECT DISTINCT ON (l.task_id) l.task_id, l.note, l.created_at,
+            (SELECT ${userJsonSql(sql)} FROM public.app_users au WHERE au.id = l.user_id) AS by_user
+          FROM production.task_logs l
+          WHERE l.organization_id = ${organizationId} AND l.task_id = ANY(${failed}::uuid[])
+            AND l.action = 'STATUS' AND l.to_value @> '{"qcFail": true}'::jsonb
+          ORDER BY l.task_id, l.created_at DESC, l.id DESC
+        `
+  ]);
+  const extrasOf = (taskId: string) => {
+    const entry = result.get(taskId) ?? { myCredits: [], lastQcFail: null };
+    result.set(taskId, entry);
+    return entry;
+  };
+  for (const row of credits) {
+    extrasOf(row.task_id).myCredits.push({ role: row.role, credits: Number(row.credits), qty: row.qty, payMode: row.pay_mode });
+  }
+  for (const row of fails) {
+    extrasOf(row.task_id).lastQcFail = { note: row.note, at: toIso(row.created_at), by: toUserRef(row.by_user) };
+  }
+  return result;
+};
+
+/** Task rows → API tasks for the caller, with the card extras (loadTaskExtras). */
+export const toProductionTasks = async (sql: QuerySql, context: AccessContext, workflow: Workflow, rows: readonly TaskRow[]) => {
+  const extras = await loadTaskExtras(sql, context.organization.id, context.user.id, rows);
+  return rows.map((row) => toProductionTask(row, workflow, relationOf(context, row), extras.get(row.id)));
+};
+
+export const toProductionTask = (row: TaskRow, workflow: Workflow, relation: TaskRelation, extras: TaskExtras = noExtras): ProductionTask => {
   // Archived jobs are read-only (BUG-PR-04).
   const manage = canManageTask(relation) && !row.job_archived;
   const doneStatusIds = new Set(workflow.statuses.filter((status) => status.countsDone).map((status) => status.id));
@@ -261,6 +320,8 @@ export const toProductionTask = (row: TaskRow, workflow: Workflow, relation: Tas
     qcFailCount: row.qc_fail_count,
     customValues: row.custom_values as ProductionTask["customValues"],
     tagIds: row.tag_ids ?? [],
+    myCredits: extras.myCredits,
+    lastQcFail: extras.lastQcFail,
     createdAt: toIso(row.created_at),
     updatedAt: toIso(row.updated_at),
     capabilities: {

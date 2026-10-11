@@ -10,7 +10,6 @@ import { invalidateAccessContexts } from "../access/access-context.js";
 import { assertPermission } from "../access/resource-access.js";
 import { createAuthUser, generateTemporaryPassword, setAuthUserBanned, setAuthUserPassword } from "../auth/supabase-admin.service.js";
 import { revokeTokensIssuedBefore, signInWithPassword } from "../auth/supabase-auth.service.js";
-import { enqueueDomainEvents } from "../events/outbox.js";
 import { assertCanAssignRole, assertProductionRolesCovered, getOrganizationMemberByUserId } from "./workspace.service.js";
 
 const accessTokenTtlSeconds = 3600;
@@ -81,9 +80,26 @@ const changePasswordAndRevoke = async (userId: string, password: string, keepSes
 /** PD-005: admins create accounts with a one-time temporary password the user must replace. */
 export const createOrganizationMember = async (context: WorkspaceContext, input: CreateOrganizationMemberRequest) => {
   assertPermission(context, Permission.MemberManage);
-  const sql = getSql();
-  await assertCanAssignRole(sql, context, input.roleId);
+  await assertCanAssignRole(getSql(), context, input.roleId);
+  return await provisionOrganizationMember(context, {
+    email: input.email,
+    displayName: input.displayName,
+    jobTitle: input.jobTitle ?? null,
+    roleId: input.roleId
+  });
+};
 
+/**
+ * Creates (or takes over) the account and its active membership with a one-time temporary password (PD-005).
+ * The caller has already authorized the request and the role. `extra` runs inside the same transaction once the
+ * membership exists (e.g. the production module adds production roles, team and whitelist entry — PD-024).
+ */
+export const provisionOrganizationMember = async (
+  context: WorkspaceContext,
+  input: { email: string; displayName: string; jobTitle: string | null; roleId: string },
+  extra?: (tx: QuerySql, userId: string) => Promise<void>
+) => {
+  const sql = getSql();
   // One creation per address at a time: a double click must not hand out a password the second request
   // already replaced (WK-33). The lock is held while GoTrue is called (one short request).
   const { userId, temporaryPassword } = await sql.begin(async (tx) => {
@@ -127,13 +143,16 @@ export const createOrganizationMember = async (context: WorkspaceContext, input:
       userId: id,
       email: input.email,
       displayName: input.displayName,
-      jobTitle: input.jobTitle ?? null,
+      jobTitle: input.jobTitle,
       roleId: input.roleId,
       mustChangePassword: true,
       profile: "overwrite",
       invitedBy: context.user.id,
       actorUserId: context.user.id
     });
+    if (extra) {
+      await extra(tx, id);
+    }
     return { userId: id, temporaryPassword: password };
   });
 
@@ -142,7 +161,7 @@ export const createOrganizationMember = async (context: WorkspaceContext, input:
 };
 
 /**
- * Writes the app profile, an active organization membership and the `member.created` event, inside
+ * Writes the app profile and an active organization membership (who invited whom stays in `invited_by`), inside
  * the caller's transaction. Shared by admin-created accounts and Google-provisioned ones (PD-012);
  * callers have already decided the role. `profile: "keep"` leaves an existing profile untouched.
  */
@@ -180,16 +199,6 @@ export const insertOrganizationMemberRecords = async (
     INSERT INTO public.organization_memberships (organization_id, user_id, role_id, status, invited_by, joined_at)
     VALUES (${input.organizationId}, ${input.userId}, ${input.roleId}, 'active', ${input.invitedBy}, now())
   `;
-  await enqueueDomainEvents(tx, [
-    {
-      organizationId: input.organizationId,
-      type: "member.created",
-      aggregateType: "user",
-      aggregateId: input.userId,
-      actorUserId: input.actorUserId,
-      payload: { email: input.email, roleId: input.roleId }
-    }
-  ]);
 };
 
 export const resetMemberPassword = async (context: WorkspaceContext, membershipId: string) => {
@@ -217,12 +226,32 @@ export const resetMemberPassword = async (context: WorkspaceContext, membershipI
   await assertCanAssignRole(sql, context, target.role_id);
   await assertProductionRolesCovered(sql, context, target.user_id);
   logger.info({ actorId: context.user.id, targetUserId: target.user_id }, "Member password reset");
+  return await issueTemporaryPassword(target.user_id);
+};
 
+/**
+ * Replaces the password with a one-time temporary one the user must change at the next sign-in (PD-005) and ends
+ * every session. The caller has authorized the reset. The password is returned once and never stored in clear.
+ */
+export const issueTemporaryPassword = async (userId: string) => {
   const temporaryPassword = generateTemporaryPassword();
-  await changePasswordAndRevoke(target.user_id, temporaryPassword, null);
-  await sql`UPDATE public.app_users SET must_change_password = true WHERE id = ${target.user_id}`;
+  await changePasswordAndRevoke(userId, temporaryPassword, null);
+  await getSql()`UPDATE public.app_users SET must_change_password = true WHERE id = ${userId}`;
   await invalidateAccessContexts();
   return { temporaryPassword };
+};
+
+/**
+ * Follow-up of a membership status change (after the UPDATE and `invalidateAccessContexts`): a disabled account
+ * loses every session and socket at once and is banned in GoTrue (no new sign-in); a re-activated one is unbanned.
+ */
+export const afterMembershipStatusChange = async (userId: string, status: "active" | "disabled") => {
+  if (status === "disabled") {
+    await revokeUserSessions(userId);
+    await setAuthUserBanned(userId, true).catch((error: unknown) => logger.warn({ err: error, userId }, "GoTrue ban failed"));
+  } else {
+    await setAuthUserBanned(userId, false).catch((error: unknown) => logger.warn({ err: error, userId }, "GoTrue unban failed"));
+  }
 };
 
 /** Raised when the current password is wrong: the only failure the change-password limiter counts (WK-38). */

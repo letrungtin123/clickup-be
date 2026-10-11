@@ -7,12 +7,12 @@ import type { DomainEventEnvelope, DomainEventInput } from "../events/outbox.js"
 import { enqueueDomainEvents } from "../events/outbox.js";
 import { deliverNotifications } from "../notifications/notifications.service.js";
 import { kpiSettlementNotificationHandlers } from "./kpi-settlement-notifications.js";
+import { listOpenJobsLedBy, loadProductionAdminIds } from "./member-lookups.js";
 
 /**
- * Production notifications (PLAN §8): events are written to the outbox inside the task transaction,
- * the worker turns them into inbox entries (and e-mails when enabled). Recipients:
- * assigned → assignee; waiting QC → QC; QC fail → assignee; checked → job leader;
- * qty corrected → assignee; client feedback → job leader + original workers; mentions → mentioned.
+ * Production notifications (SPEC §6 Phase 4 §1, PLAN §8): events are written to the outbox inside the task
+ * transaction, the worker turns them into inbox entries (and e-mails when enabled). Who gets what is decided by
+ * the pure functions in `productionRecipients` (unit-tested); the handlers below only load the people.
  */
 
 type JsonRecord = Record<string, postgres.JSONValue>;
@@ -67,7 +67,113 @@ export const commentCreatedEvent = (
 export const leaveEvent = (organizationId: string, type: "requested" | "decided", leaveId: string, actorId: string, extra: JsonRecord = {}) =>
   ({ ...event(organizationId, `production.leave.${type}`, leaveId, actorId, { leaveId, ...extra }), aggregateType: "production_leave" });
 
+/**
+ * SEC2-04 follow-up: `userId` lost the LEADER role (or was disabled) by `actorId`'s change. The worker tells the
+ * production Admins which open jobs that person still leads, so someone hands them to another Leader.
+ */
+export const leaderRemovedEvent = (organizationId: string, userId: string, actorId: string, reason: "role_removed" | "deactivated"): DomainEventInput => ({
+  organizationId,
+  type: "production.member.leader_removed",
+  aggregateType: "user",
+  aggregateId: userId,
+  actorUserId: actorId,
+  payload: { userId, reason }
+});
+
+// Recipient rules (pure) ---------------------------------------------------------------------------------
+
+/**
+ * The people of a task as the notification rules see them. `leaderId` is the job's leader only while that person
+ * still holds LEADER (or ADMIN, superadmins included) as an active member: a demoted leader lost the job-leader
+ * powers and the job's visibility (SEC2-04), so they are no longer told about it either.
+ */
+export type TaskPeople = { assigneeId: string; qcId: string | null; leaderId: string | null };
+
+/** The people of a job for a job-level comment (see `jobComment`). `creatorId` only while they may still see the job. */
+export type JobPeople = { leaderId: string | null; creatorId: string | null; workerIds: string[] };
+
+const distinct = (ids: readonly (string | null | undefined)[], exclude: readonly (string | null | undefined)[] = []) => {
+  const skip = new Set(exclude.filter((id): id is string => Boolean(id)));
+  return [...new Set(ids.filter((id): id is string => Boolean(id) && !skip.has(id as string)))];
+};
+
+/**
+ * SPEC §6 Phase 4 §1 / PLAN §8 recipients. Every list is de-duplicated; the actor is also dropped by
+ * `deliverNotifications` (nobody is notified of their own action).
+ */
+export const productionRecipients = {
+  /** TASK_ASSIGNED → assignee. */
+  taskAssigned: (task: TaskPeople) => distinct([task.assigneeId]),
+  /** TASK_WAITING_QC → QC. */
+  waitingQc: (task: TaskPeople) => distinct([task.qcId]),
+  /** QC_FAILED → assignee. */
+  qcFailed: (task: TaskPeople) => distinct([task.assigneeId]),
+  /** TASK_CHECKED → the job's leader. */
+  checked: (task: TaskPeople) => distinct([task.leaderId]),
+  /** TASK_LATE / TASK_DUE_SOON → assignee + leader. */
+  deadline: (task: TaskPeople) => distinct([task.assigneeId, task.leaderId]),
+  /** QTY_CHANGED_BY_LEADER → assignee. */
+  qtyChanged: (task: TaskPeople) => distinct([task.assigneeId]),
+  /** FEEDBACK_CREATED → leader + the previous workers ("NV cũ"). */
+  feedback: (leaderId: string | null, previousWorkerIds: readonly string[]) => distinct([leaderId, ...previousWorkerIds]),
+  /** @mentions in a comment → the mentioned people (never the writer). */
+  mentioned: (mentionedIds: readonly string[], writerId: string | null) => distinct(mentionedIds, [writerId]),
+  /**
+   * COMMENT_ADDED on a task → its worker, its QC and the job's leader, never the writer. People @mentioned get the
+   * "nhắc đến" notification instead of a second one.
+   */
+  taskComment: (task: TaskPeople, writerId: string | null, mentionedIds: readonly string[] = []) =>
+    distinct([task.assigneeId, task.qcId, task.leaderId], [writerId, ...mentionedIds]),
+  /**
+   * COMMENT_ADDED on a job (PD-023) → the job's leader, the job's creator and every worker and QC of its tasks,
+   * never the writer; @mentioned people get "nhắc đến" instead.
+   */
+  jobComment: (job: JobPeople, writerId: string | null, mentionedIds: readonly string[] = []) =>
+    distinct([job.leaderId, job.creatorId, ...job.workerIds], [writerId, ...mentionedIds]),
+  /** LEAVE_REQUESTED → the requester's team Leaders (every Leader without a team) + Admins, never the requester. */
+  leaveRequested: (approverIds: readonly string[], requesterId: string) => distinct(approverIds, [requesterId]),
+  /** LEAVE_DECIDED → the requester. */
+  leaveDecided: (requesterId: string) => distinct([requesterId]),
+  /** KPI_SETTLED → each settled person gets their own result. */
+  kpiSettledPerson: (userId: string) => distinct([userId]),
+  /** KPI_SETTLED summary → every production ADMIN, organization superadmins included (PD-011). */
+  kpiSettledAdmins: (adminIds: readonly string[]) => distinct(adminIds)
+};
+
 // Worker side ----------------------------------------------------------------------------------------------
+
+/**
+ * `leaderActiveSql`: the job leader (`j.leader_id`) is an active member who still holds LEADER or ADMIN, or is an
+ * organization superadmin (= `leadsJob`, SEC2-04). Expects the alias `j` (production.jobs).
+ */
+const leaderActiveSql = (sql: QuerySql) => sql`
+  EXISTS (
+    SELECT 1 FROM public.organization_memberships lom
+    WHERE lom.organization_id = j.organization_id AND lom.user_id = j.leader_id AND lom.status = 'active' AND lom.deleted_at IS NULL
+      AND (
+        EXISTS (SELECT 1 FROM public.roles lr WHERE lr.id = lom.role_id AND lr.key = 'superadmin')
+        OR EXISTS (
+          SELECT 1 FROM production.user_roles lur
+          WHERE lur.organization_id = lom.organization_id AND lur.user_id = lom.user_id AND lur.role_code IN ('LEADER', 'ADMIN')
+        )
+      )
+  )
+`;
+
+/** The job creator (`j.created_by`) may still see every job: Account / Leader / Admin or superadmin (PD-014). */
+const creatorSeesJobsSql = (sql: QuerySql) => sql`
+  EXISTS (
+    SELECT 1 FROM public.organization_memberships com
+    WHERE com.organization_id = j.organization_id AND com.user_id = j.created_by AND com.status = 'active' AND com.deleted_at IS NULL
+      AND (
+        EXISTS (SELECT 1 FROM public.roles cr WHERE cr.id = com.role_id AND cr.key = 'superadmin')
+        OR EXISTS (
+          SELECT 1 FROM production.user_roles cur
+          WHERE cur.organization_id = com.organization_id AND cur.user_id = com.user_id AND cur.role_code IN ('ADMIN', 'ACCOUNT', 'LEADER')
+        )
+      )
+  )
+`;
 
 type TaskInfo = {
   id: string;
@@ -75,6 +181,7 @@ type TaskInfo = {
   job_id: string;
   job_code: string;
   leader_id: string;
+  leader_active: boolean;
   assignee_id: string;
   qc_id: string | null;
   process_name: string;
@@ -83,19 +190,28 @@ type TaskInfo = {
   deadline: Date;
 };
 
-const loadTaskInfos = async (organizationId: string, taskIds: string[]) =>
-  taskIds.length === 0
-    ? []
-    : await getSql()<TaskInfo[]>`
-        SELECT t.id, t.number, t.job_id, j.code AS job_code, j.leader_id, t.assignee_id, t.qc_id, pr.name AS process_name,
-          t.qty_assigned, t.qty_done, t.deadline
-        FROM production.tasks t
-        JOIN production.jobs j ON j.organization_id = t.organization_id AND j.id = t.job_id
-        JOIN production.processes pr ON pr.organization_id = t.organization_id AND pr.id = t.process_id
-        WHERE t.organization_id = ${organizationId} AND t.id = ANY(${taskIds}::uuid[])
-      `;
+const loadTaskInfos = async (organizationId: string, taskIds: string[]) => {
+  if (taskIds.length === 0) {
+    return [];
+  }
+  const sql = getSql();
+  return await sql<TaskInfo[]>`
+    SELECT t.id, t.number, t.job_id, j.code AS job_code, j.leader_id, ${leaderActiveSql(sql)} AS leader_active,
+      t.assignee_id, t.qc_id, pr.name AS process_name, t.qty_assigned, t.qty_done, t.deadline
+    FROM production.tasks t
+    JOIN production.jobs j ON j.organization_id = t.organization_id AND j.id = t.job_id
+    JOIN production.processes pr ON pr.organization_id = t.organization_id AND pr.id = t.process_id
+    WHERE t.organization_id = ${organizationId} AND t.id = ANY(${taskIds}::uuid[])
+  `;
+};
 
 const loadTaskInfo = async (organizationId: string, taskId: string) => (await loadTaskInfos(organizationId, [taskId]))[0] ?? null;
+
+const peopleOf = (task: TaskInfo): TaskPeople => ({
+  assigneeId: task.assignee_id,
+  qcId: task.qc_id,
+  leaderId: task.leader_active ? task.leader_id : null
+});
 
 const taskPayload = (task: TaskInfo, extra: Record<string, unknown> = {}) => ({
   productionTaskId: task.id,
@@ -112,13 +228,13 @@ const notifyTask = async (
   envelope: DomainEventEnvelope,
   task: TaskInfo,
   type: NotificationType,
-  recipientIds: (string | null)[],
+  recipientIds: string[],
   extra: Record<string, unknown> = {},
   body: string | null = null
 ) => {
   await deliverNotifications({
     organizationId: envelope.organizationId,
-    recipientIds: recipientIds.filter((id): id is string => Boolean(id)),
+    recipientIds,
     type,
     actorUserId: envelope.actorUserId,
     title: task.job_code,
@@ -135,7 +251,7 @@ export const productionNotificationHandlers: Record<string, (event: DomainEventE
   "production.task.assigned": async (envelope) => {
     const task = await loadTaskInfo(envelope.organizationId, str(envelope.payload.taskId) ?? "");
     if (task) {
-      await notifyTask(envelope, task, "production.task_assigned", [task.assignee_id]);
+      await notifyTask(envelope, task, "production.task_assigned", productionRecipients.taskAssigned(peopleOf(task)));
     }
   },
 
@@ -144,15 +260,16 @@ export const productionNotificationHandlers: Record<string, (event: DomainEventE
     if (!task) {
       return;
     }
+    const people = peopleOf(task);
     const note = str(envelope.payload.note);
     if (envelope.payload.qcFail === true) {
-      await notifyTask(envelope, task, "production.qc_failed", [task.assignee_id], { note }, note);
+      await notifyTask(envelope, task, "production.qc_failed", productionRecipients.qcFailed(people), { note }, note);
     }
     if (envelope.payload.enteredWaitingQc === true) {
-      await notifyTask(envelope, task, "production.task_waiting_qc", [task.qc_id]);
+      await notifyTask(envelope, task, "production.task_waiting_qc", productionRecipients.waitingQc(people));
     }
     if (envelope.payload.enteredChecked === true) {
-      await notifyTask(envelope, task, "production.task_checked", [task.leader_id]);
+      await notifyTask(envelope, task, "production.task_checked", productionRecipients.checked(people));
     }
   },
 
@@ -166,7 +283,7 @@ export const productionNotificationHandlers: Record<string, (event: DomainEventE
       envelope,
       task,
       "production.qty_changed",
-      [task.assignee_id],
+      productionRecipients.qtyChanged(peopleOf(task)),
       { from: envelope.payload.from ?? null, to: envelope.payload.to ?? null, note },
       `#${Number(task.number)}: ${String(envelope.payload.from)} → ${String(envelope.payload.to)} tấm${note ? ` — ${note}` : ""}`
     );
@@ -183,8 +300,8 @@ export const productionNotificationHandlers: Record<string, (event: DomainEventE
     const parked = strArray(envelope.payload.taskIds);
     const sql = getSql();
     const job = (
-      await sql<{ code: string; leader_id: string; workers: string[] }[]>`
-        SELECT j.code, j.leader_id,
+      await sql<{ code: string; leader_id: string; leader_active: boolean; workers: string[] }[]>`
+        SELECT j.code, j.leader_id, ${leaderActiveSql(sql)} AS leader_active,
           coalesce((SELECT array_agg(DISTINCT t.assignee_id) FROM production.tasks t
             WHERE t.organization_id = j.organization_id AND t.job_id = j.id
               AND CASE
@@ -201,7 +318,7 @@ export const productionNotificationHandlers: Record<string, (event: DomainEventE
     const note = str(envelope.payload.note);
     await deliverNotifications({
       organizationId: envelope.organizationId,
-      recipientIds: [job.leader_id, ...job.workers],
+      recipientIds: productionRecipients.feedback(job.leader_active ? job.leader_id : null, job.workers),
       type: "production.feedback",
       actorUserId: envelope.actorUserId,
       title: job.code,
@@ -211,28 +328,56 @@ export const productionNotificationHandlers: Record<string, (event: DomainEventE
     });
   },
 
-  /** Mentioned people get "nhắc đến"; the task's worker, QC and job leader (or the job's leader and creator) get "bình luận". */
+  /**
+   * Mentioned people get "nhắc đến"; everyone else related gets "bình luận" (PD-023): on a task its worker, QC and
+   * job leader; on a job the job's leader, creator and every worker / QC of its tasks. Never the writer. A comment
+   * deleted before the event is handled notifies nobody (it would quote deleted text).
+   */
   "production.comment.created": async (envelope) => {
     const jobId = str(envelope.payload.jobId);
+    const commentId = str(envelope.payload.commentId);
     if (!jobId) {
       return;
     }
-    const mentioned = strArray(envelope.payload.mentionedUserIds);
+    const sql = getSql();
+    if (commentId) {
+      const alive = await sql`
+        SELECT 1 FROM production.comments WHERE organization_id = ${envelope.organizationId} AND id = ${commentId} AND deleted_at IS NULL
+      `;
+      if (alive.length === 0) {
+        return;
+      }
+    }
+    const writerId = envelope.actorUserId;
+    const mentioned = productionRecipients.mentioned(strArray(envelope.payload.mentionedUserIds), writerId);
     const taskId = str(envelope.payload.taskId);
     const task = taskId ? await loadTaskInfo(envelope.organizationId, taskId) : null;
     const job = (
-      await getSql()<{ code: string; leader_id: string; created_by: string }[]>`
-        SELECT code, leader_id, created_by FROM production.jobs WHERE organization_id = ${envelope.organizationId} AND id = ${jobId}
+      await sql<{ code: string; leader_id: string; leader_active: boolean; created_by: string; creator_sees_jobs: boolean; workers: string[] }[]>`
+        SELECT j.code, j.leader_id, ${leaderActiveSql(sql)} AS leader_active, j.created_by, ${creatorSeesJobsSql(sql)} AS creator_sees_jobs,
+          coalesce((
+            SELECT array_agg(DISTINCT p) FROM production.tasks t, unnest(ARRAY[t.assignee_id, t.qc_id]) AS p
+            WHERE t.organization_id = j.organization_id AND t.job_id = j.id AND p IS NOT NULL
+          ), '{}') AS workers
+        FROM production.jobs j WHERE j.organization_id = ${envelope.organizationId} AND j.id = ${jobId}
       `
     )[0];
-    if (!job) {
+    if (!job || (taskId && !task)) {
       return;
     }
-    const commentId = str(envelope.payload.commentId);
     const payload = task ? taskPayload(task, { commentId }) : { jobId, jobCode: job.code, commentId };
-    const related = (task ? [task.assignee_id, task.qc_id, job.leader_id] : [job.leader_id, job.created_by]).filter(
-      (id): id is string => Boolean(id) && !mentioned.includes(id as string)
-    );
+    const related = task
+      ? productionRecipients.taskComment(peopleOf(task), writerId, mentioned)
+      : productionRecipients.jobComment(
+          {
+            leaderId: job.leader_active ? job.leader_id : null,
+            // A creator who works on one of the tasks is in `workers` anyway.
+            creatorId: job.creator_sees_jobs ? job.created_by : null,
+            workerIds: job.workers
+          },
+          writerId,
+          mentioned
+        );
     for (const [type, recipientIds] of [
       ["production.mentioned", mentioned],
       ["production.commented", related]
@@ -287,7 +432,7 @@ Object.assign(productionNotificationHandlers, {
     if (!leaveId || !leave) {
       return;
     }
-    const recipients = await getSql()<{ user_id: string }[]>`
+    const approvers = await getSql()<{ user_id: string }[]>`
       SELECT ur.user_id FROM production.user_roles ur
       LEFT JOIN production.member_profiles mp ON mp.organization_id = ur.organization_id AND mp.user_id = ur.user_id
       WHERE ur.organization_id = ${envelope.organizationId}
@@ -300,7 +445,10 @@ Object.assign(productionNotificationHandlers, {
     `;
     await deliverNotifications({
       organizationId: envelope.organizationId,
-      recipientIds: recipients.map((row) => row.user_id),
+      recipientIds: productionRecipients.leaveRequested(
+        approvers.map((row) => row.user_id),
+        leave.user_id
+      ),
       type: "production.leave_requested",
       actorUserId: envelope.actorUserId,
       title: leave.display_name,
@@ -318,12 +466,46 @@ Object.assign(productionNotificationHandlers, {
     }
     await deliverNotifications({
       organizationId: envelope.organizationId,
-      recipientIds: [leave.user_id],
+      recipientIds: productionRecipients.leaveDecided(leave.user_id),
       type: "production.leave_decided",
       actorUserId: envelope.actorUserId,
       title: leave.status === "APPROVED" ? "Đơn nghỉ được duyệt" : "Đơn nghỉ bị từ chối",
       body: leave.decision_note,
       payload: leavePayload(leaveId, leave),
+      dedupeKey: `evt:${envelope.id}`
+    });
+  },
+
+  /**
+   * SEC2-04 follow-up (PD-024): tells the production Admins (except the one who made the change) which open jobs a
+   * person who no longer leads still has as `leader_id`. Nothing when they still hold LEADER / ADMIN (the role came
+   * back, or they are superadmin) or lead no open job any more.
+   */
+  "production.member.leader_removed": async (envelope: DomainEventEnvelope) => {
+    const userId = str(envelope.payload.userId);
+    if (!userId) {
+      return;
+    }
+    const led = await listOpenJobsLedBy(getSql(), envelope.organizationId, userId);
+    if (led.leaderActive || led.items.length === 0) {
+      return;
+    }
+    const shown = led.items.slice(0, 20);
+    const codes = shown.map((job) => job.code).join(", ");
+    await deliverNotifications({
+      organizationId: envelope.organizationId,
+      recipientIds: await loadProductionAdminIds(getSql(), envelope.organizationId),
+      type: "production.leader_removed",
+      actorUserId: envelope.actorUserId,
+      title: led.displayName || "Leader",
+      body: `Còn dẫn ${led.items.length} job chưa xong: ${codes}${led.items.length > shown.length ? ", …" : ""}. Hãy giao các job này cho Leader khác.`,
+      payload: {
+        userId,
+        userName: led.displayName,
+        reason: str(envelope.payload.reason),
+        jobCount: led.items.length,
+        jobs: shown.map((job) => ({ id: job.id, code: job.code }))
+      },
       dedupeKey: `evt:${envelope.id}`
     });
   }
@@ -335,7 +517,7 @@ Object.assign(productionNotificationHandlers, kpiSettlementNotificationHandlers)
 const deliverDeadline = (kind: "production.task_late" | "production.task_due_soon", organizationId: string, task: TaskInfo) =>
   deliverNotifications({
     organizationId,
-    recipientIds: [task.assignee_id, task.leader_id],
+    recipientIds: productionRecipients.deadline(peopleOf(task)),
     type: kind,
     actorUserId: null,
     title: task.job_code,

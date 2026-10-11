@@ -1,7 +1,7 @@
 import { z } from "zod";
 
 import { createCursorPageSchema } from "./pagination.js";
-import { CustomValuesSchema, IsoDateInputSchema, PayModeSchema, SafeText } from "./production-catalog.js";
+import { CustomFieldFiltersSchema, CustomValuesSchema, IdListQuerySchema, IsoDateInputSchema, PayModeSchema, SafeText } from "./production-catalog.js";
 import { colorTokens, UserRefSchema } from "./work.js";
 
 /**
@@ -67,6 +67,14 @@ export const ProductionTaskSchema = z.object({
   qcFailCount: z.number().int(),
   customValues: CustomValuesSchema,
   tagIds: z.array(Id),
+  /**
+   * Points recorded for the CALLER on this task ("điểm từng task", PLAN §7): the score ledger per role, adjustments
+   * (quantity corrections) included. Empty when nothing was recorded for the caller (not Done / not Checked yet,
+   * or someone else's task).
+   */
+  myCredits: z.array(z.object({ role: z.enum(["WORKER", "QC"]), credits: z.number(), qty: z.number().int(), payMode: PayModeSchema })),
+  /** The latest QC fail of the task ("xem note QC"): its note, when and by whom; null if QC never failed it. */
+  lastQcFail: z.object({ note: z.string().nullable(), at: IsoDate, by: UserRefSchema.nullable() }).nullable(),
   createdAt: IsoDate,
   updatedAt: IsoDate,
   /** What the caller may do with this task right now (the API enforces the same rules). */
@@ -137,10 +145,18 @@ export const MyProductionTasksQuerySchema = z.object({
   role: z.enum(["assignee", "qc", "all"]).default("all"),
   /** Include tasks already past the QC/complete stage (terminal or delivered). */
   includeFinished: BoolQuery,
+  /** TASK tags: any of them (`tagId=a&tagId=b`). */
+  tagId: IdListQuerySchema,
+  /** TASK custom-field filters, query `cf.<key>=…` (CustomFieldFilterSchema in production-catalog). */
+  cf: CustomFieldFiltersSchema,
   cursor: SafeText().max(500).optional(),
   limit: z.coerce.number().int().min(1).max(200).default(100)
 });
 export type MyProductionTasksQuery = z.infer<typeof MyProductionTasksQuerySchema>;
+
+/** GET /production/tasks/qc-queue — optional TASK tag / custom-field filters (same as "Task của tôi"). */
+export const QcQueueQuerySchema = z.object({ tagId: IdListQuerySchema, cf: CustomFieldFiltersSchema });
+export type QcQueueQuery = z.infer<typeof QcQueueQuerySchema>;
 
 // Jobs ----------------------------------------------------------------------------------------------
 
@@ -221,7 +237,10 @@ export const JobQuerySchema = z.object({
   projectId: Id.optional(),
   statusId: Id.optional(),
   leaderId: Id.optional(),
-  tagId: Id.optional(),
+  /** JOB tags: any of them (`tagId=a&tagId=b`; one value still works). */
+  tagId: IdListQuerySchema,
+  /** JOB custom-field filters, query `cf.<key>=…` / `cf.<key>.from=…` (CustomFieldFilterSchema in production-catalog). */
+  cf: CustomFieldFiltersSchema,
   q: SafeText().trim().min(1).max(120).optional(),
   deadlineFrom: IsoDateInput.optional(),
   deadlineTo: IsoDateInput.optional(),
@@ -295,10 +314,16 @@ export const UpdateProductionCommentRequestSchema = z.object({ body: SafeText().
 
 export const TaskLogSchema = z.object({
   id: Id,
-  taskId: Id,
-  taskNumber: z.number().int(),
+  /** null for a job-level row (action JOB). */
+  taskId: Id.nullable(),
+  taskNumber: z.number().int().nullable(),
   user: UserRefSchema.nullable(),
-  action: z.enum(["CREATE", "STATUS", "QTY", "ASSIGN", "NOTE", "FIELD"]),
+  /**
+   * JOB: an edit of the job itself (job timeline only). fromValue / toValue hold just the changed fields among
+   * code, name, projectId, deadline, leaderId, totalImages, driveLink, tagIds, customValues, archived.
+   * FIELD on a task may carry tagIds (tag changes) besides the edited fields.
+   */
+  action: z.enum(["CREATE", "STATUS", "QTY", "ASSIGN", "NOTE", "FIELD", "JOB"]),
   fromValue: z.record(z.string(), z.unknown()).nullable(),
   toValue: z.record(z.string(), z.unknown()).nullable(),
   note: z.string().nullable(),

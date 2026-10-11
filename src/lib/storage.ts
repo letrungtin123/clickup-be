@@ -1,3 +1,5 @@
+import { decodeJwt } from "jose";
+
 import { env } from "../config/env.js";
 import { AppError } from "./app-error.js";
 import { logger } from "./logger.js";
@@ -157,8 +159,35 @@ export const ensureBucket = () => {
   return bucketReady;
 };
 
-/** Signed upload URL the browser PUTs the file to directly (valid ~2 hours, single object path). */
-export const createSignedUploadUrl = async (objectPath: string) => {
+/**
+ * storage-api signs upload URLs for its UPLOAD_SIGNED_URL_EXPIRATION_TIME (60 s by default); the lifetime
+ * cannot be requested per URL. Used when the token's own expiry cannot be read.
+ */
+export const fallbackUploadTtlSeconds = 60;
+
+/**
+ * When a signed-upload token expires (SEC2-26), read from its `exp` claim WITHOUT verifying it: the token comes
+ * straight from storage and is only described here, never trusted. Falls back to `fallbackUploadTtlSeconds`.
+ */
+export const signedUploadExpiry = (token: string | null | undefined, now = Date.now()) => {
+  const fallback = new Date(now + fallbackUploadTtlSeconds * 1000);
+  if (!token) {
+    return fallback;
+  }
+  try {
+    const { exp } = decodeJwt(token);
+    const expiresAt = typeof exp === "number" ? new Date(exp * 1000) : null;
+    return expiresAt && !Number.isNaN(expiresAt.getTime()) ? expiresAt : fallback;
+  } catch {
+    return fallback;
+  }
+};
+
+/**
+ * Signed upload URL the browser PUTs the file to directly (single object path, no overwrite), with the real
+ * expiry of its token. Storage checks the token when the upload starts, so only the start must be in time.
+ */
+export const createSignedUploadUrl = async (objectPath: string): Promise<{ url: string; expiresAt: string }> => {
   await ensureBucket();
   const response = await storageFetch(`/object/upload/sign/${encodeURIComponent(env.STORAGE_BUCKET)}/${encodePath(objectPath)}`, {
     method: "POST",
@@ -169,7 +198,8 @@ export const createSignedUploadUrl = async (objectPath: string) => {
   if (!body.url) {
     throw new AppError("STORAGE_ERROR", "File storage did not return an upload URL.", 502);
   }
-  return browserUrl(body.url);
+  const token = body.token ?? new URL(body.url, "http://storage.invalid").searchParams.get("token");
+  return { url: browserUrl(body.url), expiresAt: signedUploadExpiry(token).toISOString() };
 };
 
 export const getObjectInfo = async (objectPath: string) => {

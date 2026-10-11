@@ -1,5 +1,19 @@
 import type { Redis } from "ioredis";
 
+import { notificationTypes, type NotificationType } from "../../contracts/notifications.js";
+
+/**
+ * Which inbox entries may also go out by e-mail (SPEC §6.1 / PLAN §8, PD-013): the work events of the
+ * production module and the task workspace. Chat never e-mails (SPEC: "CHAT_MESSAGE … không email") — that
+ * covers chat @mentions, thread replies and being added to a channel — and system alerts stay in the app (an
+ * SMTP problem must not feed its own alert loop). Web delivery is unaffected: every type is always in the inbox.
+ */
+const neverEmailed = (type: string) => type.startsWith("chat.") || type.startsWith("channel.") || type.startsWith("system.");
+
+export const emailableNotificationTypes: readonly NotificationType[] = notificationTypes.filter((type) => !neverEmailed(type));
+
+export const isEmailableNotificationType = (type: string) => (emailableNotificationTypes as readonly string[]).includes(type);
+
 /**
  * Digest policy (PD-013, SPEC §6): at most one notification e-mail per user per window. The window
  * is a key with a TTL claimed atomically (SET NX EX) right before a digest is sent; while it lives,

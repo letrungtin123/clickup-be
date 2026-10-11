@@ -25,7 +25,6 @@ import { assertChatAttachmentsEnabled } from "./chat-settings.js";
 /** Chat files follow the owning channel's authorization (product §28, §50). */
 
 const downloadTtlSeconds = 10 * 60;
-const uploadTtlMs = 2 * 60 * 60 * 1000;
 const maxUnsentPerHour = 50;
 
 const notFound = () => new AppError("CHAT_ATTACHMENT_NOT_FOUND", "Attachment was not found.", 404);
@@ -60,8 +59,9 @@ export const createChatUpload = async (context: AccessContext, channelId: string
             ${input.sizeBytes}, ${context.user.id})
   `;
   try {
-    const uploadUrl = await createSignedUploadUrl(objectPath);
-    return { attachmentId, uploadUrl, expiresAt: new Date(Date.now() + uploadTtlMs).toISOString() };
+    // expiresAt is the real expiry of the signed upload token (SEC2-26), not a nominal window.
+    const { url: uploadUrl, expiresAt } = await createSignedUploadUrl(objectPath);
+    return { attachmentId, uploadUrl, expiresAt };
   } catch (error) {
     await sql`DELETE FROM public.message_attachments WHERE id = ${attachmentId} AND status = 'pending'`.catch(() => undefined);
     throw error;

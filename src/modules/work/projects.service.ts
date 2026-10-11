@@ -320,16 +320,6 @@ export const createProject = async (context: AccessContext, input: CreateProject
       INSERT INTO public.lists (organization_id, project_id, name, rank, created_by)
       VALUES (${context.organization.id}, ${created.id}, 'List', 'a0', ${context.user.id})
     `;
-    await enqueueDomainEvents(tx, [
-      {
-        organizationId: context.organization.id,
-        type: "project.created",
-        aggregateType: "project",
-        aggregateId: created.id,
-        actorUserId: context.user.id,
-        payload: { key: input.key, name: input.name, visibility: input.visibility }
-      }
-    ]);
     return created.id;
   });
 

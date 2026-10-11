@@ -417,6 +417,20 @@ export const ReactionResultSchema = z.object({
 });
 export type ReactionResult = z.infer<typeof ReactionResultSchema>;
 
+/** Who reacted with what (GET /messages/:id/reactions): emojis in first-reaction order, people in reaction order. */
+export const ReactionUsersSchema = z.object({
+  messageId: Id,
+  items: z.array(
+    z.object({
+      emoji: z.string(),
+      count: z.number().int().min(0),
+      reactedByMe: z.boolean(),
+      users: z.array(UserRefSchema)
+    })
+  )
+});
+export type ReactionUsers = z.infer<typeof ReactionUsersSchema>;
+
 // Read state ---------------------------------------------------------------------------------------
 
 export const MarkReadRequestSchema = z.object({ seq: Seq }).strict();

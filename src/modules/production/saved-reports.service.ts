@@ -13,7 +13,7 @@ import { logger } from "../../lib/logger.js";
 import type { AccessContext } from "../access/access-context.js";
 import { assertProductionRole, isProductionAdmin } from "./access.js";
 import { loadSettings } from "./catalog.service.js";
-import { assertReportAllowed } from "./reports.js";
+import { assertReportConfigUsable, usesMemberCustomFields } from "./reports.js";
 
 /**
  * Saved report-builder configurations (SPEC Phase 5 §4, production.saved_reports). Report users are
@@ -56,7 +56,9 @@ const parseStoredConfig = (row: { id: string; config: unknown }): ReportConfig |
   return parsed.data;
 };
 
-export const isAdminOnlyConfig = (config: Pick<ReportConfig, "measures">) => config.measures.some((measure) => reportMeasureInfo[measure].adminOnly);
+/** Money measures and members' custom fields (Admin data) make a saved report Admin only. */
+export const isAdminOnlyConfig = (config: Pick<ReportConfig, "measures" | "dimensions" | "filters">) =>
+  config.measures.some((measure) => reportMeasureInfo[measure].adminOnly) || usesMemberCustomFields(config);
 
 const toSavedReport = (row: SavedRow, context: AccessContext): SavedReport | null => {
   const config = parseStoredConfig(row);
@@ -108,8 +110,9 @@ const loadVisible = async (sql: QuerySql, context: AccessContext, reportId: stri
 };
 
 const checkConfig = async (context: AccessContext, config: ReportConfig) => {
-  const settings = await loadSettings(getSql(), org(context));
-  assertReportAllowed(context, config, settings.scoresPublic);
+  const sql = getSql();
+  const settings = await loadSettings(sql, org(context));
+  await assertReportConfigUsable(sql, context, config, settings.scoresPublic);
 };
 
 const assertCanPin = (context: AccessContext) => {

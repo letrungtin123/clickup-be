@@ -30,12 +30,11 @@ describe("api app", () => {
     expect(body.status).toBe("ok");
   });
 
-  it("serves product metadata", async () => {
+  it("serves only the product name and version anonymously (SEC2-20)", async () => {
     const response = await request(app).get("/api/v1/meta").expect(200);
-    const body = ProductMetaSchema.parse(response.body);
 
-    expect(body.name).toBe("Nesso Work");
-    expect(body.ports).toEqual({ web: 5890, api: 3890 });
+    expect(response.body).toEqual({ name: "Nesso Work", apiVersion: "v1" });
+    expect(ProductMetaSchema.safeParse(response.body).success).toBe(false);
   });
 
   it("requires authentication for the current user endpoint", async () => {
@@ -67,7 +66,13 @@ describe("api app", () => {
     ["get", "/api/v1/projects/00000000-0000-4000-8000-000000000001/statuses"],
     ["get", "/api/v1/projects/00000000-0000-4000-8000-000000000001/tasks/00000000-0000-4000-8000-000000000002"],
     ["patch", "/api/v1/projects/00000000-0000-4000-8000-000000000001/tasks/00000000-0000-4000-8000-000000000002"],
-    ["post", "/api/v1/projects/00000000-0000-4000-8000-000000000001/tasks/00000000-0000-4000-8000-000000000002/comments"]
+    ["post", "/api/v1/projects/00000000-0000-4000-8000-000000000001/tasks/00000000-0000-4000-8000-000000000002/comments"],
+    ["post", "/api/v1/production/users"],
+    ["patch", "/api/v1/production/users/00000000-0000-4000-8000-000000000001"],
+    ["post", "/api/v1/production/users/00000000-0000-4000-8000-000000000001/deactivate"],
+    ["post", "/api/v1/production/users/00000000-0000-4000-8000-000000000001/activate"],
+    ["post", "/api/v1/production/users/00000000-0000-4000-8000-000000000001/reset-password"],
+    ["get", "/api/v1/production/users/00000000-0000-4000-8000-000000000001/led-jobs"]
   ])("requires authentication for %s %s", async (method, path) => {
     const agent = request.agent(app);
     const csrf = await agent.get("/api/v1/auth/csrf").expect(200);

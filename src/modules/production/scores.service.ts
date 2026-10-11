@@ -4,11 +4,14 @@ import { AppError } from "../../lib/app-error.js";
 import { toIso, type QuerySql } from "../../lib/db-types.js";
 import type { AccessContext } from "../access/access-context.js";
 import { toUserRef, type UserRefJson } from "../work/mappers.js";
-import { assertProductionMember, isProductionAdmin } from "./access.js";
-import { loadSettings } from "./catalog.service.js";
+import { assertProductionMember, isProductionAdmin, leadsJob } from "./access.js";
+import { closeDaysOf, customFieldsForbidden, loadSettings } from "./catalog.service.js";
+import { matchesCustomFieldFilters, resolveCustomFieldFilters } from "./custom-fields.js";
 import { cursorInstantSql, cursorTextSql, decodeTimeCursor, encodeTimeCursor } from "./cursor.js";
 import { canViewTask, loadTask, relationOf } from "./jobs.repo.js";
 import { approvedLeaveDays } from "./leave.service.js";
+import type { CustomFieldFilter, CustomValues } from "../../contracts/production-catalog.js";
+import { closeDayOfPeriod } from "../../contracts/production-scores.js";
 import {
   daysInclusive,
   effectiveTarget,
@@ -174,8 +177,8 @@ export const getMyScores = async (
   const sql = getSql();
   const settings = await loadSettings(sql, org(context));
   const today = businessDay(new Date());
-  const currentPeriod = periodOfDay(today, settings.kpiCloseDay);
-  const current = periodRange(currentPeriod, settings.kpiCloseDay);
+  const currentPeriod = periodOfDay(today, closeDaysOf(settings));
+  const current = periodRange(currentPeriod, closeDaysOf(settings));
   const from = query.from ?? current.from;
   const to = query.to ?? current.to;
   if (!isValidDay(from) || !isValidDay(to) || from > to || daysInclusive(from, to) > maxRangeDays) {
@@ -234,7 +237,7 @@ export const getScoreForecast = async (context: AccessContext, query: { period?:
   const organizationId = org(context);
   const userId = context.user.id;
   const settings = await loadSettings(sql, organizationId);
-  const closeDay = settings.kpiCloseDay;
+  const closeDay = closeDaysOf(settings);
   const today = businessDay(new Date());
   const period = query.period ?? periodOfDay(today, closeDay);
   const { from, to } = periodRange(period, closeDay);
@@ -285,7 +288,7 @@ export const getScoreForecast = async (context: AccessContext, query: { period?:
 
   return {
     ...result,
-    closeDay,
+    closeDay: closeDayOfPeriod(closeDay, period),
     today,
     pointsKhoan: khoanCents / 100 + 0,
     moneyKhoanProvisional: khoanMoney,
@@ -306,6 +309,8 @@ type BoardRow = {
   points_khoan: string;
   qty_khoan: number;
   money: string;
+  custom_values: CustomValues | null;
+  tag_ids: string[] | null;
 };
 
 /**
@@ -313,7 +318,10 @@ type BoardRow = {
  * the period, ranked by official points. Points are public; money only for the row's owner, ADMIN,
  * or when settings.moneyPublic. 403 for non-admins when settings.scoresPublic is off.
  */
-export const getScoreBoard = async (context: AccessContext, query: { period?: string | undefined; teamId?: string | undefined }): Promise<ScoreBoard> => {
+export const getScoreBoard = async (
+  context: AccessContext,
+  query: { period?: string | undefined; teamId?: string | undefined; tagId?: string[] | undefined; cf?: CustomFieldFilter[] | undefined }
+): Promise<ScoreBoard> => {
   assertProductionMember(context);
   const sql = getSql();
   const organizationId = org(context);
@@ -322,8 +330,14 @@ export const getScoreBoard = async (context: AccessContext, query: { period?: st
   if (!settings.scoresPublic && !admin) {
     throw new AppError("SCORES_PRIVATE", "Bảng điểm chung đang để riêng tư.", 403);
   }
-  const period = query.period ?? periodOfDay(businessDay(new Date()), settings.kpiCloseDay);
-  const { from, to } = periodRange(period, settings.kpiCloseDay);
+  // USER tags / custom fields (e.g. "Năng lực") are Admin data: only an Admin filters the board by them.
+  const tagIds = query.tagId ?? [];
+  if (!admin && (tagIds.length > 0 || (query.cf?.length ?? 0) > 0)) {
+    throw customFieldsForbidden();
+  }
+  const plans = await resolveCustomFieldFilters(sql, organizationId, "USER", query.cf);
+  const period = query.period ?? periodOfDay(businessDay(new Date()), closeDaysOf(settings));
+  const { from, to } = periodRange(period, closeDaysOf(settings));
   const teamId = query.teamId ?? null;
 
   const rows = await sql<BoardRow[]>`
@@ -346,7 +360,13 @@ export const getScoreBoard = async (context: AccessContext, query: { period?: st
     )
     SELECT au.id AS user_id, au.display_name, au.email, au.avatar_url, mp.team_id, tm.name AS team_name,
       coalesce(s.points_official, '0') AS points_official, coalesce(s.points_khoan, '0') AS points_khoan,
-      coalesce(s.qty_khoan, 0) AS qty_khoan, coalesce(s.money, '0') AS money
+      coalesce(s.qty_khoan, 0) AS qty_khoan, coalesce(s.money, '0') AS money,
+      ${plans.length > 0 ? sql`mp.custom_values` : sql`NULL::jsonb`} AS custom_values,
+      ${
+        tagIds.length > 0
+          ? sql`(SELECT array_agg(et.tag_id) FROM production.entity_tags et WHERE et.organization_id = ${organizationId} AND et.entity = 'USER' AND et.entity_id = au.id)`
+          : sql`NULL::uuid[]`
+      } AS tag_ids
     FROM people pe
     JOIN public.app_users au ON au.id = pe.user_id
     LEFT JOIN sums s ON s.user_id = pe.user_id
@@ -358,7 +378,9 @@ export const getScoreBoard = async (context: AccessContext, query: { period?: st
 
   const moneyVisible = admin || settings.moneyPublic;
   const ranked = rankByPoints(
-    rows.map((row) => ({ ...row, pointsOfficial: Number(row.points_official) })),
+    rows
+      .filter((row) => matchesCustomFieldFilters(row.custom_values, plans) && (tagIds.length === 0 || (row.tag_ids ?? []).some((id) => tagIds.includes(id))))
+      .map((row) => ({ ...row, pointsOfficial: Number(row.points_official) })),
     (row) => row.display_name
   );
   return {
@@ -403,7 +425,8 @@ export const getTaskScores = async (context: AccessContext, taskId: string): Pro
   const settings = await loadSettings(sql, organizationId);
   const admin = isProductionAdmin(context);
   const moneyVisible = admin || settings.moneyPublic;
-  const everyone = settings.scoresPublic || admin || task.job_leader_id === context.user.id;
+  // SEC2-04: the job leader's view of everyone's rows ends with the LEADER role.
+  const everyone = settings.scoresPublic || admin || leadsJob(context, task.job_leader_id);
   const rows = await sql<(EntryRow & { owner: UserRefJson })[]>`
     SELECT e.id, e.role, e.task_id, t.number::text AS task_number, e.job_id, j.code AS job_code, e.project_id, p.code AS project_code,
       e.process_id, pr.name AS process_name, e.shift_id, s.name AS shift_name, e.pay_mode, e.kind, e.qty,

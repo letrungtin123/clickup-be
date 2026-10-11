@@ -6,6 +6,7 @@ import { closeDatabase } from "./db/client.js";
 import { closeAmqp } from "./lib/amqp.js";
 import { logger } from "./lib/logger.js";
 import { closeRedis } from "./lib/redis.js";
+import { scheduleAdminEmailBootstrap } from "./modules/auth/admin-bootstrap.js";
 import { registerRoomAuthorizers } from "./modules/room-authorizers.js";
 import { attachRealtimeGateway } from "./realtime/gateway.js";
 
@@ -23,6 +24,8 @@ server.listen(env.API_PORT, env.API_HOST, () => {
     },
     "API server listening"
   );
+  // SPEC Phase 0: ADMIN_EMAIL (if set) is in the sign-in whitelist.
+  scheduleAdminEmailBootstrap();
 });
 
 const closeAfterServerStops = async (error?: Error) => {

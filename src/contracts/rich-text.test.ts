@@ -108,6 +108,49 @@ describe("sanitizeRichText hardening", () => {
     expect(JSON.stringify(doc)).not.toContain(`${String.fromCharCode(92)}u0000`);
   });
 
+  it("drops bidi overrides and isolates from text, code and plain text (SEC2-12)", () => {
+    const bidi = [0x202a, 0x202b, 0x202c, 0x202d, 0x202e, 0x2066, 0x2067, 0x2068, 0x2069].map((code) => String.fromCharCode(code));
+    const rlo = String.fromCharCode(0x202e);
+    const pdi = String.fromCharCode(0x2069);
+    const { doc, text } = sanitizeRichText(
+      {
+        type: "doc",
+        content: [
+          { type: "paragraph", content: [{ type: "text", text: `invoice_${rlo}fdp.exe${pdi}`, marks: [{ type: "bold" }] }] },
+          { type: "codeBlock", content: [{ type: "text", text: `a${bidi.join("")}b` }] },
+          // A node made only of bidi characters disappears.
+          { type: "paragraph", content: [{ type: "text", text: bidi.join("") }] }
+        ]
+      },
+      commentLimits
+    );
+    expect(doc.content).toEqual([
+      { type: "paragraph", content: [{ type: "text", text: "invoice_fdp.exe", marks: [{ type: "bold" }] }] },
+      { type: "codeBlock", attrs: { language: null }, content: [{ type: "text", text: "ab" }] },
+      { type: "paragraph" }
+    ]);
+    expect(text).toBe("invoice_fdp.exe\nab");
+    expect(bidi.some((character) => JSON.stringify(doc).includes(character) || text.includes(character))).toBe(false);
+  });
+
+  it("keeps ordinary right-to-left text and direction marks", () => {
+    const rlm = String.fromCharCode(0x200f);
+    const { text } = sanitizeRichText(paragraph({ type: "text", text: `שלום ${rlm}مرحبا Xin chào` }), commentLimits);
+    expect(text).toBe(`שלום ${rlm}مرحبا Xin chào`);
+  });
+
+  it("strips bidi characters from mention labels, including server-side names (SEC2-12)", () => {
+    const rlo = String.fromCharCode(0x202e);
+    const lri = String.fromCharCode(0x2066);
+    const client = sanitizeRichText(paragraph({ type: "mention", attrs: { id: userId, label: `${rlo}Minh` } }), commentLimits);
+    expect(client.text).toBe("@Minh");
+    const server = sanitizeRichText(paragraph({ type: "mention", attrs: { id: userId, label: "x" } }), commentLimits, {
+      mentionLabels: new Map([[userId, `${lri}Lan${rlo}`]])
+    });
+    expect(server.doc.content?.[0]?.content).toEqual([{ type: "mention", attrs: { id: userId, label: "Lan" } }]);
+    expect(server.text).toBe("@Lan");
+  });
+
   it("uses server-side mention labels: no spoofed names (SEC-API-10)", () => {
     const labels = new Map([[userId, "Minh Nguyễn"]]);
     const { doc, text, mentions } = sanitizeRichText(

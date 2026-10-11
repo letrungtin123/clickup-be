@@ -46,6 +46,87 @@ export type CustomFieldEntity = z.infer<typeof CustomFieldEntitySchema>;
 export const CustomValuesSchema = z.record(SafeText(), z.union([SafeText(), z.number(), z.array(SafeText()), z.null()]));
 export type CustomValues = z.infer<typeof CustomValuesSchema>;
 
+// Custom-field & tag filters of list endpoints (PLAN §8 "trường hiện trong form, bảng và bộ lọc") -----------
+
+/** Key of an admin-defined custom field. */
+export const customFieldKeyPattern = /^[a-z][a-z0-9_]{0,39}$/;
+/** Filter value meaning "the field has no value". */
+export const customFieldEmptyValue = "__empty__";
+
+/**
+ * One custom-field filter. In a query string: `cf.<key>=<value>` (repeat the parameter for several values),
+ * `cf.<key>.from=<v>` / `cf.<key>.to=<v>` for NUMBER / DATE ranges (inclusive). The key must be an active
+ * field of the list's entity (400 CUSTOM_FIELD_FILTER_INVALID otherwise). Semantics by field type:
+ *  - SELECT: one of the values; MULTISELECT: contains at least one of the values;
+ *  - TEXT: contains one of the values (case and accent insensitive);
+ *  - NUMBER / DATE (YYYY-MM-DD): equals one of the values and/or within [from, to].
+ * `__empty__` as a value matches records without a value for the field. Several filters combine with AND.
+ */
+export const CustomFieldFilterSchema = z
+  .object({
+    key: z.string().regex(customFieldKeyPattern, "Trường lọc không hợp lệ."),
+    values: z.array(SafeText().trim().min(1).max(200)).max(50).default([]),
+    from: SafeText().trim().min(1).max(40).optional(),
+    to: SafeText().trim().min(1).max(40).optional()
+  })
+  .strict()
+  .refine((filter) => filter.values.length > 0 || filter.from !== undefined || filter.to !== undefined, "Bộ lọc trường tuỳ biến cần giá trị.");
+export type CustomFieldFilter = z.infer<typeof CustomFieldFilterSchema>;
+export const CustomFieldFiltersSchema = z.array(CustomFieldFilterSchema).max(10).default([]);
+
+const queryValues = (value: unknown): string[] =>
+  value === undefined || value === null ? [] : (Array.isArray(value) ? value : [value]).filter((item): item is string => typeof item === "string");
+
+/**
+ * Turns the `cf.<key>[.from|.to]` parameters of a parsed query string into `cf: CustomFieldFilter[]` (other
+ * parameters are kept as they are). Use before parsing a list query schema: `JobQuerySchema.parse(withCustomFieldFilters(req.query))`.
+ */
+export const withCustomFieldFilters = (query: Record<string, unknown>): Record<string, unknown> => {
+  const rest: Record<string, unknown> = {};
+  const filters = new Map<string, { key: string; values: string[]; from?: string; to?: string }>();
+  for (const [name, value] of Object.entries(query)) {
+    const match = /^cf\.([^.]+)(?:\.(from|to))?$/.exec(name);
+    if (!match) {
+      rest[name] = value;
+      continue;
+    }
+    const key = match[1]!;
+    const filter = filters.get(key) ?? { key, values: [] };
+    const values = queryValues(value);
+    if (match[2] === "from" || match[2] === "to") {
+      if (values[0] !== undefined) {
+        filter[match[2]] = values[0];
+      }
+    } else {
+      filter.values.push(...values);
+    }
+    filters.set(key, filter);
+  }
+  return filters.size > 0 ? { ...rest, cf: [...filters.values()] } : rest;
+};
+
+/** A uuid list in a query string: `tagId=a&tagId=b` (a single value is accepted too). Any of them matches. */
+export const IdListQuerySchema = z.preprocess(
+  (value) => (value === undefined || value === "" ? undefined : Array.isArray(value) ? value : [value]),
+  z.array(z.string().uuid()).min(1).max(50).optional()
+);
+
+// KPI close day history (G15) ---------------------------------------------------------------------------
+
+/**
+ * One version of the KPI close day. A new close day applies from the NEXT KPI period; the current period keeps
+ * its boundaries (no overlap, no gap). The close day of period P is the version with the latest fromPeriod ≤ P.
+ */
+export const KpiCloseDayVersionSchema = z.object({
+  /** First KPI period ("YYYY-MM") this close day applies to; null = every earlier period. */
+  fromPeriod: z
+    .string()
+    .regex(/^\d{4}-(0[1-9]|1[0-2])$/)
+    .nullable(),
+  closeDay: z.number().int().min(1).max(28)
+});
+export type KpiCloseDayVersion = z.infer<typeof KpiCloseDayVersionSchema>;
+
 // Members -----------------------------------------------------------------------------------------
 
 export const ProductionMemberSchema = z.object({
@@ -62,6 +143,14 @@ export const ProductionMemberSchema = z.object({
 export type ProductionMember = z.infer<typeof ProductionMemberSchema>;
 export const ProductionMemberCollectionSchema = z.object({ items: z.array(ProductionMemberSchema) });
 
+/**
+ * GET /production/members?tagId=…&cf.<key>=… — USER tags (any of them) and USER custom-field filters
+ * (CustomFieldFilterSchema). Members' custom values and tags are Admin data: non-admins get them empty and
+ * filtering by them is 403 CUSTOM_FIELDS_FORBIDDEN.
+ */
+export const ProductionMemberQuerySchema = z.object({ tagId: IdListQuerySchema, cf: CustomFieldFiltersSchema });
+export type ProductionMemberQuery = z.infer<typeof ProductionMemberQuerySchema>;
+
 export const UpdateProductionMemberRequestSchema = z
   .object({
     roles: z.array(ProductionRoleSchema).max(5).optional(),
@@ -77,7 +166,10 @@ export const ProductionMeSchema = z.object({
   isAdmin: z.boolean(),
   teamId: Id.nullable(),
   settings: z.object({
+    /** Close day of the CURRENT KPI period (an Admin's change applies from the next period, see kpiCloseDays). */
     kpiCloseDay: z.number().int(),
+    /** Close-day versions, oldest first (the first has fromPeriod null): compute any period's dates with them. */
+    kpiCloseDays: z.array(KpiCloseDayVersionSchema).min(1),
     scoresPublic: z.boolean(),
     moneyPublic: z.boolean(),
     chatAttachmentsEnabled: z.boolean(),
@@ -102,6 +194,9 @@ export const ClientSchema = z.object({
   projectCount: z.number().int()
 });
 export const ClientCollectionSchema = z.object({ items: z.array(ClientSchema) });
+/** GET /production/clients?tagId=…&cf.<key>=… — CLIENT tags (any of them) and CLIENT custom-field filters. */
+export const ClientQuerySchema = z.object({ tagId: IdListQuerySchema, cf: CustomFieldFiltersSchema });
+export type ClientQuery = z.infer<typeof ClientQuerySchema>;
 export const UpsertClientRequestSchema = z
   .object({
     name: SafeText().trim().min(1).max(160),
@@ -340,7 +435,13 @@ export const UpsertTagRequestSchema = z
 // Settings & whitelist ----------------------------------------------------------------------------
 
 export const ProductionSettingsSchema = z.object({
+  /**
+   * The close day last configured. A change applies from the NEXT KPI period (the current period keeps its
+   * boundaries); kpiCloseDays lists every version (read only).
+   */
   kpiCloseDay: z.number().int().min(1).max(28),
+  /** Read only: close-day versions, oldest first (the first has fromPeriod null). */
+  kpiCloseDays: z.array(KpiCloseDayVersionSchema).min(1),
   scoresPublic: z.boolean(),
   moneyPublic: z.boolean(),
   kpiProrateLeave: z.boolean(),
@@ -352,7 +453,7 @@ export const ProductionSettingsSchema = z.object({
   timezone: z.string()
 });
 export type ProductionSettings = z.infer<typeof ProductionSettingsSchema>;
-export const UpdateProductionSettingsRequestSchema = ProductionSettingsSchema.omit({ timezone: true }).partial().strict();
+export const UpdateProductionSettingsRequestSchema = ProductionSettingsSchema.omit({ timezone: true, kpiCloseDays: true }).partial().strict();
 
 export const AllowedEmailSchema = z.object({ email: z.string(), addedBy: z.string().nullable(), createdAt: IsoDate });
 export const AllowedEmailCollectionSchema = z.object({ items: z.array(AllowedEmailSchema) });

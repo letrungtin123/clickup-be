@@ -1,11 +1,12 @@
 import { getSql } from "../../db/client.js";
 import type { DomainEventEnvelope, DomainEventInput } from "../events/outbox.js";
 import { deliverNotifications } from "../notifications/notifications.service.js";
+import { loadProductionAdminIds } from "./member-lookups.js";
 
 /**
  * KPI_SETTLED notifications (SPEC §8.2, PLAN §8): every settlement run queues one outbox event in its
- * transaction; the worker tells each settled person their result and sends every production ADMIN one
- * summary per run. A run superseded before delivery (its rows were replaced) notifies nobody.
+ * transaction; the worker tells each settled person their result and sends every production ADMIN
+ * (organization superadmins included) one summary per run. A run superseded before delivery (its rows were replaced) notifies nobody.
  */
 
 export const kpiSettledEvent = (organizationId: string, runId: string, period: string, actorUserId: string | null): DomainEventInput => ({
@@ -80,15 +81,11 @@ export const kpiSettlementNotificationHandlers: Record<string, (event: DomainEve
         dedupeKey: `kpi:${runId}:result`
       });
     }
-    const admins = await sql<{ user_id: string }[]>`
-      SELECT DISTINCT ur.user_id FROM production.user_roles ur
-      JOIN public.organization_memberships om
-        ON om.organization_id = ur.organization_id AND om.user_id = ur.user_id AND om.deleted_at IS NULL AND om.status = 'active'
-      WHERE ur.organization_id = ${envelope.organizationId} AND ur.role_code = 'ADMIN'
-    `;
+    // Every production ADMIN, organization superadmins included (implicitly ADMIN, PD-011).
+    const adminIds = await loadProductionAdminIds(sql, envelope.organizationId);
     await deliverNotifications({
       organizationId: envelope.organizationId,
-      recipientIds: admins.map((admin) => admin.user_id),
+      recipientIds: adminIds,
       type: "production.kpi_settled",
       actorUserId: null,
       title: `Đã chốt KPI kỳ ${label}`,

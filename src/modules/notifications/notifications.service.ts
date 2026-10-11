@@ -254,6 +254,29 @@ export const deliverNotifications = async (draft: NotificationDraft) => {
 
 export type InsertedNotificationRow = NotificationRow & { recipient_user_id: string };
 
+/**
+ * "Thông báo trên web" (notify_web, PD-021): whether each recipient wants live pop-ups / toasts. It never
+ * suppresses the inbox entry or the unread badge (PLAN §8: web notifications are always kept). A lookup failure
+ * falls back to pop-ups on (the default).
+ */
+const loadWebPopupPreferences = async (sql: QuerySql, userIds: string[]) => {
+  const result = new Map<string, boolean>();
+  if (userIds.length === 0) {
+    return result;
+  }
+  try {
+    const rows = await sql<{ id: string; notify_web: boolean }[]>`
+      SELECT id, notify_web FROM public.app_users WHERE id = ANY(${userIds}::uuid[])
+    `;
+    for (const row of rows) {
+      result.set(row.id, row.notify_web);
+    }
+  } catch (error) {
+    logger.warn({ err: error }, "Reading web notification preferences failed; pop-ups stay on");
+  }
+  return result;
+};
+
 /** Live push (with the recipient's new unread count) and optional e-mail for freshly inserted rows. */
 export const afterNotificationsInserted = async (organizationId: string, inserted: InsertedNotificationRow[]) => {
   if (inserted.length === 0) {
@@ -261,13 +284,15 @@ export const afterNotificationsInserted = async (organizationId: string, inserte
   }
   const sql = getSql();
   const unreadByUser = new Map<string, number>();
+  const popupByUser = await loadWebPopupPreferences(sql, [...new Set(inserted.map((row) => row.recipient_user_id))]);
   for (const row of inserted) {
     if (!unreadByUser.has(row.recipient_user_id)) {
       unreadByUser.set(row.recipient_user_id, await countUnread(sql, organizationId, row.recipient_user_id));
     }
     publishToUsers([row.recipient_user_id], "notification:new", {
       notification: toNotification(row),
-      unreadCount: unreadByUser.get(row.recipient_user_id) ?? 0
+      unreadCount: unreadByUser.get(row.recipient_user_id) ?? 0,
+      popup: popupByUser.get(row.recipient_user_id) ?? true
     });
   }
 

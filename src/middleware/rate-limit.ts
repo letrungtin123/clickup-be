@@ -96,17 +96,43 @@ export const createLoginRateLimit = () =>
     skipSuccessfulRequests: true,
     standardHeaders: "draft-8",
     legacyHeaders: false,
-    keyGenerator: (req) => {
-      const body: unknown = req.body;
-      const email =
-        typeof body === "object" && body !== null && "email" in body && typeof body.email === "string"
-          ? body.email.trim().toLowerCase().slice(0, 254)
-          : "";
-      return `${clientIp(req)}|${email}`;
-    },
+    keyGenerator: (req) => `${clientIp(req)}|${loginEmail(req)}`,
     handler: rejectWith("LOGIN_RATE_LIMITED", "Too many sign-in attempts. Try again in a few minutes."),
     ...redisStore("login")
   });
+
+/**
+ * A failed sign-in for the per-address limiters: any 4xx (wrong credentials, invalid input, another login
+ * limiter's 429). Successes never count; neither do 5xx (identity provider down), so an outage cannot lock
+ * an office out for the day.
+ */
+export const isFailedLoginStatus = (statusCode: number) => statusCode >= 400 && statusCode < 500;
+
+const loginIpFailureLimit = (prefix: string, windowMs: number, limit: number) =>
+  rateLimit({
+    windowMs,
+    limit,
+    skipSuccessfulRequests: true,
+    requestWasSuccessful: (_req, res) => !isFailedLoginStatus(res.statusCode),
+    standardHeaders: "draft-8",
+    legacyHeaders: false,
+    keyGenerator: (req) => `ip:${clientIp(req)}`,
+    handler: rejectWith(
+      "LOGIN_RATE_LIMITED",
+      "Có quá nhiều lần đăng nhập không thành công từ địa chỉ mạng này. Vui lòng thử lại sau."
+    ),
+    ...redisStore(prefix)
+  });
+
+/**
+ * Password-spraying guard (SEC2-02): failed sign-ins per client address across ALL emails, which the
+ * IP+email and per-account limiters cannot see. Two windows: a burst cap per 15 minutes and a daily cap.
+ * Only failures count, so colleagues behind one office NAT are affected by failed attempts alone.
+ */
+export const createLoginIpRateLimits = () => [
+  loginIpFailureLimit("login-ip", 15 * 60 * 1000, env.LOGIN_IP_LIMIT_MAX),
+  loginIpFailureLimit("login-ip-day", 24 * 60 * 60 * 1000, env.LOGIN_IP_DAILY_LIMIT_MAX)
+];
 
 /** Marks a change-password request whose current password was wrong (counted by the limiter below). */
 export const markPasswordGuessFailed = (res: Response) => {

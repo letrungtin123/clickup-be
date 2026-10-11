@@ -33,7 +33,17 @@ export const notificationTypes = [
   "production.commented",
   "production.leave_requested",
   "production.leave_decided",
-  "production.kpi_settled"
+  "production.kpi_settled",
+  /**
+   * To production Admins: someone lost the LEADER role (or the account was disabled) while still leading open
+   * jobs. Payload: { userId, userName, jobs: [{ id, code }], jobCount }. Target: none (open the member / jobs).
+   */
+  "production.leader_removed",
+  /**
+   * Ops alert to production Admins + organization admins: a worker queue parked messages it could not process.
+   * Payload: { queue, count }. At most one per queue per hour. Web only (never e-mailed).
+   */
+  "system.dead_letter"
 ] as const;
 export const NotificationTypeSchema = z.enum(notificationTypes);
 export type NotificationType = z.infer<typeof NotificationTypeSchema>;
@@ -96,8 +106,13 @@ export const ArchiveNotificationsRequestSchema = z.object({ ids: z.array(Id).min
 
 export const UnreadCountSchema = z.object({ unreadCount: z.number().int() });
 
-/** `notification:new` → room user:<id>. */
-export type NotificationNewEvent = { notification: Notification; unreadCount: number };
+/**
+ * `notification:new` → room user:<id>.
+ * `popup`: the recipient's "Thông báo trên web" preference (notify_web). The inbox entry and the unread badge
+ * always update (PLAN §8: web notifications are always kept); only when `popup` is true does the client show a
+ * toast / pop-up for it. Missing on events from older servers = true.
+ */
+export type NotificationNewEvent = { notification: Notification; unreadCount: number; popup?: boolean };
 /** `notification:read` → room user:<id> (multi-device sync). */
 export type NotificationReadEvent = { ids: string[] | "all"; unreadCount: number };
 /** `notification:archived` → room user:<id> (other tabs/devices drop the archived entries, BUG-WK-48). */

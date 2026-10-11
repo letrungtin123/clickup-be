@@ -2,12 +2,14 @@ import { randomUUID } from "node:crypto";
 
 import type { z } from "zod";
 
+import type { CustomFieldFilter, CustomValues } from "../../contracts/production-catalog.js";
 import type {
   AssignTaskRequestSchema,
   CreateTaskLine,
   MyProductionTasksQuery,
   ProductionTask,
   ProductionTaskPage,
+  QcQueueQuery,
   TaskKind,
   TransitionTaskRequest,
   UpdateProductionTaskRequestSchema
@@ -18,7 +20,15 @@ import type { QuerySql } from "../../lib/db-types.js";
 import type { AccessContext } from "../access/access-context.js";
 import { assertProductionMember } from "./access.js";
 import { cursorInstantSql, decodeTimeCursor, encodeTimeCursor } from "./cursor.js";
-import { loadFieldDefinitions, resolveCustomValues, setEntityTags, validateCustomValues } from "./custom-fields.js";
+import {
+  anyTagSql,
+  customFieldFilterSql,
+  loadFieldDefinitions,
+  resolveCustomFieldFilters,
+  resolveCustomValues,
+  setEntityTags,
+  taskLineCustomValues
+} from "./custom-fields.js";
 import { syncJobChat } from "./job-chat.service.js";
 import {
   canManageTask,
@@ -27,17 +37,20 @@ import {
   jobArchivedError,
   loadMemberRoles,
   loadTask,
+  loadTaskExtras,
   loadWorkflowModel,
   relationOf,
   selectTasks,
   taskSelectSql,
   toProductionTask,
+  toProductionTasks,
   type TaskRow
 } from "./jobs.repo.js";
 import { enqueueProductionEvents, taskAssignedEvent, taskQtyEvent, taskStatusEvent } from "./notifications.js";
 import { publishProductionChange } from "./realtime.js";
 import { onTaskQtyChanged, onTaskStatusEntered } from "./scoring-hooks.js";
 import {
+  assertDeclaredDoneQty,
   assertTransition,
   computeIsLate,
   defaultTaskDeadline,
@@ -147,6 +160,8 @@ export const moveTasks = async (
     let otHours = task.ot_hours === null ? null : Number(task.ot_hours);
     if (firstDone) {
       qtyDone = extras.qtyDone ?? task.qty_assigned;
+      // SEC2-03: the declared quantity feeds points / Khoán money in the append-only ledger.
+      assertDeclaredDoneQty(task.qty_assigned, qtyDone);
       if (task.requires_ot_hours) {
         if (extras.otHours === undefined) {
           throw new AppError("OT_HOURS_REQUIRED", "Ca OT cần nhập số giờ OT khi Done.", 400);
@@ -335,7 +350,20 @@ export const getProductionTask = async (context: AccessContext, taskId: string, 
   if (!canViewTask(relation)) {
     throw notFound();
   }
-  return toProductionTask(task, workflow, relation);
+  const extras = await loadTaskExtras(sql, context.organization.id, context.user.id, [task]);
+  return toProductionTask(task, workflow, relation, extras.get(task.id));
+};
+
+/**
+ * TASK tag (any of them) and custom-field filters of the personal lists. Returns a builder: a postgres.js fragment
+ * must never be returned from an async function (awaiting it would run it as a query).
+ */
+const taskListFilters = async (sql: QuerySql, organizationId: string, query: { tagId?: string[] | undefined; cf?: CustomFieldFilter[] | undefined }) => {
+  const plans = await resolveCustomFieldFilters(sql, organizationId, "TASK", query.cf);
+  return () => sql`
+    ${query.tagId?.length ? sql`AND ${anyTagSql(sql, "TASK", "t.id", "t.organization_id", query.tagId)}` : sql``}
+    ${plans.length > 0 ? sql`AND ${customFieldFilterSql(sql, "t.custom_values", plans)}` : sql``}
+  `;
 };
 
 /** Personal board: tasks I work on and/or check, soonest deadline first (full-precision keyset, BUG-PR-05). */
@@ -347,12 +375,14 @@ export const listMyProductionTasks = async (context: AccessContext, query: MyPro
   const workflow = await loadWorkflowModel(sql, organizationId);
   const finished = query.includeFinished ? [] : finishedStatusIds(workflow);
   const me = context.user.id;
+  const filters = await taskListFilters(sql, organizationId, query);
   const rows = await sql<TaskRow[]>`
     ${taskSelectSql(sql)}
     WHERE t.organization_id = ${organizationId}
       AND ${query.role === "assignee" ? sql`t.assignee_id = ${me}` : query.role === "qc" ? sql`t.qc_id = ${me}` : sql`(t.assignee_id = ${me} OR t.qc_id = ${me})`}
       AND NOT (t.status_id = ANY(${finished}::uuid[]))
       AND j.archived_at IS NULL
+      ${filters()}
       ${cursor ? sql`AND (t.deadline, t.id) > (${cursorInstantSql(sql, cursor.at)}, ${cursor.id}::uuid)` : sql``}
     ORDER BY t.deadline, t.id
     LIMIT ${query.limit + 1}
@@ -360,25 +390,27 @@ export const listMyProductionTasks = async (context: AccessContext, query: MyPro
   const page = rows.slice(0, query.limit);
   const last = page[page.length - 1];
   return {
-    items: page.map((row) => toProductionTask(row, workflow, relationOf(context, row))),
+    items: await toProductionTasks(sql, context, workflow, page),
     pageInfo: { hasMore: rows.length > query.limit, nextCursor: rows.length > query.limit && last ? encodeTimeCursor(last.deadline_cursor, last.id) : null }
   };
 };
 
 /** QC queue: tasks waiting for my check, oldest Done first (archived jobs left out, BUG-PR-04). */
-export const listQcQueue = async (context: AccessContext) => {
+export const listQcQueue = async (context: AccessContext, query: QcQueueQuery = { cf: [] }) => {
   assertProductionMember(context);
   const sql = getSql();
   const workflow = await loadWorkflowModel(sql, context.organization.id);
   const waiting = workflow.statuses.filter((status) => status.code === "WAITING_QC").map((status) => status.id);
+  const filters = await taskListFilters(sql, context.organization.id, query);
   const rows = await sql<TaskRow[]>`
     ${taskSelectSql(sql)}
     WHERE t.organization_id = ${context.organization.id} AND t.qc_id = ${context.user.id}
       AND t.status_id = ANY(${waiting}::uuid[]) AND j.archived_at IS NULL
+      ${filters()}
     ORDER BY t.done_at NULLS LAST, t.id
     LIMIT 500
   `;
-  return { items: rows.map((row) => toProductionTask(row, workflow, relationOf(context, row))), pageInfo: { hasMore: false, nextCursor: null } };
+  return { items: await toProductionTasks(sql, context, workflow, rows), pageInfo: { hasMore: false, nextCursor: null } };
 };
 
 // Creating tasks -------------------------------------------------------------------------------------------
@@ -463,17 +495,47 @@ export const insertTasks = async (
     throw new AppError("WORKFLOW_INCOMPLETE", "Chưa có trạng thái khởi tạo trong cấu hình.", 409);
   }
   const parentIds = [...new Set(lines.map((line) => line.sourceTaskId ?? options.defaultParentId).filter((id): id is string => Boolean(id)))];
-  const parents = new Map<string, { assignedAt: Date; deadline: Date }>();
+  const parents = new Map<string, { assignedAt: Date; deadline: Date; customValues: CustomValues; tagIds: string[] }>();
   if (parentIds.length > 0) {
-    const found = await tx<{ id: string; assigned_at: Date; deadline: Date }[]>`
-      SELECT id, assigned_at, deadline FROM production.tasks
-      WHERE organization_id = ${organizationId} AND job_id = ${job.id} AND id = ANY(${parentIds}::uuid[])
+    const found = await tx<{ id: string; assigned_at: Date; deadline: Date; custom_values: CustomValues; tag_ids: string[] | null }[]>`
+      SELECT t.id, t.assigned_at, t.deadline, t.custom_values,
+        (SELECT array_agg(et.tag_id ORDER BY et.created_at) FROM production.entity_tags et
+          WHERE et.organization_id = t.organization_id AND et.entity = 'TASK' AND et.entity_id = t.id) AS tag_ids
+      FROM production.tasks t
+      WHERE t.organization_id = ${organizationId} AND t.job_id = ${job.id} AND t.id = ANY(${parentIds}::uuid[])
     `;
     if (found.length !== parentIds.length) {
       throw new AppError("SOURCE_TASK_INVALID", "Task gốc không thuộc job này.", 400);
     }
     for (const row of found) {
-      parents.set(row.id, { assignedAt: row.assigned_at, deadline: row.deadline });
+      parents.set(row.id, { assignedAt: row.assigned_at, deadline: row.deadline, customValues: row.custom_values ?? {}, tagIds: row.tag_ids ?? [] });
+    }
+  }
+  // Custom fields and tags of every line, all errors at once ("Dòng N: …"), before anything is written. A feedback
+  // redo task ("Giao lại") inherits its source task's values and tags unless the line sends its own.
+  const definitions = await loadFieldDefinitions(tx, organizationId, "TASK");
+  const lineErrors: string[] = [];
+  const lineValues = lines.map((line, index) => {
+    const parentId = line.sourceTaskId ?? options.defaultParentId;
+    const parent = options.kind === "NORMAL" || !parentId ? null : (parents.get(parentId) ?? null);
+    try {
+      return { customValues: taskLineCustomValues(definitions, line.customValues, parent?.customValues ?? null), tagIds: [...new Set(line.tagIds ?? parent?.tagIds ?? [])] };
+    } catch (error) {
+      lineErrors.push(`Dòng ${index + 1}: ${error instanceof Error ? error.message : String(error)}`);
+      return { customValues: {}, tagIds: [] };
+    }
+  });
+  if (lineErrors.length > 0) {
+    throw new AppError("CUSTOM_FIELDS_INVALID", lineErrors.join(" "), 400);
+  }
+  const lineTagIds = [...new Set(lineValues.flatMap((value) => value.tagIds))];
+  if (lineTagIds.length > 0) {
+    const known = new Set(
+      (await tx<{ id: string }[]>`SELECT id FROM production.tags WHERE organization_id = ${organizationId} AND id = ANY(${lineTagIds}::uuid[])`).map((row) => row.id)
+    );
+    const missing = lineValues.flatMap((value, index) => (value.tagIds.some((tagId) => !known.has(tagId)) ? [`Dòng ${index + 1}: tag không tồn tại.`] : []));
+    if (missing.length > 0) {
+      throw new AppError("TAG_NOT_FOUND", missing.join(" "), 400);
     }
   }
   let warning: string | null = null;
@@ -487,8 +549,7 @@ export const insertTasks = async (
     warning = overAllocationWarning(job.total_images, assigned, lines.reduce((sum, line) => sum + line.qtyAssigned, 0));
   }
   const assignedAt = options.assignedAt ?? new Date();
-  const definitions = await loadFieldDefinitions(tx, organizationId, "TASK");
-  const rows = lines.map((line) => {
+  const rows = lines.map((line, index) => {
     const parentId = line.sourceTaskId ?? options.defaultParentId;
     const deadline = line.deadline
       ? new Date(line.deadline)
@@ -510,9 +571,9 @@ export const insertTasks = async (
       deadline: deadline.toISOString(),
       parentId,
       note: line.note?.trim() || null,
-      customValues: validateCustomValues(definitions, line.customValues, { enforceRequired: true }),
+      customValues: lineValues[index]!.customValues,
       isLate: computeIsLate({ doneAt: null, closed: false, deadline, now: assignedAt }),
-      tagIds: line.tagIds ?? []
+      tagIds: lineValues[index]!.tagIds
     };
   });
   await tx`
@@ -577,7 +638,7 @@ export const createProductionTasks = async (context: AccessContext, jobId: strin
   await syncJobChat(context, jobId);
   const workflow = await loadWorkflowModel(sql, organizationId);
   const rows = await selectTasks(sql, organizationId, result.ids);
-  return { tasks: rows.map((row) => toProductionTask(row, workflow, relationOf(context, row))), warnings: result.warnings };
+  return { tasks: await toProductionTasks(sql, context, workflow, rows), warnings: result.warnings };
 };
 
 // Changing tasks -------------------------------------------------------------------------------------------
@@ -762,9 +823,10 @@ export const updateProductionTask = async (context: AccessContext, taskId: strin
       }
     }
     const deadline = input.deadline ? new Date(input.deadline) : task.deadline;
+    // Required TASK fields are checked whenever values are sent (like jobs and clients), and at creation.
     const customValues =
       input.customValues !== undefined
-        ? await resolveCustomValues(tx, organizationId, "TASK", input.customValues, { existing: task.custom_values as never, enforceRequired: false })
+        ? await resolveCustomValues(tx, organizationId, "TASK", input.customValues, { existing: task.custom_values as never, enforceRequired: true })
         : task.custom_values;
     const note = input.note === undefined ? task.note : input.note?.trim() || null;
     // A deadline moved into the past makes the task late now; the next scan notifies once for that deadline (BUG-PR-03).
@@ -787,6 +849,10 @@ export const updateProductionTask = async (context: AccessContext, taskId: strin
         to[key] = after;
       }
     };
+    // Tag changes are part of the task history too (FIELD tagIds, sorted).
+    if (input.tagIds) {
+      track("tagIds", [...new Set(task.tag_ids ?? [])].sort(), [...new Set(input.tagIds)].sort());
+    }
     track("qtyAssigned", task.qty_assigned, input.qtyAssigned ?? task.qty_assigned);
     track("processId", task.process_id, input.processId ?? task.process_id);
     track("shiftId", task.shift_id, input.shiftId ?? task.shift_id);

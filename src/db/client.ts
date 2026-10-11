@@ -1,4 +1,3 @@
-import { drizzle } from "drizzle-orm/postgres-js";
 import postgres from "postgres";
 import { z } from "zod";
 
@@ -28,7 +27,6 @@ const roleDefaults: Record<DatabaseRole, { max: number; statementTimeoutMs: numb
 
 let role: DatabaseRole = "api";
 let sqlClient: postgres.Sql | undefined;
-let dbClient: ReturnType<typeof drizzle> | undefined;
 /** Set when the server ignored the startup parameters (e.g. Supavisor): limits are applied per transaction. */
 let applyTimeoutsPerTransaction = false;
 
@@ -122,11 +120,6 @@ export const setLocalStatementTimeout = async (tx: postgres.TransactionSql, mill
   await tx`SELECT set_config('statement_timeout', ${String(Math.max(0, Math.trunc(milliseconds)))}, true)`;
 };
 
-export const getDb = () => {
-  dbClient ??= drizzle(getSql());
-  return dbClient;
-};
-
 export const checkDatabase = async () => {
   if (!env.DATABASE_URL) {
     return { ok: false, reason: "DATABASE_URL is not configured" };
@@ -140,6 +133,5 @@ export const closeDatabase = async () => {
   if (sqlClient) {
     await sqlClient.end({ timeout: 5 });
     sqlClient = undefined;
-    dbClient = undefined;
   }
 };

@@ -9,7 +9,8 @@ import {
   NewPasswordSchema,
   SafeLineSchema,
   SafeMultilineSchema,
-  SafeSearchSchema
+  SafeSearchSchema,
+  WorkspaceSessionSchema
 } from "./schemas.js";
 import { CreateTaskRequestSchema, TaskQuerySchema, UpdateListRequestSchema, UpdateProjectRequestSchema } from "./work.js";
 
@@ -100,5 +101,23 @@ describe("reaction emoji normalization (WK-63)", () => {
     // ✌ + skin tone: no selector before a modifier; keycap #️⃣ keeps its selector.
     expect(normalizeReactionEmoji(`${char(0x270c)}${char(0x1f3fb)}`)).toBe(`${char(0x270c)}${char(0x1f3fb)}`);
     expect(normalizeReactionEmoji(`#${char(0x20e3)}`)).toBe(`#${VS16}${char(0x20e3)}`);
+  });
+});
+
+describe("WorkspaceSessionSchema (GET /workspace/context, PD-021)", () => {
+  const context = {
+    user: { id: "00000000-0000-4000-8000-000000000001", displayName: "A", email: null },
+    organization: { id: "00000000-0000-4000-8000-000000000002", slug: "nesso", name: "Nesso" },
+    role: { id: "00000000-0000-4000-8000-000000000003", organizationId: "00000000-0000-4000-8000-000000000002", key: "member", name: "Thành viên", permissions: [] },
+    hasFullOrganizationAuthority: false
+  };
+  it("carries the personal notification channels", () => {
+    expect(WorkspaceSessionSchema.parse({ ...context, notificationPreferences: { notifyWeb: false, notifyEmail: true } }).notificationPreferences).toEqual({
+      notifyWeb: false,
+      notifyEmail: true
+    });
+  });
+  it("defaults to web on, e-mail off", () => {
+    expect(WorkspaceSessionSchema.parse(context).notificationPreferences).toEqual({ notifyWeb: true, notifyEmail: false });
   });
 });

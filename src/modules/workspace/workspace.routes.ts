@@ -18,7 +18,7 @@ import {
   UpdateOrganizationMemberRequestSchema,
   UpdateRolePermissionsRequestSchema,
   UpdateRoleRequestSchema,
-  WorkspaceContextSchema
+  WorkspaceSessionSchema
 } from "../../contracts/schemas.js";
 import { getSql } from "../../db/client.js";
 import { AppError } from "../../lib/app-error.js";
@@ -26,10 +26,9 @@ import { requireSupabaseUser, type AuthenticatedRequest } from "../../middleware
 import { createPasswordChangeRateLimit, markPasswordGuessFailed } from "../../middleware/rate-limit.js";
 import { clearAuthCookies, setAuthCookies } from "../auth/auth.cookies.js";
 import { signInWithPassword } from "../auth/supabase-auth.service.js";
-import { setAuthUserBanned } from "../auth/supabase-admin.service.js";
 import { disconnectUsers } from "../../realtime/publisher.js";
 import { assertPasswordCurrent, invalidateAccessContexts, resolveAccessContext } from "../access/access-context.js";
-import { changeOwnPassword, createOrganizationMember, resetMemberPassword, revokeUserSessions } from "./members.service.js";
+import { afterMembershipStatusChange, changeOwnPassword, createOrganizationMember, resetMemberPassword } from "./members.service.js";
 import {
   archiveRole,
   createRole,
@@ -66,7 +65,18 @@ workspaceRoutes.use(["/workspace", "/permissions", "/roles", "/organization", "/
 workspaceRoutes.get("/workspace/context", async (req, res, next) => {
   try {
     const context = await resolveAccessContext(getAuthenticatedUserId(req));
-    res.json(WorkspaceContextSchema.parse(context));
+    // Personal channels are read fresh (not part of the cached access context): a toggle shows on the next fetch.
+    const preferences = (
+      await getSql()<{ notify_web: boolean; notify_email: boolean }[]>`
+        SELECT notify_web, notify_email FROM public.app_users WHERE id = ${context.user.id}
+      `
+    )[0];
+    res.json(
+      WorkspaceSessionSchema.parse({
+        ...context,
+        notificationPreferences: { notifyWeb: preferences?.notify_web ?? true, notifyEmail: preferences?.notify_email ?? false }
+      })
+    );
   } catch (error) {
     next(error);
   }
@@ -162,11 +172,8 @@ workspaceRoutes.patch("/organization/members/:membershipId", async (req, res, ne
     const context = await resolveActiveContext(req);
     const payload = await updateOrganizationMember(context, membershipId, input);
     await invalidateAccessContexts();
-    if (input.status === "disabled") {
-      await revokeUserSessions(payload.user.id);
-      await setAuthUserBanned(payload.user.id, true).catch(() => undefined);
-    } else if (input.status === "active") {
-      await setAuthUserBanned(payload.user.id, false).catch(() => undefined);
+    if (input.status === "disabled" || input.status === "active") {
+      await afterMembershipStatusChange(payload.user.id, input.status);
     }
     if (input.roleId) {
       // Live room subscriptions were authorized with the old role: force a re-authenticated reconnect.

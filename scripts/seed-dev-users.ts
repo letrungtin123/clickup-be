@@ -3,7 +3,8 @@
  * multi-user flows (assignment, chat, permissions) can be exercised.
  *
  * Passwords are generated once and stored in BE/.env.seed (git-ignored). Never run against
- * anything but the local stack: the script refuses non-loopback URLs.
+ * anything but the local stack: the script refuses non-loopback URLs, NODE_ENV=production and databases
+ * without the dev marker (scripts/lib/dev-guard.ts).
  *
  *   npx tsx scripts/seed-dev-users.ts
  */
@@ -12,6 +13,8 @@ import { existsSync, readFileSync, writeFileSync } from "node:fs";
 
 import "dotenv/config";
 import postgres from "postgres";
+
+import { assertDevDatabase } from "./lib/dev-guard.js";
 
 const seedFile = new URL("../.env.seed", import.meta.url);
 
@@ -32,6 +35,7 @@ if (!isLoopback(supabaseUrl) || !isLoopback(databaseUrl) || !serviceKey) {
   console.error("Refusing to seed: SUPABASE_URL and DATABASE_URL must point at the local stack.");
   process.exit(1);
 }
+await assertDevDatabase(databaseUrl);
 
 type SeedUser = { key: string; email: string; displayName: string; role: "manager" | "member" };
 

@@ -1,5 +1,6 @@
 import type { Response } from "express";
 
+import { customFieldEmptyValue, type CustomFieldFilter } from "../../contracts/production-catalog.js";
 import type { JobQuery, JobSummary } from "../../contracts/production-jobs.js";
 import {
   reportDimensionInfo,
@@ -14,7 +15,7 @@ import type { AccessContext } from "../access/access-context.js";
 import { businessDate, dayCell, exportFilename, numberFormats, percentCell, sendWorkbook, type CellValue, type SheetColumn, type SheetSpec } from "./excel.js";
 import { listJobs } from "./jobs.service.js";
 import { getKpiReport } from "./kpi-settlement.service.js";
-import { runReport } from "./reports.js";
+import { loadReportCustomFields, runReport, type ReportCustomFields } from "./reports.js";
 import { getScoreBoard } from "./scores.service.js";
 import { businessDay } from "./time.js";
 
@@ -63,11 +64,17 @@ const presetLabels: Record<ReportRangePreset, string> = {
 };
 const taskDateLabels: Record<ReportConfig["taskDate"], string> = { DONE: "Ngày Done lần đầu", ASSIGNED: "Ngày giao", DEADLINE: "Deadline" };
 
-type NamedFilter = Exclude<keyof ReportFilters, "taskKind" | "scoreRole" | "taskState" | "jobState"> | "tag";
+type NamedFilter = Exclude<keyof ReportFilters, "taskKind" | "scoreRole" | "taskState" | "jobState" | "customFields"> | "tag";
 const filterLookups: Record<NamedFilter, { label: string; query: (sql: QuerySql, organizationId: string, ids: string[]) => Promise<{ name: string }[]> }> = {
   user: {
     label: "Nhân viên",
-    query: (sql, _org, ids) => sql<{ name: string }[]>`SELECT display_name AS name FROM public.app_users WHERE id = ANY(${ids}::uuid[]) ORDER BY 1`
+    // Only people of this organization (any membership status: former staff still appear in reports, SEC2-27).
+    query: (sql, organizationId, ids) =>
+      sql<{ name: string }[]>`
+        SELECT au.display_name AS name FROM public.app_users au
+        WHERE au.id = ANY(${ids}::uuid[])
+          AND EXISTS (SELECT 1 FROM public.organization_memberships om WHERE om.organization_id = ${organizationId} AND om.user_id = au.id)
+        ORDER BY 1`
   },
   team: {
     label: "Team",
@@ -111,7 +118,7 @@ const filterLookups: Record<NamedFilter, { label: string; query: (sql: QuerySql,
   }
 };
 
-const filterRows = async (sql: QuerySql, organizationId: string, filters: ReportFilters): Promise<[string, CellValue][]> => {
+const filterRows = async (sql: QuerySql, organizationId: string, filters: ReportFilters, customFields?: ReportCustomFields): Promise<[string, CellValue][]> => {
   const rows: [string, CellValue][] = [];
   for (const [key, lookup] of Object.entries(filterLookups) as [NamedFilter, (typeof filterLookups)[NamedFilter]][]) {
     const ids = filters[key];
@@ -133,6 +140,11 @@ const filterRows = async (sql: QuerySql, organizationId: string, filters: Report
   if (filters.jobState) {
     rows.push(["Lọc – Job", filters.jobState === "ACTIVE" ? "Chưa lưu trữ" : "Đã lưu trữ"]);
   }
+  for (const filter of filters.customFields ?? []) {
+    const field = customFields?.get(filter.field);
+    const labelOf = (value: string) => (value === customFieldEmptyValue ? "(chưa có)" : (field?.options.find((option) => option.value === value)?.label ?? value));
+    rows.push([`Lọc – ${field?.label ?? filter.field}`, filter.values.map(labelOf).join(", ")]);
+  }
   return rows;
 };
 
@@ -142,13 +154,17 @@ export const exportReport = async (context: AccessContext, res: Response, input:
   const sql = getSql();
   const { now, today } = exportedAt();
   const config = result.config;
+  // Column labels come with the result (custom-field dimensions carry their field label).
+  const columnLabel = new Map(result.columns.map((column) => [column.key, column.label]));
+  const headerOf = (dim: string) => columnLabel.get(dim) ?? dim;
+  const customFields = await loadReportCustomFields(sql, org(context), config);
 
   const columns: SheetColumn[] = [
     ...config.dimensions.map((dim): SheetColumn => {
       if (dim === "day" || dim === "week") {
         return { header: dim === "week" ? "Tuần (từ thứ Hai)" : reportDimensionInfo[dim].label, key: dim, width: 16, numFmt: numberFormats.day };
       }
-      return { header: reportDimensionInfo[dim].label, key: dim, width: 28 };
+      return { header: headerOf(dim), key: dim, width: 28 };
     }),
     ...config.measures.map((measure): SheetColumn => ({
       header: reportMeasureInfo[measure].label,
@@ -184,14 +200,14 @@ export const exportReport = async (context: AccessContext, res: Response, input:
     ["Tên báo cáo", name],
     ["Khoảng ngày", `${formatDay(result.from)} – ${formatDay(result.to)}`],
     ["Kỳ có sẵn", config.preset ? presetLabels[config.preset] : config.from ? "Tuỳ chọn" : presetLabels.THIS_PERIOD],
-    ["Chiều", config.dimensions.map((dim) => reportDimensionInfo[dim].label).join(", ") || "(không)"],
+    ["Chiều", config.dimensions.map(headerOf).join(", ") || "(không)"],
     ["Chỉ số", config.measures.map((measure) => reportMeasureInfo[measure].label).join(", ")],
     ["Mốc ngày của task", taskDateLabels[config.taskDate]],
-    ...(await filterRows(sql, org(context), config.filters)),
+    ...(await filterRows(sql, org(context), config.filters, customFields)),
     [
       "Sắp xếp",
       config.sort
-        ? `${(reportDimensionInfo as Record<string, { label: string }>)[config.sort.key]?.label ?? reportMeasureInfo[config.sort.key as keyof typeof reportMeasureInfo].label} ${config.sort.direction === "asc" ? "tăng dần" : "giảm dần"}`
+        ? `${columnLabel.get(config.sort.key) ?? config.sort.key} ${config.sort.direction === "asc" ? "tăng dần" : "giảm dần"}`
         : "Mặc định"
     ],
     ["Số dòng", result.rows.length],
@@ -206,6 +222,52 @@ export const exportReport = async (context: AccessContext, res: Response, input:
   ]);
 };
 
+// Custom fields in exports -----------------------------------------------------------------------------
+
+type ExportField = {
+  key: string;
+  label: string;
+  type: "TEXT" | "NUMBER" | "DATE" | "SELECT" | "MULTISELECT";
+  options: { value: string; label: string }[];
+  show_in_table: boolean;
+};
+
+const loadExportFields = (sql: QuerySql, organizationId: string, entity: "JOB" | "TASK" | "USER" | "CLIENT") => sql<ExportField[]>`
+  SELECT key, label, type, options, show_in_table FROM production.custom_fields
+  WHERE organization_id = ${organizationId} AND entity = ${entity} AND active
+  ORDER BY sort_order, key
+`;
+
+const optionLabel = (field: ExportField, value: string) => field.options.find((option) => option.value === value)?.label ?? value;
+
+/** A stored custom value as an Excel cell (option labels, dd/mm/yyyy days, numbers as numbers). */
+const customValueCell = (field: ExportField, value: unknown): CellValue => {
+  if (value === undefined || value === null || value === "") {
+    return null;
+  }
+  switch (field.type) {
+    case "NUMBER":
+      return typeof value === "number" ? value : Number(value);
+    case "DATE":
+      return typeof value === "string" ? formatDay(value) : null;
+    case "SELECT":
+      return typeof value === "string" ? optionLabel(field, value) : null;
+    case "MULTISELECT":
+      return Array.isArray(value) ? value.map((item) => optionLabel(field, String(item))).join(", ") : null;
+    default:
+      return typeof value === "string" || typeof value === "number" ? String(value) : JSON.stringify(value);
+  }
+};
+
+/** "Lọc – <field>" rows of the info sheet for custom-field filters (cf.<key>=…). */
+const customFilterRows = (fields: readonly ExportField[], filters: readonly CustomFieldFilter[] | undefined): [string, CellValue][] =>
+  (filters ?? []).map((filter) => {
+    const field = fields.find((item) => item.key === filter.key);
+    const values = filter.values.map((value) => (value === customFieldEmptyValue ? "(chưa có)" : field ? optionLabel(field, value) : value));
+    const range = [filter.from ? `từ ${filter.from}` : null, filter.to ? `đến ${filter.to}` : null].filter(Boolean).join(" ");
+    return [`Lọc – ${field?.label ?? filter.key}`, [...values, ...(range ? [range] : [])].join(", ")];
+  });
+
 // Jobs -------------------------------------------------------------------------------------------------
 
 /** GET /production/jobs/export — the GET /production/jobs filters (all pages, at most 5000 jobs). */
@@ -219,6 +281,8 @@ export const exportJobs = async (context: AccessContext, res: Response, query: J
   } while (cursor && items.length < exportRowLimit);
   const truncated = items.length > exportRowLimit || cursor !== undefined;
   const { now, today } = exportedAt();
+  const fields = await loadExportFields(getSql(), org(context), "JOB");
+  const tableFields = fields.filter((field) => field.show_in_table);
 
   const columns: SheetColumn[] = [
     { header: "Mã job", key: "code", width: 36 },
@@ -236,9 +300,12 @@ export const exportJobs = async (context: AccessContext, res: Response, query: J
     { header: "FB đang mở", key: "openFeedbackCount", numFmt: numberFormats.count },
     { header: "Trạng thái", key: "status", width: 18 },
     { header: "Ngày tạo", key: "createdAt", width: 18, numFmt: numberFormats.datetime },
-    { header: "Lưu trữ", key: "archived", width: 10 }
+    { header: "Lưu trữ", key: "archived", width: 10 },
+    // PLAN §8: the JOB custom fields shown in the table are columns of the export too (e.g. "Mã đơn hàng").
+    ...tableFields.map((field): SheetColumn => ({ header: field.label, key: `cf_${field.key}`, width: field.type === "TEXT" ? 28 : 18 }))
   ];
   const rows = items.slice(0, exportRowLimit).map((job) => ({
+    ...Object.fromEntries(tableFields.map((field) => [`cf_${field.key}`, customValueCell(field, job.customValues[field.key])])),
     code: job.code,
     name: job.name,
     project: job.project.code,
@@ -264,11 +331,12 @@ export const exportJobs = async (context: AccessContext, res: Response, query: J
   if (query.projectId) filters.push(["Lọc – Dự án", await nameOf("project", query.projectId)]);
   if (query.statusId) filters.push(["Lọc – Trạng thái", await nameOf("status", query.statusId)]);
   if (query.leaderId) filters.push(["Lọc – Leader", await nameOf("user", query.leaderId)]);
-  if (query.tagId) filters.push(["Lọc – Tag", await nameOf("tag", query.tagId)]);
+  if (query.tagId?.length) filters.push(["Lọc – Tag", (await filterLookups.tag.query(sql, org(context), query.tagId)).map((row) => row.name).join(", ")]);
   if (query.deadlineFrom) filters.push(["Deadline từ", businessDate(query.deadlineFrom)]);
   if (query.deadlineTo) filters.push(["Deadline trước", businessDate(query.deadlineTo)]);
   if (query.late) filters.push(["Chỉ job có task trễ", "Có"]);
   if (query.includeArchived) filters.push(["Gồm job đã lưu trữ", "Có"]);
+  filters.push(...customFilterRows(fields, query.cf));
 
   await sendWorkbook(res, exportFilename("Danh sách job", null, today), [
     { name: "Job", columns, rows },
@@ -279,8 +347,13 @@ export const exportJobs = async (context: AccessContext, res: Response, query: J
 // Score board ----------------------------------------------------------------------------------------------
 
 /** GET /production/scores/board/export — the board's own visibility rules (private board → 403, money). */
-export const exportScoreBoard = async (context: AccessContext, res: Response, query: { period?: string | undefined; teamId?: string | undefined }) => {
+export const exportScoreBoard = async (
+  context: AccessContext,
+  res: Response,
+  query: { period?: string | undefined; teamId?: string | undefined; tagId?: string[] | undefined; cf?: CustomFieldFilter[] | undefined }
+) => {
   const board = await getScoreBoard(context, query);
+  const peopleFilters = await peopleFilterRows(context, query);
   const { now, today } = exportedAt();
   const showMoney = board.items.some((item) => item.money !== null);
   const columns: SheetColumn[] = [
@@ -306,10 +379,30 @@ export const exportScoreBoard = async (context: AccessContext, res: Response, qu
     infoSheet([
       ["Kỳ KPI", board.period],
       ["Khoảng ngày", `${formatDay(board.from)} – ${formatDay(board.to)}`],
+      ...peopleFilters,
       ["Số người", rows.length],
       ...exporterRows(context, now)
     ])
   ]);
+};
+
+/** Info rows for the people filters of the board / KPI exports (team, USER tags, USER custom fields). */
+const peopleFilterRows = async (
+  context: AccessContext,
+  query: { teamId?: string | undefined; tagId?: string[] | undefined; cf?: CustomFieldFilter[] | undefined }
+): Promise<[string, CellValue][]> => {
+  const sql = getSql();
+  const rows: [string, CellValue][] = [];
+  if (query.teamId) {
+    rows.push(["Lọc – Team", (await filterLookups.team.query(sql, org(context), [query.teamId]))[0]?.name ?? query.teamId]);
+  }
+  if (query.tagId?.length) {
+    rows.push(["Lọc – Tag", (await filterLookups.tag.query(sql, org(context), query.tagId)).map((row) => row.name).join(", ")]);
+  }
+  if (query.cf?.length) {
+    rows.push(...customFilterRows(await loadExportFields(sql, org(context), "USER"), query.cf));
+  }
+  return rows;
 };
 
 // KPI ------------------------------------------------------------------------------------------------------
@@ -317,10 +410,16 @@ export const exportScoreBoard = async (context: AccessContext, res: Response, qu
 /**
  * GET /production/kpi/export — the Phase 6 KPI report (GET /production/kpi/report, same query and
  * visibility: ADMIN every person, others only themselves; Khoán money only for ADMIN and the owner).
- * One sheet per user × period, one for the quarter / year rollups.
+ * One sheet per user × period, one for the quarter / year rollups (whole quarters / years, G8) and, for an
+ * Admin, one with the team and organization totals per period / quarter / year.
  */
-export const exportKpi = async (context: AccessContext, res: Response, query: { from: string; to: string; teamId?: string | undefined }) => {
+export const exportKpi = async (
+  context: AccessContext,
+  res: Response,
+  query: { from: string; to: string; teamId?: string | undefined; tagId?: string[] | undefined; cf?: CustomFieldFilter[] | undefined }
+) => {
   const report = await getKpiReport(context, query);
+  const peopleFilters = await peopleFilterRows(context, query);
   const { now, today } = exportedAt();
   const people = new Map(report.users.map((entry) => [entry.user.id, entry]));
   const person = (userId: string) => people.get(userId);
@@ -378,6 +477,7 @@ export const exportKpi = async (context: AccessContext, res: Response, query: { 
       { header: "Loại", key: "type", width: 8 },
       { header: "Kỳ", key: "key", width: 10 },
       { header: "Các tháng", key: "periods", width: 30 },
+      { header: "Tình trạng", key: "state", width: 16 },
       { header: "Chỉ tiêu riêng", key: "explicit", width: 14 },
       ...figures,
       ...money
@@ -388,7 +488,37 @@ export const exportKpi = async (context: AccessContext, res: Response, query: { 
       type: row.periodType === "QUARTER" ? "Quý" : "Năm",
       key: row.key,
       periods: row.periods.join(", "),
+      state: rollupState(row),
       explicit: row.explicitTarget ? "Có" : "Không (cộng các tháng)",
+      target: row.target,
+      pointsOfficial: row.pointsOfficial,
+      khoanPointsConverted: row.khoanPointsConverted,
+      totalPoints: row.totalPoints,
+      percent: percentOf(row.percent),
+      difference: row.difference,
+      khoanMoney: row.khoanMoney
+    }))
+  };
+  const totalTypes = { MONTH: "Tháng", QUARTER: "Quý", YEAR: "Năm" } as const;
+  const totals: SheetSpec = {
+    name: "Tổng theo team",
+    columns: [
+      { header: "Nhóm", key: "group", width: 28 },
+      { header: "Loại", key: "type", width: 8 },
+      { header: "Kỳ", key: "key", width: 10 },
+      { header: "Số người", key: "memberCount", width: 10, numFmt: numberFormats.count },
+      { header: "Có chỉ tiêu", key: "withTargetCount", width: 12, numFmt: numberFormats.count },
+      { header: "Đạt KPI", key: "metCount", width: 10, numFmt: numberFormats.count },
+      ...figures,
+      ...money
+    ],
+    rows: report.totals.map((row) => ({
+      group: row.scope === "ORG" ? "Toàn bộ" : (row.teamName ?? "Chưa có team"),
+      type: totalTypes[row.periodType],
+      key: row.key,
+      memberCount: row.memberCount,
+      withTargetCount: row.withTargetCount,
+      metCount: row.metCount,
       target: row.target,
       pointsOfficial: row.pointsOfficial,
       khoanPointsConverted: row.khoanPointsConverted,
@@ -402,11 +532,16 @@ export const exportKpi = async (context: AccessContext, res: Response, query: { 
   await sendWorkbook(res, exportFilename("KPI", scope, today), [
     monthly,
     rollups,
+    ...(report.totals.length > 0 ? [totals] : []),
     infoSheet([
       ["Từ kỳ", report.from],
       ["Đến kỳ", report.to],
+      ...peopleFilters,
       ["Số người", report.users.length],
+      ["Quý / năm", "Cả quý / cả năm: cộng các kỳ tháng đã bắt đầu (kể cả ngoài khoảng chọn), so với chỉ tiêu quý / năm hoặc tổng chỉ tiêu các tháng"],
       ...exporterRows(context, now)
     ])
   ]);
 };
+
+const rollupState = (row: { complete: boolean; settled: boolean }) => (row.settled ? "Đã chốt đủ" : row.complete ? "Tạm tính" : "Chưa hết kỳ");

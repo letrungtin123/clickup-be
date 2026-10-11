@@ -25,8 +25,9 @@ import {
   ScoreForecastSchema,
   TaskScoresSchema
 } from "../../contracts/production-scores.js";
+import { withCustomFieldFilters } from "../../contracts/production-catalog.js";
 import { requireSupabaseUser } from "../../middleware/auth.js";
-import { handle, param } from "../work/http.js";
+import { handle, param } from "./http.js";
 import { getKpiReport, listKpiSettlementRuns, listKpiSettlements, runKpiSettlement } from "./kpi-settlement.service.js";
 import { applyDefaultKpiTargets, deleteKpiTarget, getKpiTargetMatrix, importKpiTargets, putKpiTargets } from "./kpi-targets.service.js";
 import { getMyScores, getScoreBoard, getScoreForecast, getTaskScores } from "./scores.service.js";
@@ -45,7 +46,7 @@ export const createProductionScoreRoutes = (): ExpressRouter => {
     handle(async (context, req) => ScoreForecastSchema.parse(await getScoreForecast(context, ForecastQuerySchema.parse(req.query))))
   );
   routes.get("/production/scores/task/:taskId", handle(async (context, req) => TaskScoresSchema.parse(await getTaskScores(context, param(req, "taskId")))));
-  routes.get("/production/scores/board", handle(async (context, req) => ScoreBoardSchema.parse(await getScoreBoard(context, ScoreBoardQuerySchema.parse(req.query)))));
+  routes.get("/production/scores/board", handle(async (context, req) => ScoreBoardSchema.parse(await getScoreBoard(context, ScoreBoardQuerySchema.parse(withCustomFieldFilters(req.query))))));
 
   // KPI targets (ADMIN)
   routes.get(
@@ -83,7 +84,7 @@ export const createProductionScoreRoutes = (): ExpressRouter => {
       KpiSettlementRunCollectionSchema.parse(await listKpiSettlementRuns(context, KpiSettlementRunQuerySchema.parse(req.query)))
     )
   );
-  routes.get("/production/kpi/report", handle(async (context, req) => KpiReportSchema.parse(await getKpiReport(context, KpiReportQuerySchema.parse(req.query)))));
+  routes.get("/production/kpi/report", handle(async (context, req) => KpiReportSchema.parse(await getKpiReport(context, KpiReportQuerySchema.parse(withCustomFieldFilters(req.query))))));
 
   return routes;
 };

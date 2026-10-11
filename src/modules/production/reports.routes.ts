@@ -1,5 +1,6 @@
 import { Router, type Router as ExpressRouter } from "express";
 
+import { withCustomFieldFilters } from "../../contracts/production-catalog.js";
 import { JobQuerySchema } from "../../contracts/production-jobs.js";
 import {
   AdminDashboardSchema,
@@ -20,7 +21,7 @@ import {
 } from "../../contracts/production-reports.js";
 import { KpiReportQuerySchema, ScoreBoardQuerySchema } from "../../contracts/production-scores.js";
 import { requireSupabaseUser } from "../../middleware/auth.js";
-import { handle, param } from "../work/http.js";
+import { handle, param } from "./http.js";
 import { listAnomalies, reviewAnomaly, unreviewAnomaly } from "./anomalies.service.js";
 import { getAdminDashboard, getLeaderDashboard } from "./dashboards.service.js";
 import { exportJobs, exportKpi, exportReport, exportScoreBoard } from "./exports.service.js";
@@ -88,19 +89,19 @@ export const createProductionReportRoutes = (): ExpressRouter => {
   routes.get(
     "/production/jobs/export",
     handle(async (context, req, res) => {
-      await exportJobs(context, res, JobQuerySchema.parse(req.query));
+      await exportJobs(context, res, JobQuerySchema.parse(withCustomFieldFilters(req.query)));
     })
   );
   routes.get(
     "/production/scores/board/export",
     handle(async (context, req, res) => {
-      await exportScoreBoard(context, res, ScoreBoardQuerySchema.parse(req.query));
+      await exportScoreBoard(context, res, ScoreBoardQuerySchema.parse(withCustomFieldFilters(req.query)));
     })
   );
   routes.get(
     "/production/kpi/export",
     handle(async (context, req, res) => {
-      await exportKpi(context, res, KpiReportQuerySchema.parse(req.query));
+      await exportKpi(context, res, KpiReportQuerySchema.parse(withCustomFieldFilters(req.query)));
     })
   );
 

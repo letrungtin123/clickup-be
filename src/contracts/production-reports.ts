@@ -68,6 +68,31 @@ export const reportMeasures = [
 export const ReportMeasureSchema = z.enum(reportMeasures);
 export type ReportMeasure = z.infer<typeof ReportMeasureSchema>;
 
+/**
+ * Custom-field dimensions (PLAN §8/§10, e.g. "Năng lực" A++/A/B on USER): `cf_<entity>:<key>` with entity user
+ * (the person: worker/QC of a score entry, assignee of a task), job, task or client, for active SELECT,
+ * MULTISELECT and TEXT fields (400 REPORT_INVALID otherwise). Row key = the stored value (option value / text),
+ * `<dim>_label` = the option label; records without a value group under null ("Chưa có"). MULTISELECT groups by
+ * each chosen option, so a record counts once per option (totals still count it once). USER fields are Admin data:
+ * ADMIN only (403 CUSTOM_FIELDS_FORBIDDEN). With settings.scoresPublic off, job/task fields count as personal
+ * breakdowns like `job` (PR-11).
+ */
+export const customFieldDimensionEntities = ["user", "job", "task", "client"] as const;
+export type CustomFieldDimensionEntity = (typeof customFieldDimensionEntities)[number];
+export type CustomFieldDimension = `cf_${CustomFieldDimensionEntity}:${string}`;
+export const customFieldDimensionPattern = /^cf_(user|job|task|client):([a-z][a-z0-9_]{0,39})$/;
+export const isCustomFieldDimension = (value: unknown): value is CustomFieldDimension =>
+  typeof value === "string" && customFieldDimensionPattern.test(value);
+export const CustomFieldDimensionSchema = z.custom<CustomFieldDimension>(isCustomFieldDimension, "Chiều trường tuỳ biến không hợp lệ.");
+/** `{ entity: "user", key: "nang_luc" }` of "cf_user:nang_luc"; null for any other text. */
+export const parseCustomFieldDimension = (value: string): { entity: CustomFieldDimensionEntity; key: string } | null => {
+  const match = customFieldDimensionPattern.exec(value);
+  return match ? { entity: match[1] as CustomFieldDimensionEntity, key: match[2]! } : null;
+};
+/** A fixed dimension or a custom-field one. */
+export const ReportDimensionKeySchema = z.union([ReportDimensionSchema, CustomFieldDimensionSchema]);
+export type ReportDimensionKey = z.infer<typeof ReportDimensionKeySchema>;
+
 export type ReportValueFormat = "text" | "day" | "week" | "month" | "points" | "money" | "count" | "images" | "percent" | "hours" | "decimal";
 
 /** Chip labels (Vietnamese) for the builder. `time` dimensions sort chronologically. */
@@ -131,7 +156,17 @@ export const ReportFiltersSchema = z
     /** TASKS measures only: open work (not Done and not closed, OPEN) or Done (DONE). */
     taskState: z.enum(["OPEN", "DONE"]).optional(),
     /** Jobs not archived (ACTIVE) or archived ones only (ARCHIVED); both when absent. */
-    jobState: z.enum(["ACTIVE", "ARCHIVED"]).optional()
+    jobState: z.enum(["ACTIVE", "ARCHIVED"]).optional(),
+    /**
+     * Custom-field filters (AND between fields): `field` like a custom-field dimension ("cf_user:nang_luc"),
+     * `values` = stored values (SELECT option values / MULTISELECT: has any of them / TEXT: exact text);
+     * "__empty__" = no value. Same field rules and permissions as the custom-field dimensions.
+     */
+    customFields: z
+      .array(z.object({ field: CustomFieldDimensionSchema, values: z.array(SafeText().trim().min(1).max(200)).min(1).max(100) }).strict())
+      .min(1)
+      .max(10)
+      .optional()
   })
   .strict();
 export type ReportFilters = z.infer<typeof ReportFiltersSchema>;
@@ -147,7 +182,8 @@ const unique = (values: readonly string[]) => new Set(values).size === values.le
 
 export const ReportConfigSchema = z
   .object({
-    dimensions: z.array(ReportDimensionSchema).max(4).default([]),
+    /** Fixed dimensions and/or custom-field ones (`cf_<entity>:<key>`, see CustomFieldDimensionSchema). */
+    dimensions: z.array(ReportDimensionKeySchema).max(4).default([]),
     measures: z.array(ReportMeasureSchema).min(1).max(reportMeasures.length),
     filters: ReportFiltersSchema.default({}),
     /** Relative range, resolved at run time (pinned reports stay current). Default THIS_PERIOD. */
@@ -157,7 +193,7 @@ export const ReportConfigSchema = z
     to: DateOnly.optional(),
     taskDate: ReportTaskDateSchema.default("DONE"),
     sort: z
-      .object({ key: z.union([ReportDimensionSchema, ReportMeasureSchema]), direction: z.enum(["asc", "desc"]).default("desc") })
+      .object({ key: z.union([ReportDimensionKeySchema, ReportMeasureSchema]), direction: z.enum(["asc", "desc"]).default("desc") })
       .strict()
       .optional(),
     limit: z.number().int().min(1).max(reportRowLimit).optional(),
@@ -165,8 +201,8 @@ export const ReportConfigSchema = z
     view: z
       .object({
         type: ReportChartTypeSchema.default("TABLE"),
-        rows: z.array(ReportDimensionSchema).max(4).default([]),
-        columns: z.array(ReportDimensionSchema).max(4).default([])
+        rows: z.array(ReportDimensionKeySchema).max(4).default([]),
+        columns: z.array(ReportDimensionKeySchema).max(4).default([])
       })
       .strict()
       .optional()

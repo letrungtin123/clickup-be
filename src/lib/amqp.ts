@@ -6,6 +6,10 @@ import { logger } from "./logger.js";
 export const eventsExchange = "nesso.events";
 export const deadLetterExchange = "nesso.events.dlx";
 
+/** Durable work queues of the worker (jobs/registry.ts); each has `.retry` and `.dead` companions (declareWorkQueue). */
+export const workQueueNames = { notifications: "nesso.notifications", email: "nesso.email" } as const;
+export const deadQueueName = (queue: string) => `${queue}.dead`;
+
 export type QueueSpec = {
   name: string;
   bindings: string[];
@@ -81,8 +85,26 @@ const getPublishChannel = async () => {
     }
   });
   channel.on("error", (error: Error) => logger.warn({ err: error }, "RabbitMQ publish channel error"));
+  // Messages are published "mandatory": an event type no queue is bound to comes back here instead of vanishing.
+  channel.on("return", (message: { fields: { routingKey: string } }) => reportUnroutedEvent(message.fields.routingKey));
   publishChannel = channel;
   return channel;
+};
+
+const unroutedSeen = new Set<string>();
+
+/**
+ * An outbox event type that no consumer binds (no queue receives it): logged once per type and process, so a new
+ * event without a consumer (or a consumer that lost its binding) is noticed instead of being dropped silently.
+ * Returns whether this call logged.
+ */
+export const reportUnroutedEvent = (routingKey: string) => {
+  if (unroutedSeen.has(routingKey) || unroutedSeen.size >= 500) {
+    return false;
+  }
+  unroutedSeen.add(routingKey);
+  logger.warn({ routingKey }, "Outbox event has no consumer: no queue is bound to this event type");
+  return true;
 };
 
 /** Publishes persistent messages and waits for broker confirmation. */
@@ -97,6 +119,7 @@ export const publishEvents = async (
   for (const message of messages) {
     channel.publish(eventsExchange, message.routingKey, Buffer.from(JSON.stringify(message.body)), {
       persistent: true,
+      mandatory: true,
       contentType: "application/json",
       messageId: message.messageId,
       timestamp: Math.floor(message.timestamp.getTime() / 1000),
@@ -135,6 +158,36 @@ export const declareWorkQueue = async (channel: Channel, spec: QueueSpec) => {
   }
 
   return { retryQueue, deadQueue };
+};
+
+type ChannelFactory = { createChannel(): Promise<Pick<Channel, "checkQueue" | "close" | "on">> };
+
+/**
+ * Messages parked in each work queue's `.dead` queue (passive declare: nothing is created). A queue that does not
+ * exist (yet) or cannot be read counts as null.
+ */
+export const getDeadLetterCounts = async (model?: ChannelFactory): Promise<Record<string, number | null>> => {
+  const connection: ChannelFactory = model ?? (await getAmqpConnection());
+  const counts: Record<string, number | null> = {};
+  for (const queue of Object.values(workQueueNames)) {
+    const dead = deadQueueName(queue);
+    let channel: Awaited<ReturnType<ChannelFactory["createChannel"]>> | undefined;
+    try {
+      channel = await connection.createChannel();
+      // A missing queue closes the channel with 404: handled here, never an unhandled `error` event.
+      channel.on("error", () => undefined);
+      counts[dead] = (await channel.checkQueue(dead)).messageCount;
+    } catch {
+      counts[dead] = null;
+    } finally {
+      try {
+        await channel?.close();
+      } catch {
+        // already closed (e.g. by the 404 of a missing queue)
+      }
+    }
+  }
+  return counts;
 };
 
 export const checkAmqp = async () => {

@@ -4,6 +4,7 @@ import type { ProductionRole } from "../../contracts/production-catalog.js";
 import { AppError } from "../../lib/app-error.js";
 import {
   allowedTransitions,
+  assertDeclaredDoneQty,
   assertTransition,
   computeIsLate,
   defaultTaskDeadline,
@@ -11,6 +12,7 @@ import {
   feedbackTaskDeadline,
   finishedStatusIds,
   isQcFail,
+  maxDeclaredDoneQty,
   overAllocationWarning,
   systemFollowUp,
   taskLineErrors,
@@ -266,5 +268,39 @@ describe("task lines", () => {
   it("warns (but allows) over-allocation", () => {
     expect(overAllocationWarning(10, 5, 5)).toBeNull();
     expect(overAllocationWarning(10, 5, 6)).toContain("11");
+  });
+});
+
+describe("declared Done quantity cap (SEC2-03)", () => {
+  const codeOf = (fn: () => unknown) => {
+    try {
+      fn();
+    } catch (error) {
+      return { code: (error as AppError).code, status: (error as AppError).statusCode, message: (error as AppError).message };
+    }
+    return null;
+  };
+
+  it("caps at max(2 × assigned, assigned + 10)", () => {
+    expect(maxDeclaredDoneQty(10)).toBe(20);
+    expect(maxDeclaredDoneQty(100)).toBe(200);
+    expect(maxDeclaredDoneQty(1)).toBe(11);
+    expect(maxDeclaredDoneQty(5)).toBe(15);
+    expect(maxDeclaredDoneQty(0)).toBe(10);
+  });
+
+  it("keeps small overshoots legal (12/10 must still reach the anomaly report)", () => {
+    expect(codeOf(() => assertDeclaredDoneQty(10, 12))).toBeNull();
+    expect(codeOf(() => assertDeclaredDoneQty(10, 20))).toBeNull();
+    expect(codeOf(() => assertDeclaredDoneQty(10, 8))).toBeNull();
+    expect(codeOf(() => assertDeclaredDoneQty(10, 0))).toBeNull();
+    expect(codeOf(() => assertDeclaredDoneQty(1, 11))).toBeNull();
+  });
+
+  it("refuses anything above the cap with QTY_DONE_TOO_HIGH (400, Vietnamese message)", () => {
+    expect(codeOf(() => assertDeclaredDoneQty(10, 21))).toMatchObject({ code: "QTY_DONE_TOO_HIGH", status: 400 });
+    expect(codeOf(() => assertDeclaredDoneQty(10, 1_000_000))?.code).toBe("QTY_DONE_TOO_HIGH");
+    expect(codeOf(() => assertDeclaredDoneQty(1, 12))?.code).toBe("QTY_DONE_TOO_HIGH");
+    expect(codeOf(() => assertDeclaredDoneQty(10, 21))?.message).toContain("tối đa 20");
   });
 });

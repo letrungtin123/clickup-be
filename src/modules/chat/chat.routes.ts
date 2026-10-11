@@ -31,6 +31,7 @@ import {
   ReactionQuerySchema,
   ReactionRequestSchema,
   ReactionResultSchema,
+  ReactionUsersSchema,
   ReadStateSchema,
   SendMessageRequestSchema,
   ThreadPageSchema,
@@ -66,6 +67,7 @@ import {
   deleteMessage,
   editMessage,
   getMessageHistory,
+  getReactionUsers,
   getThread,
   listMyMentions,
   markRead,
@@ -200,6 +202,10 @@ export const createChatRoutes = (): ExpressRouter => {
   routes.get(
     "/messages/:messageId/thread",
     handle(async (context, req) => ThreadPageSchema.parse(await getThread(context, param(req, "messageId"), ThreadQuerySchema.parse(req.query))))
+  );
+  routes.get(
+    "/messages/:messageId/reactions",
+    handle(async (context, req) => ReactionUsersSchema.parse(await getReactionUsers(context, param(req, "messageId"))))
   );
   routes.put(
     "/messages/:messageId/reactions",

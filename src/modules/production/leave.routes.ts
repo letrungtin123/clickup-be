@@ -9,7 +9,7 @@ import {
   LeaveRequestSchema
 } from "../../contracts/production-leave.js";
 import { requireSupabaseUser } from "../../middleware/auth.js";
-import { handle, param } from "../work/http.js";
+import { handle, param } from "./http.js";
 import {
   cancelLeaveRequest,
   createLeaveRequest,

@@ -274,6 +274,25 @@ export const taskLineErrors = (line: TaskLineInput, context: TaskLineContext): s
   return errors;
 };
 
+/**
+ * Highest quantity anyone may declare at a task's first Done (SEC2-03): twice the assigned quantity or the
+ * assigned quantity + 10, whichever is larger. A small overshoot (12/10) stays legal and is reported as a
+ * QTY_MISMATCH anomaly; a typo or a deliberate 1000/10 is refused before it reaches the score ledger. Later
+ * corrections by the job Leader / Admin are not capped (trusted, logged, worker notified — PD-014).
+ */
+export const maxDeclaredDoneQty = (qtyAssigned: number) => Math.max(qtyAssigned * 2, qtyAssigned + 10);
+
+export const assertDeclaredDoneQty = (qtyAssigned: number, qtyDone: number) => {
+  const max = maxDeclaredDoneQty(qtyAssigned);
+  if (qtyDone > max) {
+    throw new AppError(
+      "QTY_DONE_TOO_HIGH",
+      `Số lượng hoàn thành ${qtyDone} vượt mức cho phép (tối đa ${max} cho ${qtyAssigned} tấm được giao). Nếu thực tế làm nhiều hơn, hãy báo Leader của job sửa số lượng sau khi Done.`,
+      400
+    );
+  }
+};
+
 /** Over-allocation is allowed but warned and logged (SPEC Phase 2 §2). */
 export const overAllocationWarning = (totalImages: number, alreadyAssigned: number, adding: number) => {
   const total = alreadyAssigned + adding;

@@ -2,7 +2,8 @@
 // which refuses any container outside the dev compose project). Suites remove exactly what they created;
 // sweepLeftovers() removes what crashed runs left behind. Every sweep is keyed on a test-only pattern AND on
 // rows written by the four seeded dev accounts, so real data (superadmin, @test.local worklog seed) never matches.
-import { bumpAuthz, localSql, seed, session } from "./lib.mjs";
+// Importing lib.mjs already refuses NODE_ENV=production and unmarked databases; sweepLeftovers() re-asserts it.
+import { assertDevStack, bumpAuthz, localSql, seed, session } from "./lib.mjs";
 
 export const quote = (text) => `'${String(text).replaceAll("'", "''")}'`;
 const sqlList = (ids) => [...new Set(ids.filter(Boolean))].map(quote).join(",");
@@ -186,6 +187,7 @@ export const purgeTestRoles = (keys = null) => {
  * up after themselves). Returns a short summary, or "" when there was nothing to remove.
  */
 export const sweepLeftovers = async () => {
+  assertDevStack();
   const summary = [];
   const note = (label, n) => n > 0 && summary.push(`${n} ${label}`);
 
@@ -245,7 +247,7 @@ export const sweepLeftovers = async () => {
   `);
   note("leave requests", count(leaves));
 
-  // Price versions the catalog suite's "new version from 2026-08-01" copied onto real projects: identical copies
+  // Price versions the catalog suite's "new version from 2027-08-01" (earlier runs: 2026-08-01) copied onto real projects: identical copies
   // written by the dev MANAGER, never used by a score. Removing one re-extends the version it split (as the API does).
   const copies = localSql(`
     BEGIN;
@@ -256,7 +258,7 @@ export const sweepLeftovers = async () => {
         ON p.organization_id = c.organization_id AND p.project_id = c.project_id AND p.process_id = c.process_id
        AND p.effective_to = c.effective_from AND p.credit_per_image = c.credit_per_image
        AND p.money_per_image IS NOT DISTINCT FROM c.money_per_image
-      WHERE c.created_by IN ${devUsers} AND c.effective_from = '2026-08-01'
+      WHERE c.created_by IN ${devUsers} AND c.effective_from IN ('2026-08-01', '2027-08-01')
         AND NOT EXISTS (SELECT 1 FROM production.score_entries s WHERE s.credit_rule_id = c.id);
     DELETE FROM production.credit_rules WHERE id IN (SELECT id FROM e2e_copies);
     UPDATE production.credit_rules r SET effective_to = e2e_copies.effective_to
@@ -289,6 +291,30 @@ export const sweepLeftovers = async () => {
     WHERE deleted_at IS NULL AND email_normalized ~ '^(new|e2e\\.member)\\.[0-9]{13}@nesso\\.test$'
   `);
   note("test accounts", softDeleteTestAccounts(accounts).length);
+  // …then removed for good (auth user → cascades), so they don't pile up run after run. An account that is still
+  // referenced (e.g. it wrote a ledger row) stays soft-deleted.
+  const testAccountPattern = "'^(new|e2e\\.member)\\.[0-9]{13}@nesso\\.test$'";
+  const softDeleted = () =>
+    Number(localSql(`SELECT count(*) FROM public.app_users WHERE deleted_at IS NOT NULL AND email_normalized ~ ${testAccountPattern}`)[0] ?? 0);
+  const beforePurge = softDeleted();
+  if (beforePurge > 0) {
+    localSql(`
+      DO $$
+      DECLARE victim uuid;
+      BEGIN
+        FOR victim IN
+          SELECT u.id FROM public.app_users u
+          WHERE u.deleted_at IS NOT NULL AND u.email_normalized ~ ${testAccountPattern} AND u.id NOT IN ${devUsers}
+        LOOP
+          BEGIN
+            DELETE FROM auth.users WHERE id = victim;
+          EXCEPTION WHEN foreign_key_violation OR restrict_violation THEN NULL;
+          END;
+        END LOOP;
+      END $$;
+    `);
+    note("purged test accounts", beforePurge - softDeleted());
+  }
   note("test roles", purgeTestRoles().length);
 
   // Inbox rows written directly by suites (paging fixtures), keyed "e2e-…".

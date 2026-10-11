@@ -245,12 +245,13 @@ export const createChannel = async (context: AccessContext, input: CreateChannel
         await advanceReadMarkers(tx, context, channel.id, memberIds, added.seq);
       }
 
-      await enqueueDomainEvents(tx, [
-        channelEvent(context, "chat.channel.created", channel.id, { channelKind: input.kind, name: input.name }),
-        ...(memberIds.length > 0
+      // Only events a consumer handles are emitted (chat.channel.member_added → inbox); see jobs/registry.ts.
+      await enqueueDomainEvents(
+        tx,
+        memberIds.length > 0
           ? [channelEvent(context, "chat.channel.member_added", channel.id, { channelKind: input.kind, userIds: memberIds, addedBy: context.user.id })]
-          : [])
-      ]);
+          : []
+      );
       return { channelId: channel.id, systemMessageIds };
     });
   } catch (error) {
@@ -324,17 +325,6 @@ export const updateChannel = async (context: AccessContext, channelId: string, i
         ids.push((await insertSystemMessage(tx, context, channelId, event)).id);
       }
 
-      await enqueueDomainEvents(tx, [
-        channelEvent(context, "chat.channel.updated", channelId, {
-          changes: [
-            ...(renamed ? ["name"] : []),
-            ...(description !== channel.description ? ["description"] : []),
-            ...(topic !== channel.topic ? ["topic"] : []),
-            ...(kind !== channel.kind ? ["kind"] : [])
-          ],
-          kind
-        })
-      ]);
       const madePrivate = channel.kind === "public" && kind === "private";
       if (madePrivate) {
         // Non-members lose the channel: their inbox entries quoting it go too (BUG-WK-04).
@@ -391,7 +381,6 @@ export const setChannelArchived = async (context: AccessContext, channelId: stri
       `;
       messageId = (await insertSystemMessage(tx, context, channelId, { type: "unarchived", actorId: context.user.id })).id;
     }
-    await enqueueDomainEvents(tx, [channelEvent(context, archived ? "chat.channel.archived" : "chat.channel.unarchived", channelId, {})]);
     return messageId;
   });
 
@@ -423,7 +412,6 @@ export const deleteChannel = async (context: AccessContext, channelId: string) =
       SELECT user_id FROM public.channel_members
       WHERE organization_id = ${context.organization.id} AND channel_id = ${channelId} AND deleted_at IS NULL
     `;
-    await enqueueDomainEvents(tx, [channelEvent(context, "chat.channel.deleted", channelId, { name: resolved.channel.name })]);
     return members.map((member) => member.user_id);
   });
 
@@ -571,9 +559,6 @@ const removeMembership = async (
       )
     ).id;
   }
-  await enqueueDomainEvents(tx, [
-    channelEvent(context, "chat.channel.member_removed", channelId, { userIds: [userId], removedBy: context.user.id })
-  ]);
   return { removed: true, systemMessageId };
 };
 
@@ -794,15 +779,6 @@ export const updateChannelMember = async (
       WHERE organization_id = ${context.organization.id} AND channel_id = ${channelId}
         AND user_id = ${userId} AND deleted_at IS NULL
     `;
-    await enqueueDomainEvents(tx, [
-      channelEvent(context, "chat.channel.member_updated", channelId, {
-        userId,
-        access,
-        role,
-        previousAccess: target.access,
-        previousRole: target.role
-      })
-    ]);
     return { downgraded: target.access === "submit" && access === "view", changed: true };
   });
 
@@ -890,7 +866,6 @@ export const openDirectConversation = async (
       FROM unnest(${dm.participantIds}::uuid[]) AS u(user_id)
     `;
     await enqueueDomainEvents(tx, [
-      channelEvent(context, "chat.channel.created", inserted.id, { channelKind: dm.kind, name: null }),
       channelEvent(context, "chat.channel.member_added", inserted.id, {
         channelKind: dm.kind,
         userIds: dm.otherIds,
@@ -1044,7 +1019,6 @@ export const setSystemChannelMembers = async (input: {
           )
         ).id
       );
-      events.push(channelEvent(context, "chat.channel.member_removed", channelId, { userIds: removedIds, removedBy: input.actorId }));
     }
     await enqueueDomainEvents(tx, events);
     return { addedIds, removedIds, messageIds };

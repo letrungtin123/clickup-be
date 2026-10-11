@@ -15,8 +15,9 @@ import { publishProductionChange } from "./realtime.js";
 
 /**
  * What a comment box belongs to. `viewers`: who may see it besides the all-jobs roles (Account / Leader /
- * Admin) — for a task its worker, QC and job leader; for a job its leader and everyone working or checking
- * in it (PD-014). `archived`: the job is archived (read-only, BUG-PR-04).
+ * Admin) — for a task its worker and QC; for a job everyone working or checking in it (PD-014). The job
+ * leader sees it through the LEADER role; a leader who lost that role no longer counts (SEC2-04).
+ * `archived`: the job is archived (read-only, BUG-PR-04).
  */
 type Target = { entity: "JOB" | "TASK"; entityId: string; jobId: string; archived: boolean; viewers: Set<string> };
 
@@ -29,12 +30,12 @@ const resolveTarget = async (sql: QuerySql, context: AccessContext, entity: "JOB
     if (!canViewTask(relationOf(context, task))) {
       throw new AppError("TASK_NOT_FOUND", "Không tìm thấy task.", 404);
     }
-    const viewers = new Set([task.assignee_id, task.job_leader_id, ...(task.qc_id ? [task.qc_id] : [])]);
+    const viewers = new Set([task.assignee_id, ...(task.qc_id ? [task.qc_id] : [])]);
     return { entity, entityId: id, jobId: task.job_id, archived: task.job_archived, viewers };
   }
   const job = (
-    await sql<{ leader_id: string; archived: boolean; people: string[] }[]>`
-      SELECT j.leader_id, j.archived_at IS NOT NULL AS archived,
+    await sql<{ archived: boolean; people: string[] }[]>`
+      SELECT j.archived_at IS NOT NULL AS archived,
         coalesce((
           SELECT array_agg(DISTINCT p) FROM production.tasks t, unnest(ARRAY[t.assignee_id, t.qc_id]) AS p
           WHERE t.organization_id = j.organization_id AND t.job_id = j.id AND p IS NOT NULL
@@ -42,7 +43,7 @@ const resolveTarget = async (sql: QuerySql, context: AccessContext, entity: "JOB
       FROM production.jobs j WHERE j.organization_id = ${organizationId} AND j.id = ${id}
     `
   )[0];
-  const viewers = new Set(job ? [job.leader_id, ...job.people] : []);
+  const viewers = new Set(job ? job.people : []);
   if (!job || !(isProductionAdmin(context) || hasProductionRole(context, "ACCOUNT", "LEADER") || viewers.has(context.user.id))) {
     throw new AppError("JOB_NOT_FOUND", "Không tìm thấy job.", 404);
   }
@@ -79,10 +80,11 @@ const toComment = (row: CommentRow, context: AccessContext): ProductionComment =
 type LogRow = {
   id: string;
   cursor_at: string;
-  task_id: string;
-  task_number: string | number;
+  /** Null for job-level history (action JOB: job edits). */
+  task_id: string | null;
+  task_number: string | number | null;
   user: UserRefJson | null;
-  action: "CREATE" | "STATUS" | "QTY" | "ASSIGN" | "NOTE" | "FIELD";
+  action: "CREATE" | "STATUS" | "QTY" | "ASSIGN" | "NOTE" | "FIELD" | "JOB";
   from_value: Record<string, unknown> | null;
   to_value: Record<string, unknown> | null;
   note: string | null;
@@ -124,7 +126,7 @@ export const listProductionTimeline = async (
         ${cursorTextSql(sql, "l.created_at")} AS cursor_at,
         (SELECT ${userJsonSql(sql)} FROM public.app_users au WHERE au.id = l.user_id) AS user
       FROM production.task_logs l
-      JOIN production.tasks t ON t.organization_id = l.organization_id AND t.id = l.task_id
+      LEFT JOIN production.tasks t ON t.organization_id = l.organization_id AND t.id = l.task_id
       WHERE l.organization_id = ${organizationId}
         AND ${entity === "JOB" ? sql`l.job_id = ${target.jobId}` : sql`l.task_id = ${id}`}
         ${before("l")}
@@ -142,7 +144,7 @@ export const listProductionTimeline = async (
         log: {
           id: row.id,
           taskId: row.task_id,
-          taskNumber: Number(row.task_number),
+          taskNumber: row.task_number === null ? null : Number(row.task_number),
           user: toUserRef(row.user),
           action: row.action,
           fromValue: row.from_value,
@@ -247,6 +249,11 @@ export const deleteProductionComment = async (context: AccessContext, commentId:
   const row = await loadComment(sql, organizationId, commentId);
   if (row.user_id !== context.user.id && !isProductionAdmin(context)) {
     throw new AppError("FORBIDDEN", "Chỉ người viết (hoặc Quản trị) được xoá bình luận.", 403);
+  }
+  // Same checks as editing (SEC2-08): the author must still see the task / job (404 otherwise, e.g. after
+  // being taken off the task), and an archived job is read-only.
+  if ((await resolveTarget(sql, context, row.entity, row.entity_id)).archived) {
+    throw jobArchivedError();
   }
   await sql`UPDATE production.comments SET deleted_at = now() WHERE organization_id = ${organizationId} AND id = ${commentId}`;
   publishProductionChange(organizationId, row.job_id, row.entity === "TASK" ? [row.entity_id] : [], "comment", context.user.id);

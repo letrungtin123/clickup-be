@@ -15,6 +15,7 @@ import {
   JobTransitionRequestSchema,
   JobTransitionResultSchema,
   MyProductionTasksQuerySchema,
+  QcQueueQuerySchema,
   ProductionCommentSchema,
   ProductionTaskPageSchema,
   ProductionTaskSchema,
@@ -27,8 +28,9 @@ import {
   UpdateProductionTaskRequestSchema,
   UpdateTaskQtyRequestSchema
 } from "../../contracts/production-jobs.js";
+import { withCustomFieldFilters } from "../../contracts/production-catalog.js";
 import { requireSupabaseUser } from "../../middleware/auth.js";
-import { handle, param } from "../work/http.js";
+import { handle, param } from "./http.js";
 import { openJobChat } from "./job-chat.service.js";
 import { closeFeedback, createFeedback, createJob, getJobDetail, listJobs, reassignFeedback, transitionJob, updateJob } from "./jobs.service.js";
 import {
@@ -49,7 +51,7 @@ export const createProductionJobRoutes = (): ExpressRouter => {
   routes.use("/production", requireSupabaseUser);
 
   // Jobs
-  routes.get("/production/jobs", handle(async (context, req) => JobPageSchema.parse(await listJobs(context, JobQuerySchema.parse(req.query)))));
+  routes.get("/production/jobs", handle(async (context, req) => JobPageSchema.parse(await listJobs(context, JobQuerySchema.parse(withCustomFieldFilters(req.query))))));
   routes.post("/production/jobs", handle(async (context, req) => JobDetailSchema.parse(await createJob(context, CreateJobRequestSchema.parse(req.body))), 201));
   routes.get("/production/jobs/:jobId", handle(async (context, req) => JobDetailSchema.parse(await getJobDetail(context, param(req, "jobId")))));
   routes.patch(
@@ -96,9 +98,12 @@ export const createProductionJobRoutes = (): ExpressRouter => {
   // Tasks
   routes.get(
     "/production/tasks/mine",
-    handle(async (context, req) => ProductionTaskPageSchema.parse(await listMyProductionTasks(context, MyProductionTasksQuerySchema.parse(req.query))))
+    handle(async (context, req) => ProductionTaskPageSchema.parse(await listMyProductionTasks(context, MyProductionTasksQuerySchema.parse(withCustomFieldFilters(req.query)))))
   );
-  routes.get("/production/tasks/qc-queue", handle(async (context) => ProductionTaskPageSchema.parse(await listQcQueue(context))));
+  routes.get(
+    "/production/tasks/qc-queue",
+    handle(async (context, req) => ProductionTaskPageSchema.parse(await listQcQueue(context, QcQueueQuerySchema.parse(withCustomFieldFilters(req.query)))))
+  );
   routes.get("/production/tasks/:taskId", handle(async (context, req) => ProductionTaskSchema.parse(await getProductionTask(context, param(req, "taskId")))));
   routes.patch(
     "/production/tasks/:taskId",

@@ -5,19 +5,26 @@ import type { QuerySql } from "../../lib/db-types.js";
 import { logger } from "../../lib/logger.js";
 import type { AccessContext } from "../access/access-context.js";
 import { createChannel, setSystemChannelMembers, updateChannelMember } from "../chat/channels.service.js";
-import { assertProductionMember, hasProductionRole, isProductionAdmin } from "./access.js";
+import { assertProductionMember, hasProductionRole, isProductionAdmin, leadsJob } from "./access.js";
 import { assertJobVisible, jobArchivedError, loadMemberRoles } from "./jobs.repo.js";
 import { publishProductionChange } from "./realtime.js";
 
 /**
  * "Tạo nhóm cho job này" (SPEC §6 Phase 4 §2): one private chat channel per job.
  *
- * Membership (SEC-API-05, BUG-PR-13): the people related to the job — its leader, its creator and every
- * worker / QC of its tasks (active organization members) — belong to the chat. Assignment changes reconcile
- * it: newly related people are added, members without a relation are removed unless they may see every job
- * anyway (Account / Leader / Admin, superadmins), so someone taken off a job stops reading its chat. Anyone
- * who may see the job and opens "Nhóm chat" is added (an Admin/Account who was not a member gets in instead of
- * a channel they cannot open), and opening it also brings in people involved since.
+ * Membership (SPEC: "tự thêm leader, account, mọi assignee/qc của job"; SEC-API-05, BUG-PR-13, PD-022): the people
+ * related to the job belong to the chat, as long as they are active organization members:
+ *   - its leader, while they still lead (hold LEADER or ADMIN, or are superadmin — SEC2-04);
+ *   - its creator, while they may still see every job (Account / Leader / Admin, superadmin);
+ *   - every holder of the production ACCOUNT role;
+ *   - every worker and QC of its tasks.
+ * Assignment changes reconcile it: newly related people are added, members without a relation are removed unless
+ * they may see every job anyway (Account / Leader / Admin, superadmins), so someone taken off a job stops reading
+ * its chat. Losing LEADER / ACCOUNT / ADMIN reconciles every job chat of that person (`syncJobChatsForMember`),
+ * so a demoted leader leaves the chats they were only in as leader. Gaining ACCOUNT does not touch existing chats
+ * at once: the new Account joins each one at its next reconcile (assignment change or someone opening it). Anyone
+ * who may see the job and opens "Nhóm chat" is added (an Admin who was not a member gets in instead of a channel
+ * they cannot open), and opening it also brings in people involved since.
  *
  * The production module owns this membership policy and applies it through the chat module's own service
  * functions (system messages, events, realtime and eviction stay the chat module's), acting as the caller
@@ -41,15 +48,30 @@ const loadJobChat = async (sql: QuerySql, organizationId: string, jobId: string)
         EXISTS (
           SELECT 1 FROM public.channels c WHERE c.id = j.channel_id AND c.deleted_at IS NULL AND c.archived_at IS NULL
         ) AS channel_alive,
-        -- Related people who are still active organization members (people may have left since).
+        -- Related people who are still active organization members (people may have left since); see above.
         coalesce((
           SELECT array_agg(DISTINCT om.user_id)
           FROM public.organization_memberships om
+          LEFT JOIN public.roles r ON r.id = om.role_id AND r.organization_id = om.organization_id
           WHERE om.organization_id = j.organization_id AND om.status = 'active' AND om.deleted_at IS NULL
-            AND (om.user_id IN (j.leader_id, j.created_by) OR EXISTS (
-              SELECT 1 FROM production.tasks t
-              WHERE t.organization_id = j.organization_id AND t.job_id = j.id AND (t.assignee_id = om.user_id OR t.qc_id = om.user_id)
-            ))
+            AND (
+              (om.user_id = j.leader_id AND (r.key = 'superadmin' OR EXISTS (
+                SELECT 1 FROM production.user_roles ur
+                WHERE ur.organization_id = om.organization_id AND ur.user_id = om.user_id AND ur.role_code IN ('LEADER', 'ADMIN')
+              )))
+              OR (om.user_id = j.created_by AND (r.key = 'superadmin' OR EXISTS (
+                SELECT 1 FROM production.user_roles ur
+                WHERE ur.organization_id = om.organization_id AND ur.user_id = om.user_id AND ur.role_code IN ('ADMIN', 'ACCOUNT', 'LEADER')
+              )))
+              OR EXISTS (
+                SELECT 1 FROM production.user_roles ur
+                WHERE ur.organization_id = om.organization_id AND ur.user_id = om.user_id AND ur.role_code = 'ACCOUNT'
+              )
+              OR EXISTS (
+                SELECT 1 FROM production.tasks t
+                WHERE t.organization_id = j.organization_id AND t.job_id = j.id AND (t.assignee_id = om.user_id OR t.qc_id = om.user_id)
+              )
+            )
         ), '{}') AS related
       FROM production.jobs j WHERE j.organization_id = ${organizationId} AND j.id = ${jobId}
     `
@@ -129,6 +151,36 @@ export const syncJobChat = async (context: AccessContext, jobId: string) => {
   }
 };
 
+/**
+ * After someone lost LEADER, ACCOUNT or ADMIN (PD-022, SEC2-04 follow-up): reconciles every live job chat they are
+ * a member of or whose job they still lead, so they leave the chats they were only in through that role. Returns
+ * how many chats were checked. Never throws (problems are logged per job by `syncJobChat`).
+ */
+export const syncJobChatsForMember = async (context: AccessContext, userId: string) => {
+  const organizationId = context.organization.id;
+  let jobs: { id: string }[] = [];
+  try {
+    jobs = await getSql()<{ id: string }[]>`
+      SELECT j.id FROM production.jobs j
+      JOIN public.channels c ON c.id = j.channel_id AND c.organization_id = j.organization_id AND c.deleted_at IS NULL AND c.archived_at IS NULL
+      WHERE j.organization_id = ${organizationId} AND j.archived_at IS NULL
+        AND (j.leader_id = ${userId} OR EXISTS (
+          SELECT 1 FROM public.channel_members cm
+          WHERE cm.organization_id = j.organization_id AND cm.channel_id = j.channel_id AND cm.user_id = ${userId} AND cm.deleted_at IS NULL
+        ))
+      ORDER BY j.id
+      LIMIT 2000
+    `;
+  } catch (error) {
+    logger.warn({ err: error, userId }, "Listing job chats of a member failed");
+    return 0;
+  }
+  for (const job of jobs) {
+    await syncJobChat(context, job.id);
+  }
+  return jobs.length;
+};
+
 /** POST /production/jobs/:jobId/chat — opens (creating if needed) the job chat for anyone who may see the job. */
 export const openJobChat = async (context: AccessContext, jobId: string): Promise<{ channelId: string; created: boolean }> => {
   assertProductionMember(context);
@@ -148,7 +200,7 @@ export const openJobChat = async (context: AccessContext, jobId: string): Promis
     return { channelId: job.channel_id, created: false };
   }
 
-  if (job.leader_id !== context.user.id && !isProductionAdmin(context) && !hasProductionRole(context, "ACCOUNT")) {
+  if (!leadsJob(context, job.leader_id) && !isProductionAdmin(context) && !hasProductionRole(context, "ACCOUNT")) {
     throw new AppError("FORBIDDEN", "Chỉ Leader của job, Account hoặc Quản trị được tạo nhóm chat cho job.", 403);
   }
   const members = [...new Set([...job.related, context.user.id])];

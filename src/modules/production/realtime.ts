@@ -8,9 +8,9 @@ import { publishToUsers } from "../../realtime/publisher.js";
  *
  * PR-20: the hint names a job and its tasks, so it is not broadcast to the organization's production room
  * (every production member). It goes to the personal rooms of the people who may see that job: holders of an
- * all-jobs role (Account / Leader / Admin, and organization superadmins = production Admin) plus the job's
- * leader and everyone working on or checking one of its tasks (PD-014 visibility), plus `extraUserIds` —
- * e.g. someone just taken off a task, whose lists must drop it. Members outside that set get no hint (their
+ * all-jobs role (Account / Leader / Admin, and organization superadmins = production Admin — every job leader
+ * who still holds LEADER, SEC2-04) plus everyone working on or checking one of its tasks (PD-014 visibility),
+ * plus `extraUserIds` — e.g. someone just taken off a task, whose lists must drop it. Members outside that set get no hint (their
  * screens refresh on focus / their own changes); the client handles the event the same way whatever the room.
  */
 
@@ -29,7 +29,6 @@ export const jobAudience = async (sql: QuerySql, organizationId: string, jobId: 
             SELECT 1 FROM production.user_roles ur
             WHERE ur.organization_id = om.organization_id AND ur.user_id = om.user_id AND ur.role_code IN ('ADMIN', 'ACCOUNT', 'LEADER')
           )
-          OR EXISTS (SELECT 1 FROM production.jobs j WHERE j.organization_id = om.organization_id AND j.id = ${jobId} AND j.leader_id = om.user_id)
           OR EXISTS (
             SELECT 1 FROM production.tasks t
             WHERE t.organization_id = om.organization_id AND t.job_id = ${jobId} AND (t.assignee_id = om.user_id OR t.qc_id = om.user_id)

@@ -9,6 +9,8 @@ import {
   createMemoryWindowStore,
   createRedisWindowStore,
   digestWindowKey,
+  emailableNotificationTypes,
+  isEmailableNotificationType,
   recipientSkipReason,
   type DigestRecipient,
   type WindowStore
@@ -37,18 +39,22 @@ const sweepIntervalMs = 60_000;
 const sweepUserLimit = 200;
 
 const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+/** SQL parameter form of the e-mailable types (email-policy.ts). */
+const emailableTypeList: string[] = [...emailableNotificationTypes];
 
 // Producer side (called by deliverNotifications) -------------------------------------------------
 
 /**
- * Queues an e-mail for each new notification whose recipient opted in: one statement filters and
- * marks the rows (email_queued_at), and the same transaction writes the outbox events.
+ * Queues an e-mail for each new notification whose type may be e-mailed (chat never is, see email-policy.ts)
+ * and whose recipient opted in: one statement filters and marks the rows (email_queued_at), and the same
+ * transaction writes the outbox events.
  */
-export const enqueueNotificationEmails = async (organizationId: string, rows: { id: string; recipient_user_id: string }[]) => {
-  if (rows.length === 0 || !isEmailEnabled()) {
+export const enqueueNotificationEmails = async (organizationId: string, rows: { id: string; recipient_user_id: string; type: string }[]) => {
+  const eligible = rows.filter((row) => isEmailableNotificationType(row.type));
+  if (eligible.length === 0 || !isEmailEnabled()) {
     return 0;
   }
-  const ids = rows.map((row) => row.id);
+  const ids = eligible.map((row) => row.id);
   return await getSql().begin(async (tx) => {
     const queued = await tx<{ id: string; recipient_user_id: string }[]>`
       UPDATE public.notifications n
@@ -56,6 +62,7 @@ export const enqueueNotificationEmails = async (organizationId: string, rows: { 
       FROM public.app_users au
       WHERE n.id = ANY(${ids}::uuid[])
         AND n.email_queued_at IS NULL
+        AND n.type = ANY(${emailableTypeList}::text[])
         AND au.id = n.recipient_user_id
         AND au.notify_email AND au.email IS NOT NULL AND au.deleted_at IS NULL
       RETURNING n.id, n.recipient_user_id
@@ -125,6 +132,8 @@ const loadPending = async (userId: string) =>
     WHERE n.recipient_user_id = ${userId}
       AND n.email_queued_at > now() - make_interval(hours => ${lookbackHours})
       AND n.email_sent_at IS NULL AND n.read_at IS NULL AND n.archived_at IS NULL
+      -- Rows queued before the chat exclusion existed are never e-mailed either.
+      AND n.type = ANY(${emailableTypeList}::text[])
     ORDER BY n.created_at, n.id
     LIMIT ${maxRowsPerDigest}
   `;
@@ -243,6 +252,7 @@ export const runEmailDigestSweep = async () => {
     FROM public.notifications n
     WHERE n.email_queued_at > now() - make_interval(hours => ${lookbackHours})
       AND n.email_sent_at IS NULL AND n.read_at IS NULL AND n.archived_at IS NULL
+      AND n.type = ANY(${emailableTypeList}::text[])
       AND EXISTS (
         SELECT 1 FROM public.organization_memberships om
         WHERE om.organization_id = n.organization_id AND om.user_id = n.recipient_user_id

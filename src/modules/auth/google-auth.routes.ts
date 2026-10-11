@@ -3,6 +3,7 @@ import { Router, type NextFunction, type Request, type Response, type Router as 
 import { appPublicUrl, authCookieSecure, env, supabasePublicUrl } from "../../config/env.js";
 import { readCookie } from "../../lib/cookies.js";
 import { logger } from "../../lib/logger.js";
+import { rotateCsrfToken } from "../../middleware/csrf.js";
 import { createGoogleAuthRateLimit } from "../../middleware/rate-limit.js";
 import { notFound } from "../../middleware/not-found.js";
 import { setAuthCookies } from "./auth.cookies.js";
@@ -120,6 +121,7 @@ export const createGoogleAuthRoutes = (): ExpressRouter => {
         return;
       }
       setAuthCookies(res, result.tokens);
+      rotateCsrfToken(res); // new session, new CSRF token (SEC2-23)
       redirectTo(res, `${appPublicUrl}${flow.next}`);
     } catch (error) {
       logger.error({ err: error }, "Google sign-in callback failed");

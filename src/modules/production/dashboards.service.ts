@@ -12,7 +12,7 @@ import { AppError } from "../../lib/app-error.js";
 import { toIso } from "../../lib/db-types.js";
 import type { AccessContext } from "../access/access-context.js";
 import { assertProductionAdmin, assertProductionRole, isProductionAdmin } from "./access.js";
-import { loadSettings } from "./catalog.service.js";
+import { closeDaysOf, loadSettings } from "./catalog.service.js";
 import { loadWorkflowModel } from "./jobs.repo.js";
 import { getKpiReport } from "./kpi-settlement.service.js";
 import { executeReport } from "./reports.js";
@@ -180,7 +180,7 @@ export const getLeaderDashboard = async (context: AccessContext, query: { leader
     sql,
     organizationId,
     ReportConfigSchema.parse({ dimensions: ["team", "week"], measures: ["points", "points_khoan"], from: weeks[0], to: addDays(lastWeek, 6) }),
-    { today, closeDay: settings.kpiCloseDay }
+    { today, closeDay: closeDaysOf(settings) }
   );
   const series = new Map<string, { teamId: string | null; teamName: string; points: number[]; pointsKhoan: number[] }>();
   for (const row of teamReport.rows) {
@@ -285,7 +285,7 @@ export const getAdminDashboard = async (context: AccessContext): Promise<AdminDa
   const settings = await loadSettings(sql, organizationId);
   const now = new Date();
   const today = businessDay(now);
-  const closeDay = settings.kpiCloseDay;
+  const closeDay = closeDaysOf(settings);
   const period = periodOfDay(today, closeDay);
   const configs = adminCardConfigs(today);
   const lateFrom = startOfBusinessDay(configs.lateJobs.from!);
@@ -326,7 +326,7 @@ export const getAdminDashboard = async (context: AccessContext): Promise<AdminDa
       LIMIT 50
     `,
     // Phase 6 KPI report (settled figures, or what a settlement would give now): % = total points / target.
-    getKpiReport(context, { from: period, to: period }),
+    getKpiReport(context, { from: period, to: period }, { rollups: false }),
     listPinnedReports(sql, organizationId)
   ]);
 

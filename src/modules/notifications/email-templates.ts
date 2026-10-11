@@ -115,6 +115,9 @@ export const notificationPath = (notification: EmailNotification) => {
   if (notification.type.startsWith("production.leave_") || uuid(notification.payload.leaveId)) {
     return "/production/leave";
   }
+  if (notification.type === "production.leader_removed") {
+    return "/production/settings/members";
+  }
   return "/inbox";
 };
 
@@ -303,6 +306,25 @@ const templates = {
         ["Chỉ tiêu", target !== null ? String(target) : null],
         ["% KPI", percent !== null ? `${percent}%` : null]
       ],
+      excerpt: c.excerpt
+    };
+  },
+  "production.leader_removed": (n, c) => {
+    const name = text(n.payload.userName) ?? c.title;
+    const count = num(n.payload.jobCount);
+    return {
+      headline: `${name} không còn là Leader nhưng vẫn dẫn ${count ?? "một số"} job chưa xong`,
+      facts: [["Số job cần giao lại", count !== null ? String(count) : null]],
+      excerpt: c.excerpt
+    };
+  },
+  // Never e-mailed (email-policy.ts); present so every type renders.
+  "system.dead_letter": (n, c) => {
+    const queue = text(n.payload.queue);
+    const count = num(n.payload.count);
+    return {
+      headline: queue ? `Hàng đợi lỗi ${queue} có tin nhắn chưa xử lý` : "Hàng đợi lỗi có tin nhắn chưa xử lý",
+      facts: [["Số tin nhắn", count !== null ? String(count) : null]],
       excerpt: c.excerpt
     };
   }

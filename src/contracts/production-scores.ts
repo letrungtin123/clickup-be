@@ -1,19 +1,71 @@
 import { z } from "zod";
 
-import { PayModeSchema, SafeText } from "./production-catalog.js";
+import { CustomFieldFiltersSchema, IdListQuerySchema, PayModeSchema, SafeText, type KpiCloseDayVersion } from "./production-catalog.js";
 import { UserRefSchema } from "./work.js";
 
 /**
  * Production (Photo Retouch) scores & KPI — docs/retouch/SPEC.md Phase 3. Shared FE/BE.
  * Credits are decimals with 2 places (numbers); money is VND integers. Days are business calendar
  * days (YYYY-MM-DD, Asia/Ho_Chi_Minh). A KPI period "YYYY-MM" runs from the day after the previous
- * month's close day to this month's close day (settings.kpiCloseDay, e.g. 2026-10 = 26/09–25/10).
+ * period's close day to this month's close day (e.g. 2026-10 = 26/09–25/10 with close day 25). Each period's
+ * close day comes from settings.kpiCloseDays (a change applies from the next period): use kpiPeriodRange /
+ * kpiPeriodOfDay below.
  */
 
 const Id = z.string().uuid();
 const IsoDate = z.string().datetime({ offset: true });
 const DateOnly = z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "Use YYYY-MM-DD.");
 export const PeriodKeySchema = z.string().regex(/^\d{4}-(0[1-9]|1[0-2])$/, "Use YYYY-MM.");
+
+// KPI periods with a close-day history (G15) ----------------------------------------------------------------
+
+/** One close day for every period, or the versions of settings.kpiCloseDays. */
+export type KpiCloseDays = number | readonly KpiCloseDayVersion[];
+
+const pad2 = (value: number) => String(value).padStart(2, "0");
+const shiftMonth = (period: string, months: number) => {
+  const index = Number(period.slice(0, 4)) * 12 + Number(period.slice(5, 7)) - 1 + months;
+  return `${Math.floor(index / 12)}-${pad2((index % 12) + 1)}`;
+};
+const nextDay = (day: string) => {
+  const date = new Date(`${day}T00:00:00Z`);
+  date.setUTCDate(date.getUTCDate() + 1);
+  return date.toISOString().slice(0, 10);
+};
+
+/** Close day of a period: the version with the latest fromPeriod ≤ period (fromPeriod null = since always). */
+export const closeDayOfPeriod = (closeDays: KpiCloseDays, period: string): number => {
+  if (typeof closeDays === "number") {
+    return closeDays;
+  }
+  let best: KpiCloseDayVersion | null = null;
+  let earliest: KpiCloseDayVersion | null = null;
+  for (const version of closeDays) {
+    const from = version.fromPeriod ?? "";
+    if (from <= period && (best === null || from > (best.fromPeriod ?? ""))) {
+      best = version;
+    }
+    if (earliest === null || from < (earliest.fromPeriod ?? "")) {
+      earliest = version;
+    }
+  }
+  return (best ?? earliest)?.closeDay ?? 25;
+};
+
+/** Business days of a period: the day after the previous period's close day … this period's close day. */
+export const kpiPeriodRange = (period: string, closeDays: KpiCloseDays) => {
+  const previous = shiftMonth(period, -1);
+  return {
+    from: nextDay(`${previous}-${pad2(closeDayOfPeriod(closeDays, previous))}`),
+    to: `${period}-${pad2(closeDayOfPeriod(closeDays, period))}`
+  };
+};
+
+/** KPI period ("YYYY-MM") of a business day: this month while the day ≤ this month's close day, else the next one. */
+export const kpiPeriodOfDay = (day: string, closeDays: KpiCloseDays) => {
+  const period = day.slice(0, 7);
+  return Number(day.slice(8, 10)) <= closeDayOfPeriod(closeDays, period) ? period : shiftMonth(period, 1);
+};
 
 export const ScoreRoleSchema = z.enum(["WORKER", "QC"]);
 export type ScoreRole = z.infer<typeof ScoreRoleSchema>;
@@ -149,7 +201,16 @@ export type ScoreForecast = z.infer<typeof ScoreForecastSchema>;
 
 // Board ------------------------------------------------------------------------------------------------
 
-export const ScoreBoardQuerySchema = z.object({ period: PeriodKeySchema.optional(), teamId: Id.optional() });
+/**
+ * `tagId` (USER tags, any of them) and `cf.<key>=…` (USER custom fields, e.g. cf.nang_luc=A) are ADMIN only
+ * (members' tags and custom values are Admin data): 403 CUSTOM_FIELDS_FORBIDDEN for others.
+ */
+export const ScoreBoardQuerySchema = z.object({
+  period: PeriodKeySchema.optional(),
+  teamId: Id.optional(),
+  tagId: IdListQuerySchema,
+  cf: CustomFieldFiltersSchema
+});
 
 /**
  * GET /production/scores/board — public points (SPEC §5.4). `money` is null unless the row is the
@@ -372,8 +433,17 @@ export const KpiSettlementRunCollectionSchema = z.object({ items: z.array(KpiSet
 
 // KPI report --------------------------------------------------------------------------------------------------
 
-/** At most 24 periods. ADMIN sees everyone (optionally one team); other members only themselves. */
-export const KpiReportQuerySchema = z.object({ from: PeriodKeySchema, to: PeriodKeySchema, teamId: Id.optional() });
+/**
+ * At most 24 periods. ADMIN sees everyone (optionally one team, USER tags `tagId` and USER custom fields
+ * `cf.<key>=…`); other members only themselves (tag / custom-field filters → 403 CUSTOM_FIELDS_FORBIDDEN).
+ */
+export const KpiReportQuerySchema = z.object({
+  from: PeriodKeySchema,
+  to: PeriodKeySchema,
+  teamId: Id.optional(),
+  tagId: IdListQuerySchema,
+  cf: CustomFieldFiltersSchema
+});
 
 const KpiFigures = {
   target: z.number().nullable(),
@@ -398,18 +468,48 @@ export const KpiReportRowSchema = z.object({
 });
 export type KpiReportRow = z.infer<typeof KpiReportRowSchema>;
 
+/**
+ * Quarter / year of one person (SPEC §8.4 "Quý/năm = cộng các tháng"): ALWAYS the whole quarter/year, whatever
+ * the selected range — the sum of its monthly periods that have started (settled, or provisional), against the
+ * explicit QUARTER/YEAR target, else the sum of the monthly targets of all its months. `complete` = every month
+ * of it has started; `settled` = every month of it is settled.
+ */
 export const KpiReportRollupSchema = z.object({
   userId: Id,
   periodType: z.enum(["QUARTER", "YEAR"]),
   /** "2026-Q4" or "2026". */
   key: z.string(),
-  /** Monthly periods of the range inside this quarter/year. */
+  /** Monthly periods summed: the started months of the quarter/year (also those outside the selected range). */
   periods: z.array(PeriodKeySchema),
   /** The target is an explicit QUARTER/YEAR target (otherwise the sum of monthly targets). */
   explicitTarget: z.boolean(),
+  complete: z.boolean(),
+  settled: z.boolean(),
   ...KpiFigures
 });
 export type KpiReportRollup = z.infer<typeof KpiReportRollupSchema>;
+
+/**
+ * Total rows of the KPI report (PLAN §6 "theo NV, team"): per team (scope TEAM; teamId null = people without a
+ * team) and for everyone shown (scope ORG), per month of the range (periodType MONTH, key "YYYY-MM") and per
+ * quarter / year (keys as the rollups). Sums over the people shown: target = Σ targets (null when nobody has
+ * one), points, converted Khoán points, total; percent = total / target; difference = total − target;
+ * khoanMoney = Σ. ADMIN only ([] for others).
+ */
+export const KpiReportTotalSchema = z.object({
+  scope: z.enum(["TEAM", "ORG"]),
+  teamId: Id.nullable(),
+  teamName: z.string().nullable(),
+  periodType: z.enum(["MONTH", "QUARTER", "YEAR"]),
+  key: z.string(),
+  memberCount: z.number().int(),
+  /** People with a target among memberCount. */
+  withTargetCount: z.number().int(),
+  /** MONTH: people who met the KPI that month; QUARTER/YEAR: people at ≥ 100 %. */
+  metCount: z.number().int(),
+  ...KpiFigures
+});
+export type KpiReportTotal = z.infer<typeof KpiReportTotalSchema>;
 
 export const KpiReportSchema = z.object({
   from: PeriodKeySchema,
@@ -417,6 +517,8 @@ export const KpiReportSchema = z.object({
   periods: z.array(PeriodKeySchema),
   users: z.array(z.object({ user: UserRefSchema, teamId: Id.nullable(), teamName: z.string().nullable() })),
   rows: z.array(KpiReportRowSchema),
-  rollups: z.array(KpiReportRollupSchema)
+  rollups: z.array(KpiReportRollupSchema),
+  /** Team and organization totals (ADMIN; [] for others). */
+  totals: z.array(KpiReportTotalSchema)
 });
 export type KpiReport = z.infer<typeof KpiReportSchema>;

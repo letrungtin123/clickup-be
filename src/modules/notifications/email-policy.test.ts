@@ -1,7 +1,8 @@
 import { describe, expect, it } from "vitest";
 
 import { emailConfigured, isDeliverableAddress, isPermanentMailError, PermanentMailError, toSubjectLine } from "../../lib/mailer.js";
-import { createMemoryWindowStore, digestWindowKey, recipientSkipReason } from "./email-policy.js";
+import { notificationTypes } from "../../contracts/notifications.js";
+import { createMemoryWindowStore, digestWindowKey, emailableNotificationTypes, isEmailableNotificationType, recipientSkipReason } from "./email-policy.js";
 
 describe("emailConfigured", () => {
   it("is on only when both SMTP_HOST and SMTP_FROM are set", () => {
@@ -80,5 +81,48 @@ describe("mail helpers", () => {
   it("keeps subjects on one bounded line", () => {
     expect(toSubjectLine("Xin chào\r\nBcc: x@y.z")).toBe("Xin chào Bcc: x@y.z");
     expect(toSubjectLine("x".repeat(300))).toHaveLength(200);
+  });
+});
+
+describe("which notification types may be e-mailed (SPEC: chat never e-mails)", () => {
+  it("never e-mails chat: messages / @mentions / thread replies / added to a channel", () => {
+    for (const type of ["chat.mentioned", "chat.thread_replied", "channel.member_added", "chat.message"]) {
+      expect(isEmailableNotificationType(type)).toBe(false);
+    }
+  });
+
+  it("never e-mails system alerts (an SMTP failure must not feed its own alert)", () => {
+    expect(isEmailableNotificationType("system.dead_letter")).toBe(false);
+  });
+
+  it("e-mails every production event of PLAN §8 and the task workspace events", () => {
+    for (const type of [
+      "production.task_assigned",
+      "production.task_waiting_qc",
+      "production.qc_failed",
+      "production.task_checked",
+      "production.task_late",
+      "production.task_due_soon",
+      "production.feedback",
+      "production.qty_changed",
+      "production.kpi_settled",
+      "production.commented",
+      "production.mentioned",
+      "production.leave_requested",
+      "production.leave_decided",
+      "production.leader_removed",
+      "task.assigned",
+      "task.mentioned",
+      "task.commented",
+      "project.member_added"
+    ]) {
+      expect(isEmailableNotificationType(type)).toBe(true);
+    }
+  });
+
+  it("is a subset of the notification types; unknown types are not e-mailed", () => {
+    expect(emailableNotificationTypes.every((type) => (notificationTypes as readonly string[]).includes(type))).toBe(true);
+    expect(emailableNotificationTypes.some((type) => type.startsWith("chat.") || type.startsWith("channel."))).toBe(false);
+    expect(isEmailableNotificationType("something.new")).toBe(false);
   });
 });

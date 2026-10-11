@@ -93,6 +93,10 @@ describe("report SQL builder", () => {
     expect(query.text).toContain("sum(f.money) FILTER (WHERE f.pay_mode = 'MONEY_IF_KPI')");
     expect(query.text).toContain("GROUP BY GROUPING SETS ((f.d0), ())");
     expect(query.text).toContain("LEFT JOIN public.app_users l0 ON l0.id = r.d0");
+    // SEC2-27: user labels only for people with a membership in this organization.
+    expect(query.text).toContain(
+      "AND EXISTS (SELECT 1 FROM public.organization_memberships om0 WHERE om0.organization_id = $1::uuid AND om0.user_id = l0.id)"
+    );
     expect(query.text).not.toContain("UNION ALL");
     expect(query.params).toEqual([org, "2026-09-26", "2026-10-25", reportRowLimit + 2]);
   });

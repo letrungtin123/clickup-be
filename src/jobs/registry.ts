@@ -3,7 +3,9 @@ import { emailBindings, handleEmailEvent, startEmailDigestSweeper } from "../mod
 import { handleNotificationEvent, notificationBindings } from "../modules/notifications/notification-handlers.js";
 import { startKpiSettlementScheduler } from "../modules/production/kpi-settlement-scheduler.js";
 import { startProductionLatenessScheduler } from "../modules/production/lateness-scheduler.js";
+import { workQueueNames } from "../lib/amqp.js";
 import { startConsumer } from "./consumer.js";
+import { startDeadLetterMonitor } from "./dead-letter-monitor.js";
 import { startMaintenanceScheduler } from "./maintenance-scheduler.js";
 
 type Stop = () => Promise<void>;
@@ -14,7 +16,7 @@ export const startWorkerConsumers = async (): Promise<Stop> => {
 
   stops.push(
     await startConsumer({
-      name: "nesso.notifications",
+      name: workQueueNames.notifications,
       bindings: notificationBindings,
       retryDelayMs: 15_000,
       prefetch: 20,
@@ -25,7 +27,7 @@ export const startWorkerConsumers = async (): Promise<Stop> => {
   // Notification e-mail digests (PD-013); idle until SMTP_HOST / SMTP_FROM are configured.
   stops.push(
     await startConsumer({
-      name: "nesso.email",
+      name: workQueueNames.email,
       bindings: emailBindings,
       retryDelayMs: 60_000,
       prefetch: 5,
@@ -38,6 +40,8 @@ export const startWorkerConsumers = async (): Promise<Stop> => {
   stops.push(startMaintenanceScheduler());
   stops.push(startProductionLatenessScheduler());
   stops.push(startKpiSettlementScheduler());
+  // Parked (dead-letter) messages → error log + one in-app alert per queue per hour.
+  stops.push(startDeadLetterMonitor());
 
   return async () => {
     await Promise.allSettled(stops.map((stop) => stop()));

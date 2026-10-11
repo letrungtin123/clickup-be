@@ -236,6 +236,18 @@ export const WorkspaceContextSchema = z.object({
   productionRoles: z.array(z.string().min(1).max(20)).default([])
 });
 
+/**
+ * The caller's personal notification channels (PD-021). `notifyWeb` = "Thông báo trên web": when false the client
+ * shows no toast / pop-up for new notifications, but the inbox and the unread badge still update (PLAN §8: web
+ * notifications are always kept). `notifyEmail` = digest e-mails (PD-013; chat never e-mails).
+ */
+export const NotificationChannelsSchema = z.object({ notifyWeb: z.boolean(), notifyEmail: z.boolean() });
+
+/** GET /workspace/context response: the access context plus `notificationPreferences` (read fresh, not cached). */
+export const WorkspaceSessionSchema = WorkspaceContextSchema.extend({
+  notificationPreferences: NotificationChannelsSchema.default({ notifyWeb: true, notifyEmail: false })
+});
+
 /** bcrypt (GoTrue) only uses the first 72 bytes of a password; GoTrue rejects longer ones. */
 export const passwordMaxBytes = 72;
 const utf8Length = (value: string) => new TextEncoder().encode(value).length;

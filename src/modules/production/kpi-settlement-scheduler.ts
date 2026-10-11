@@ -1,13 +1,13 @@
 import { getSql } from "../../db/client.js";
 import { logger } from "../../lib/logger.js";
+import { closeDaysOf, loadSettings } from "./catalog.service.js";
 import { settleMonth, settlementLockKey } from "./kpi-settlement.service.js";
 import { latestClosedPeriod, periodCloseInstant, shouldAutoSettle } from "./scoring.js";
 
 const intervalMs = 60_000;
-const defaultCloseDay = 25;
 
 /**
- * SPEC §8.3: at 23:59 business time on settings.kpi_close_day, each organization's period that ends
+ * SPEC §8.3: at 23:59 business time on the period's close day (close-day versions, G15), each organization's period that ends
  * that day is settled automatically (run_by = null). Checked every minute, so a worker that was down
  * at 23:59 catches up on its next start (within scoring.autoSettleCatchUpDays). A period is settled
  * automatically only once: any run finished at or after the close (automatic or by an Admin) counts.
@@ -15,14 +15,9 @@ const defaultCloseDay = 25;
  */
 export const runKpiSettlementTick = async (now = new Date()) => {
   const sql = getSql();
-  const organizations = await sql<{ id: string; close_day: unknown }[]>`
-    SELECT o.id, s.value AS close_day
-    FROM public.organizations o
-    LEFT JOIN production.settings s ON s.organization_id = o.id AND s.key = 'kpi_close_day'
-    WHERE o.deleted_at IS NULL
-  `;
+  const organizations = await sql<{ id: string }[]>`SELECT o.id FROM public.organizations o WHERE o.deleted_at IS NULL`;
   for (const organization of organizations) {
-    const closeDay = typeof organization.close_day === "number" ? organization.close_day : defaultCloseDay;
+    const closeDay = closeDaysOf(await loadSettings(sql, organization.id));
     const period = latestClosedPeriod(now, closeDay);
     if (!shouldAutoSettle({ now, period, closeDay, hasFinalRun: false })) {
       continue;

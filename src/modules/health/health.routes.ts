@@ -2,7 +2,7 @@ import { Router, type Router as ExpressRouter } from "express";
 
 import { env } from "../../config/env.js";
 import { checkDatabase } from "../../db/client.js";
-import { checkAmqp } from "../../lib/amqp.js";
+import { checkAmqp, getDeadLetterCounts } from "../../lib/amqp.js";
 import { checkRedis } from "../../lib/redis.js";
 
 export const healthRoutes: ExpressRouter = Router();
@@ -23,6 +23,9 @@ healthRoutes.get("/ready", async (_req, res, next) => {
       checkAmqp()
     ]);
     const ready = (database.ok && redis.ok) || env.NODE_ENV !== "production";
+    // Parked messages per work queue (`<queue>.dead`, passive check). /ready is only reachable on the loopback API
+    // port (the web server proxies /api and /socket.io only). Non-zero = undelivered notifications / e-mails.
+    const deadLetters = rabbitmq.ok ? await getDeadLetterCounts().catch(() => null) : null;
 
     // Readiness exposes dependency health only; failure reasons stay in logs outside development.
     const describe = (status: { ok: boolean; reason: string | null }) =>
@@ -33,7 +36,7 @@ healthRoutes.get("/ready", async (_req, res, next) => {
       dependencies: {
         database: describe(database),
         redis: describe(redis),
-        rabbitmq: describe(rabbitmq),
+        rabbitmq: { ...describe(rabbitmq), deadLetters },
         supabase: {
           configured: Boolean(env.SUPABASE_URL && env.SUPABASE_ANON_KEY)
         }

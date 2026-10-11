@@ -25,6 +25,15 @@ export const hasProductionRole = (context: AccessContext, ...roles: ProductionRo
 
 export const isProductionAdmin = (context: AccessContext) => productionRolesOf(context).has("ADMIN");
 
+/**
+ * The caller leads this job AND still holds LEADER (or ADMIN). Job-leader powers (split, reassign, correct
+ * quantities, edit, private score rows, visibility through leadership) end when the LEADER role is removed,
+ * even before an Account hands the job to another leader (SEC2-04). Everyone holding LEADER sees every job
+ * anyway (PD-014), so `leader_id` alone never grants anything.
+ */
+export const leadsJob = (context: AccessContext, leaderId: string | null | undefined) =>
+  Boolean(leaderId) && leaderId === context.user.id && hasProductionRole(context, "LEADER", "ADMIN");
+
 /** Any production role: the module is invisible (404) to everyone else. */
 export const assertProductionMember = (context: AccessContext) => {
   if (productionRolesOf(context).size === 0) {

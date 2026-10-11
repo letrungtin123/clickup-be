@@ -36,6 +36,10 @@ const EnvSchema = z
     LOGIN_RATE_LIMIT_MAX: z.coerce.number().int().min(1).default(10),
     /** Failed sign-ins per account (any IP) before a temporary lockout. */
     LOGIN_ACCOUNT_LIMIT_MAX: z.coerce.number().int().min(1).default(20),
+    /** Failed sign-ins per client address across all emails per 15 minutes (password spraying). */
+    LOGIN_IP_LIMIT_MAX: z.coerce.number().int().min(1).default(30),
+    /** Failed sign-ins per client address across all emails per 24 hours. */
+    LOGIN_IP_DAILY_LIMIT_MAX: z.coerce.number().int().min(1).default(200),
     /** Reverse-proxy hops in front of the API whose X-Forwarded-For is trusted. */
     TRUST_PROXY_HOPS: z.coerce.number().int().min(0).max(5).default(1),
     REDIS_URL: z.string().url().optional(),
@@ -75,6 +79,14 @@ const EnvSchema = z
     SUPABASE_PUBLIC_URL: z.preprocess((value) => (value === "" ? undefined : value), z.string().url().optional()),
     /** Optional comma-separated Google Workspace domains (`hd` claim); empty = any verified Google account. */
     GOOGLE_AUTH_HOSTED_DOMAINS: z.string().default(""),
+    /**
+     * SPEC Phase 0: the first Admin's address. When set, the API makes sure it is in the sign-in whitelist
+     * (allowed_emails) at start-up — idempotent, never removes anything. Blank = nothing to do.
+     */
+    ADMIN_EMAIL: z.preprocess(
+      (value) => (typeof value === "string" ? (value.trim() === "" ? undefined : value.trim().toLowerCase()) : value),
+      z.string().email().max(254).optional()
+    ),
     /** Google sign-in redirects (start + callback) per client address per 15 minutes. */
     GOOGLE_AUTH_RATE_LIMIT_MAX: z.coerce.number().int().min(1).default(60)
   })

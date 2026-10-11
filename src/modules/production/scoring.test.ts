@@ -18,12 +18,14 @@ import {
   prorateTarget,
   rankByPoints,
   rollupKpi,
+  rollupKpiPeriod,
   rollupKey,
   rolesToRecord,
   settlePeriod,
   settleUser,
   shouldAutoSettle,
   summarize,
+  sumKpiFigures,
   totals,
   weekStart,
   type RuleSnapshot,
@@ -530,5 +532,121 @@ describe("KPI report rollups (quarter / year = sum of months)", () => {
     });
     expect(rollupKpi(months, null)).toMatchObject({ target: 200, percent: 120, difference: 40 });
     expect(rollupKpi([months[2]!], null)).toMatchObject({ target: null, percent: null, difference: null });
+  });
+});
+
+describe("G15 — changing the close day mid-period: a new close day applies from the next period", () => {
+  // 25 until 10/2026; on 2026-10-11 the Admin sets 20 → version from 2026-11 (catalog.service scheduleCloseDay).
+  const versions = [
+    { fromPeriod: null, closeDay: 25 },
+    { fromPeriod: "2026-11", closeDay: 20 }
+  ];
+
+  it("the current period keeps its boundaries, the next ones follow the new day", () => {
+    expect(periodRange("2026-10", versions)).toEqual({ from: "2026-09-26", to: "2026-10-25" });
+    expect(periodRange("2026-11", versions)).toEqual({ from: "2026-10-26", to: "2026-11-20" });
+    expect(periodRange("2026-12", versions)).toEqual({ from: "2026-11-21", to: "2026-12-20" });
+  });
+
+  it("every day belongs to exactly one period (no overlap, no gap), also when the day moves back up", () => {
+    const schedules = [versions, [{ fromPeriod: null, closeDay: 20 }, { fromPeriod: "2026-11", closeDay: 28 }, { fromPeriod: "2027-02", closeDay: 5 }]];
+    for (const schedule of schedules) {
+      let expectedFrom = periodRange("2026-01", schedule).from;
+      for (let period = "2026-01"; period <= "2027-12"; period = `${Number(period.slice(0, 4)) + (period.endsWith("12") ? 1 : 0)}-${String((Number(period.slice(5)) % 12) + 1).padStart(2, "0")}`) {
+        const range = periodRange(period, schedule);
+        expect(range.from).toBe(expectedFrom);
+        for (const day of [range.from, range.to]) {
+          expect(periodOfDay(day, schedule)).toBe(period);
+        }
+        const next = new Date(`${range.to}T00:00:00Z`);
+        next.setUTCDate(next.getUTCDate() + 1);
+        expectedFrom = next.toISOString().slice(0, 10);
+      }
+    }
+  });
+
+  it("entries, close instants and the latest closed period use the period's own close day", () => {
+    expect(periodOfDay("2026-10-21", versions)).toBe("2026-10");
+    expect(periodOfDay("2026-10-26", versions)).toBe("2026-11");
+    expect(periodOfDay("2026-11-21", versions)).toBe("2026-12");
+    expect(periodMonth(new Date("2026-11-20T16:30:00Z"), versions)).toBe("2026-11-01"); // 23:30 VN on the 20th
+    expect(periodCloseInstant("2026-10", versions).toISOString()).toBe("2026-10-25T16:59:00.000Z");
+    expect(periodCloseInstant("2026-11", versions).toISOString()).toBe("2026-11-20T16:59:00.000Z");
+    expect(latestClosedPeriod(new Date("2026-11-20T17:00:00Z"), versions)).toBe("2026-11");
+    expect(latestClosedPeriod(new Date("2026-11-20T16:00:00Z"), versions)).toBe("2026-10");
+    expect(shouldAutoSettle({ now: new Date("2026-11-20T17:00:00Z"), period: "2026-11", closeDay: versions, hasFinalRun: false })).toBe(true);
+  });
+
+  it("settlement and forecast cover the period's own days", () => {
+    expect(settlePeriod({ period: "2026-11", closeDay: versions, prorateLeave: false, users: [] })).toMatchObject({ from: "2026-10-26", to: "2026-11-20" });
+    const result = forecast({ target: 100, pointsOfficial: 0, period: "2026-11", closeDay: versions, today: "2026-11-20", prorateLeave: false, leaveDays: null });
+    expect(result).toMatchObject({ from: "2026-10-26", to: "2026-11-20", daysLeft: 1 });
+  });
+});
+
+describe("G8 — KPI report quarters / years always cover the whole quarter / year", () => {
+  const month = (period: string, target: number | null, totalPoints: number) => ({
+    period,
+    target,
+    pointsOfficial: totalPoints,
+    khoanPointsConverted: 0,
+    totalPoints,
+    khoanMoney: 0
+  });
+  const started = (period: string) => period <= "2026-10";
+  const settled = (period: string) => period <= "2026-09";
+
+  it("a quarter sums its months (also those outside the selected range) against the sum of all its monthly targets", () => {
+    const q3 = rollupKpiPeriod({
+      periodType: "QUARTER",
+      period: "2026-08",
+      months: [month("2026-07", 100, 90), month("2026-08", 100, 120), month("2026-09", 110, 100)],
+      monthTargets: [],
+      explicitTarget: null,
+      started,
+      settled
+    });
+    expect(q3).toMatchObject({ key: "2026-Q3", periods: ["2026-07", "2026-08", "2026-09"], target: 310, totalPoints: 310, percent: 100, complete: true, settled: true });
+  });
+
+  it("a running quarter: months not started yet count their effective MONTH target; complete / settled are false", () => {
+    const q4 = rollupKpiPeriod({
+      periodType: "QUARTER",
+      period: "2026-10",
+      months: [month("2026-10", 120, 60)],
+      monthTargets: [{ periodType: "MONTH", targetPoints: 120, effectiveFrom: "2026-10" }],
+      explicitTarget: null,
+      started,
+      settled
+    });
+    expect(q4).toMatchObject({ periods: ["2026-10"], target: 360, totalPoints: 60, complete: false, settled: false });
+    const explicit = rollupKpiPeriod({ periodType: "QUARTER", period: "2026-10", months: [month("2026-10", 120, 60)], monthTargets: [], explicitTarget: 300, started, settled });
+    expect(explicit).toMatchObject({ target: 300, percent: 20 });
+  });
+
+  it("team / organization totals sum the people; percent = total / target; money only when visible", () => {
+    const totalsRow = sumKpiFigures([
+      { target: 100, pointsOfficial: 120, khoanPointsConverted: 0, totalPoints: 120, khoanMoney: 150000, met: true, percent: 120 },
+      { target: 100, pointsOfficial: 80, khoanPointsConverted: 30, totalPoints: 110, khoanMoney: 0, met: false, percent: 110 },
+      { target: null, pointsOfficial: 5, khoanPointsConverted: 0, totalPoints: 5, khoanMoney: 0, met: true, percent: null }
+    ]);
+    expect(totalsRow).toEqual({
+      memberCount: 3,
+      withTargetCount: 2,
+      metCount: 2,
+      target: 200,
+      pointsOfficial: 205,
+      khoanPointsConverted: 30,
+      totalPoints: 235,
+      percent: 117.5,
+      difference: 35,
+      khoanMoney: 150000
+    });
+    expect(sumKpiFigures([{ target: null, pointsOfficial: 1, khoanPointsConverted: 0, totalPoints: 1, khoanMoney: null, percent: null }])).toMatchObject({
+      target: null,
+      percent: null,
+      khoanMoney: null,
+      metCount: 1
+    });
   });
 });

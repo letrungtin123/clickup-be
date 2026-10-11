@@ -194,12 +194,18 @@ try {
   a = byUser(r.body.items, leaderId);
   ok("re-run after new points: A now meets the KPI (105 ≥ 100) and gets the Khoán money", a?.met === true && a.pointsOfficial === 105 && a.khoanMoney === 150000 && a.khoanPointsConverted === 0 && r.body.run.metCount === 2);
 
-  // Close day 20: the period becomes 21/02–20/03 and B's Khoán work of 22/03 moves to the next period
-  await admin.call("PATCH", "/production/settings", { kpiCloseDay: 20 });
+  // Close day 20 (G15): a new close day applies from the NEXT period — settled / past periods keep their days
+  r = await admin.call("PATCH", "/production/settings", { kpiCloseDay: 20 });
+  const versions = r.body?.kpiCloseDays ?? [];
+  const newest = versions[versions.length - 1];
+  ok("close day 20 is scheduled from the next period", r.status === 200 && r.body.kpiCloseDay === 20 && newest?.closeDay === 20 && newest.fromPeriod > "2019-03", JSON.stringify(versions));
   r = await run(admin, "2019-03", "Thử ngày chốt 20");
   b = byUser(r.body.items, staffId);
-  ok("close day 20 shifts the period", r.body.run?.from === "2019-02-21" && r.body.run.to === "2019-03-20" && r.body.run.closeDay === 20 && b?.khoanCredits === 0 && b.khoanMoney === 0 && b.pointsOfficial === 120, JSON.stringify(r.body?.run));
-  await admin.call("PATCH", "/production/settings", { kpiCloseDay: originalSettings.kpiCloseDay });
+  ok("a past period keeps its boundaries", r.body.run?.from === "2019-02-26" && r.body.run.to === "2019-03-25" && r.body.run.closeDay === 25 && b?.khoanMoney === 150000, JSON.stringify(r.body?.run));
+  r = await admin.call("GET", `/production/scores/forecast?period=${newest?.fromPeriod}`);
+  ok("the next period runs from the old close day + 1 to the new close day", r.status === 200 && r.body.to.endsWith("-20") && r.body.from.endsWith("-26") && r.body.closeDay === 20, JSON.stringify(r.body && { from: r.body.from, to: r.body.to }));
+  r = await admin.call("PATCH", "/production/settings", { kpiCloseDay: originalSettings.kpiCloseDay });
+  ok("back to the original close day: no extra version left", r.status === 200 && r.body.kpiCloseDays.length === originalSettings.kpiCloseDays.length, JSON.stringify(r.body?.kpiCloseDays));
   r = await run(admin, "2019-03", "Trả lại ngày chốt 25");
   ok("back to close day 25", r.body.run?.to === "2019-03-25" && byUser(r.body.items, staffId)?.khoanMoney === 150000);
 
@@ -214,7 +220,15 @@ try {
   ok("a QUARTER version keeps applying to later quarters", roll("QUARTER", "2019-Q2")?.explicitTarget === true && roll("QUARTER", "2019-Q2").target === 300 && roll("QUARTER", "2019-Q2").totalPoints === 50);
   const leaderQ1 = r.body.rollups.find((item) => item.userId === leaderId && item.periodType === "QUARTER" && item.key === "2019-Q1");
   ok("quarter without a QUARTER target sums the monthly targets", leaderQ1?.explicitTarget === false && leaderQ1.target === 100 && leaderQ1.totalPoints === 105, JSON.stringify(leaderQ1));
-  ok("year = sum of the months", roll("YEAR", "2019")?.periods.join() === "2019-03,2019-04" && roll("YEAR", "2019").totalPoints === 170 && roll("YEAR", "2019").target === 200 && roll("YEAR", "2019").percent === 85);
+  // G8: quarters / years always cover the whole quarter / year (months outside the range included).
+  const year = roll("YEAR", "2019");
+  ok(
+    "year = sum of all its months (03–12 have figures; target = 10 monthly targets)",
+    year?.periods.length === 10 && year.periods[0] === "2019-03" && year.totalPoints === 170 && year.target === 1000 && year.percent === 17 && year.complete === true && year.settled === false,
+    JSON.stringify(year)
+  );
+  const orgMarch = r.body.totals?.find((item) => item.scope === "ORG" && item.periodType === "MONTH" && item.key === "2019-03");
+  ok("ADMIN gets team / organization totals", orgMarch?.memberCount === 2 && orgMarch.totalPoints === 225 && orgMarch.target === 200 && orgMarch.metCount === 2, JSON.stringify(orgMarch));
   r = await leader.call("GET", "/production/kpi/report?from=2019-03&to=2019-04");
   ok("a member's report holds only their rows", r.status === 200 && r.body.rows.every((row) => row.userId === leaderId) && r.body.users.length === 1);
   r = await admin.call("GET", "/production/kpi/report?from=2019-05&to=2019-03");

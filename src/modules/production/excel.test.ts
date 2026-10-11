@@ -11,7 +11,7 @@ describe("excel helpers", () => {
     for (const value of ["=1+1", "+SUM(A1)", "-2+3", "@cmd", "\t=1", "\r=1"]) {
       expect(safeText(value)).toBe(`'${value}`);
     }
-    expect(safeText("BL JO020320 = batch")).toBe("BL JO020320 = batch");
+    expect(safeText("ABC JOB000123 = batch")).toBe("ABC JOB000123 = batch");
     expect(safeCell(-5)).toBe(-5);
     expect(safeCell(Number.NaN)).toBeNull();
     expect(safeCell(null)).toBeNull();

@@ -31,6 +31,9 @@ const login = async (email, password) => {
   };
   csrf = (await call("GET", "/auth/csrf")).body.csrfToken;
   const result = await call("POST", "/auth/login", { email, password });
+  if (result.status === 200) {
+    csrf = (await call("GET", "/auth/csrf")).body.csrfToken; // rotated at sign-in (SEC2-23)
+  }
   return { call, cookieHeader, status: result.status };
 };
 

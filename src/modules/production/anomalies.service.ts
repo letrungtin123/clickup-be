@@ -43,7 +43,7 @@ const leaderScope = (sql: QuerySql, leaderId: string | null) => (leaderId ? sql`
 
 type Draft = Omit<Anomaly, "reviewed"> & { reviewed?: never };
 
-const queryQtyMismatch = async (sql: QuerySql, organizationId: string, since: Date, leaderId: string | null): Promise<Draft[]> => {
+const queryQtyMismatch = async (sql: QuerySql, organizationId: string, since: Date, leaderId: string | null, _threshold: number, subjectId: string | null = null): Promise<Draft[]> => {
   const rows = await sql<
     (TaskCols & { assignee: UserCols; qty_assigned: number; qty_done: number; done_at: Date; changed_by: UserCols | null; changed_at: Date | null; action: string | null })[]
   >`
@@ -65,7 +65,7 @@ const queryQtyMismatch = async (sql: QuerySql, organizationId: string, since: Da
     ) lg ON true
     LEFT JOIN public.app_users uc ON uc.id = lg.user_id
     WHERE t.organization_id = ${organizationId} AND t.done_at >= ${since} AND t.qty_done IS NOT NULL AND t.qty_done <> t.qty_assigned
-      ${leaderScope(sql, leaderId)}
+      ${leaderScope(sql, leaderId)} ${subjectId ? sql`AND t.id = ${subjectId}` : sql``}
     ORDER BY t.done_at DESC, t.id
     LIMIT ${perKindLimit + 1}
   `;
@@ -84,7 +84,7 @@ const queryQtyMismatch = async (sql: QuerySql, organizationId: string, since: Da
   }));
 };
 
-const queryQcFailRepeat = async (sql: QuerySql, organizationId: string, since: Date, leaderId: string | null): Promise<Draft[]> => {
+const queryQcFailRepeat = async (sql: QuerySql, organizationId: string, since: Date, leaderId: string | null, _threshold: number, subjectId: string | null = null): Promise<Draft[]> => {
   const rows = await sql<
     (TaskCols & { assignee: UserCols; qc_fail_count: number; updated_at: Date; status_id: string; status_code: string; status_name: string; status_color: string })[]
   >`
@@ -96,7 +96,7 @@ const queryQcFailRepeat = async (sql: QuerySql, organizationId: string, since: D
     JOIN production.statuses s ON s.organization_id = t.organization_id AND s.id = t.status_id
     JOIN public.app_users ua ON ua.id = t.assignee_id
     WHERE t.organization_id = ${organizationId} AND t.done_at >= ${since} AND t.qc_fail_count >= 2
-      ${leaderScope(sql, leaderId)}
+      ${leaderScope(sql, leaderId)} ${subjectId ? sql`AND t.id = ${subjectId}` : sql``}
     ORDER BY t.updated_at DESC, t.id
     LIMIT ${perKindLimit + 1}
   `;
@@ -118,7 +118,8 @@ const queryWorkerFailRate = async (
   organizationId: string,
   since: Date,
   leaderId: string | null,
-  threshold: number
+  threshold: number,
+  subjectId: string | null = null
 ): Promise<Draft[]> => {
   const rows = await sql<
     (UserCols & { task_count: number; fb_wrong: number; qc_failed: number; last_incident: Date | null; last_done: Date })[]
@@ -133,6 +134,7 @@ const queryWorkerFailRate = async (
       FROM production.tasks t
       JOIN production.jobs j ON j.organization_id = t.organization_id AND j.id = t.job_id
       WHERE t.organization_id = ${organizationId} AND t.done_at >= ${since} ${leaderScope(sql, leaderId)}
+        ${subjectId ? sql`AND t.assignee_id = ${subjectId}` : sql``}
       GROUP BY t.assignee_id
     ) a
     JOIN public.app_users ua ON ua.id = a.assignee_id
@@ -155,7 +157,7 @@ const queryWorkerFailRate = async (
   }));
 };
 
-const queryFastDone = async (sql: QuerySql, organizationId: string, since: Date, leaderId: string | null): Promise<Draft[]> => {
+const queryFastDone = async (sql: QuerySql, organizationId: string, since: Date, leaderId: string | null, _threshold: number, subjectId: string | null = null): Promise<Draft[]> => {
   const rows = await sql<(TaskCols & { assignee: UserCols; assigned_at: Date; done_at: Date; qty_done: number | null; seconds: string })[]>`
     SELECT t.id AS task_id, t.number::text AS task_number, t.job_id, j.code AS job_code,
       json_build_object('id', ua.id, 'display_name', ua.display_name, 'email', ua.email, 'avatar_url', ua.avatar_url) AS assignee,
@@ -165,7 +167,7 @@ const queryFastDone = async (sql: QuerySql, organizationId: string, since: Date,
     JOIN public.app_users ua ON ua.id = t.assignee_id
     WHERE t.organization_id = ${organizationId} AND t.done_at >= ${since}
       AND t.done_at <= t.assigned_at + make_interval(mins => ${fastDoneMinutes})
-      ${leaderScope(sql, leaderId)}
+      ${leaderScope(sql, leaderId)} ${subjectId ? sql`AND t.id = ${subjectId}` : sql``}
     ORDER BY t.done_at DESC, t.id
     LIMIT ${perKindLimit + 1}
   `;
@@ -182,7 +184,7 @@ const queryFastDone = async (sql: QuerySql, organizationId: string, since: Date,
   }));
 };
 
-const queryMissingRule = async (sql: QuerySql, organizationId: string, since: Date, leaderId: string | null): Promise<Draft[]> => {
+const queryMissingRule = async (sql: QuerySql, organizationId: string, since: Date, leaderId: string | null, _threshold: number, subjectId: string | null = null): Promise<Draft[]> => {
   const rows = await sql<
     (TaskCols & { entry_id: string; earner: UserCols; role: "WORKER" | "QC"; project_code: string; process_name: string | null; qty: number; business_day: string; created_at: Date })[]
   >`
@@ -197,7 +199,7 @@ const queryMissingRule = async (sql: QuerySql, organizationId: string, since: Da
     JOIN public.app_users u ON u.id = e.user_id
     WHERE e.organization_id = ${organizationId} AND e.credit_rule_id IS NULL AND e.adjusts_entry_id IS NULL
       AND e.created_at >= ${since} AND e.kind <> 'FB_WRONG'
-      ${leaderScope(sql, leaderId)}
+      ${leaderScope(sql, leaderId)} ${subjectId ? sql`AND e.id = ${subjectId}` : sql``}
     ORDER BY e.created_at DESC, e.id
     LIMIT ${perKindLimit + 1}
   `;
@@ -217,7 +219,7 @@ const queryMissingRule = async (sql: QuerySql, organizationId: string, since: Da
 
 const kindQueries: Record<
   AnomalyKind,
-  (sql: QuerySql, organizationId: string, since: Date, leaderId: string | null, threshold: number) => Promise<Draft[]>
+  (sql: QuerySql, organizationId: string, since: Date, leaderId: string | null, threshold: number, subjectId?: string | null) => Promise<Draft[]>
 > = {
   QTY_MISMATCH: queryQtyMismatch,
   QC_FAIL_REPEAT: queryQcFailRepeat,
@@ -284,71 +286,123 @@ export const listAnomalies = async (
 
 const anomalyNotFound = () => new AppError("ANOMALY_NOT_FOUND", "Không tìm thấy bất thường.", 404);
 
+/** Longest look-back the list accepts (AnomalyQuerySchema.days): a key listed in any window can be reviewed. */
+export const anomalyMaxWindowDays = 180;
+
+export type WorkerTaskSample = { doneAt: Date; fbWrong: boolean; qcFailed: boolean };
+
 /**
- * Resolves the subject of a key inside the caller's scope: the task (task kinds), the score entry's task
- * (MISSING_CREDIT_RULE) or the worker (WORKER_FAIL_RATE, who must have worked on a job the LEADER leads).
- * Returns the task id to store, or throws 404.
+ * Every WORKER_FAIL_RATE key one worker can be listed with, over each look-back window the list accepts
+ * (1…maxDays days, the same rule as queryWorkerFailRate). The key carries the window's counts, so a review is
+ * accepted only for counts the caller could actually have been shown (SEC2-11).
  */
-const resolveSubject = async (sql: QuerySql, context: AccessContext, kind: AnomalyKind, key: string): Promise<string | null> => {
+export const workerFailRateKeys = (userId: string, tasks: readonly WorkerTaskSample[], now: Date, threshold: number, maxDays = anomalyMaxWindowDays) => {
+  const keys = new Set<string>();
+  for (let days = 1; days <= maxDays; days += 1) {
+    const since = now.getTime() - days * 86_400_000;
+    let count = 0;
+    let fbWrong = 0;
+    let qcFailed = 0;
+    for (const task of tasks) {
+      if (task.doneAt.getTime() >= since) {
+        count += 1;
+        fbWrong += task.fbWrong ? 1 : 0;
+        qcFailed += task.qcFailed ? 1 : 0;
+      }
+    }
+    if (count > 0 && (fbWrong / count > threshold || qcFailed / count > threshold)) {
+      keys.add(`${userId}:${fbWrong}:${qcFailed}`);
+    }
+  }
+  return keys;
+};
+
+/**
+ * The anomaly a review names, computed for the caller's own scope (SEC2-11) — the jobs a LEADER leads, every
+ * job for an ADMIN — over the longest window the list offers. Only an exact key from that computation is
+ * accepted, never a key the client made up or one from someone else's (e.g. the ADMIN-wide) scope. Returns
+ * the task id to store with the review (null for a worker), or throws 404.
+ */
+const resolveOwnAnomaly = async (sql: QuerySql, context: AccessContext, kind: AnomalyKind, key: string): Promise<string | null> => {
   const organizationId = org(context);
-  const subjectId = key.slice(0, 36);
   const leaderId = isProductionAdmin(context) ? null : context.user.id;
-  const scope = leaderScope(sql, leaderId);
+  const subjectId = key.slice(0, 36);
+  const threshold = (await loadSettings(sql, organizationId)).anomalyFailRate;
+  const now = new Date();
+  const since = new Date(now.getTime() - anomalyMaxWindowDays * 86_400_000);
   if (kind === "WORKER_FAIL_RATE") {
-    const found = await sql`
-      SELECT 1 FROM production.tasks t
+    const rows = await sql<{ done_at: Date; fb_wrong: boolean; qc_failed: boolean }[]>`
+      SELECT t.done_at, t.kind = 'FB_WRONG' AS fb_wrong, t.qc_fail_count > 0 AS qc_failed
+      FROM production.tasks t
       JOIN production.jobs j ON j.organization_id = t.organization_id AND j.id = t.job_id
-      WHERE t.organization_id = ${organizationId} AND t.assignee_id = ${subjectId} ${scope}
-      LIMIT 1
+      WHERE t.organization_id = ${organizationId} AND t.assignee_id = ${subjectId} AND t.done_at >= ${since} ${leaderScope(sql, leaderId)}
     `;
-    if (found.length === 0) {
+    const samples = rows.map((row) => ({ doneAt: row.done_at, fbWrong: row.fb_wrong, qcFailed: row.qc_failed }));
+    if (!workerFailRateKeys(subjectId, samples, now, threshold).has(key)) {
       throw anomalyNotFound();
     }
     return null;
   }
-  const rows =
-    kind === "MISSING_CREDIT_RULE"
-      ? await sql<{ task_id: string }[]>`
-          SELECT e.task_id FROM production.score_entries e
-          JOIN production.jobs j ON j.organization_id = e.organization_id AND j.id = e.job_id
-          WHERE e.organization_id = ${organizationId} AND e.id = ${subjectId} ${scope}
-        `
-      : await sql<{ task_id: string }[]>`
-          SELECT t.id AS task_id FROM production.tasks t
-          JOIN production.jobs j ON j.organization_id = t.organization_id AND j.id = t.job_id
-          WHERE t.organization_id = ${organizationId} AND t.id = ${subjectId} ${scope}
-        `;
-  if (!rows[0]) {
+  const match = (await kindQueries[kind](sql, organizationId, since, leaderId, threshold, subjectId)).find((draft) => draft.key === key);
+  if (!match) {
     throw anomalyNotFound();
   }
-  return rows[0].task_id;
+  return match.task?.id ?? null;
 };
 
-/** POST /production/anomalies/review — mark "Đã xem" (idempotent; a second mark updates who/when). */
+/**
+ * POST /production/anomalies/review — mark "Đã xem" (idempotent). A second mark by the same reviewer (or an
+ * ADMIN) updates who/when/note; someone else's review stays theirs (only they or an ADMIN may change or undo
+ * it, SEC2-11) and is returned unchanged.
+ */
 export const reviewAnomaly = async (context: AccessContext, input: { kind: AnomalyKind; key: string; note?: string | undefined }) => {
   assertProductionRole(context, "LEADER");
   const sql = getSql();
-  const taskId = await resolveSubject(sql, context, input.kind, input.key);
-  const row = (
-    await sql<{ reviewed_at: Date }[]>`
-      INSERT INTO production.anomaly_reviews (organization_id, kind, subject_key, task_id, reviewed_by, note)
-      VALUES (${org(context)}, ${input.kind}, ${input.key}, ${taskId}, ${context.user.id}, ${input.note?.trim() || null})
-      ON CONFLICT (organization_id, kind, subject_key)
-      DO UPDATE SET reviewed_by = EXCLUDED.reviewed_by, reviewed_at = now(), note = EXCLUDED.note
-      RETURNING reviewed_at
-    `
-  )[0]!;
+  const organizationId = org(context);
+  const taskId = await resolveOwnAnomaly(sql, context, input.kind, input.key);
+  const admin = isProductionAdmin(context);
+  const row =
+    (
+      await sql<{ reviewed_at: Date }[]>`
+        INSERT INTO production.anomaly_reviews AS r (organization_id, kind, subject_key, task_id, reviewed_by, note)
+        VALUES (${organizationId}, ${input.kind}, ${input.key}, ${taskId}, ${context.user.id}, ${input.note?.trim() || null})
+        ON CONFLICT (organization_id, kind, subject_key)
+        DO UPDATE SET reviewed_by = EXCLUDED.reviewed_by, reviewed_at = now(), note = EXCLUDED.note
+        WHERE ${admin}::boolean OR r.reviewed_by = ${context.user.id}
+        RETURNING r.reviewed_at
+      `
+    )[0] ??
+    (
+      await sql<{ reviewed_at: Date }[]>`
+        SELECT reviewed_at FROM production.anomaly_reviews
+        WHERE organization_id = ${organizationId} AND kind = ${input.kind} AND subject_key = ${input.key}
+      `
+    )[0]!;
   return { kind: input.kind, key: input.key, reviewedAt: toIso(row.reviewed_at) };
 };
 
-/** DELETE /production/anomalies/reviews?kind&key — undo "Đã xem". */
+/**
+ * DELETE /production/anomalies/reviews?kind&key — undo "Đã xem": only the person who marked it or an ADMIN
+ * (SEC2-11). Undoing a mark that does not exist is a no-op.
+ */
 export const unreviewAnomaly = async (context: AccessContext, input: { kind: AnomalyKind; key: string }) => {
   assertProductionRole(context, "LEADER");
   const sql = getSql();
-  await resolveSubject(sql, context, input.kind, input.key);
-  await sql`
-    DELETE FROM production.anomaly_reviews
-    WHERE organization_id = ${org(context)} AND kind = ${input.kind} AND subject_key = ${input.key}
-  `;
+  const organizationId = org(context);
+  const review = (
+    await sql<{ reviewed_by: string | null }[]>`
+      SELECT reviewed_by FROM production.anomaly_reviews
+      WHERE organization_id = ${organizationId} AND kind = ${input.kind} AND subject_key = ${input.key}
+    `
+  )[0];
+  if (review) {
+    if (!isProductionAdmin(context) && review.reviewed_by !== context.user.id) {
+      throw new AppError("ANOMALY_REVIEW_NOT_OWNER", "Chỉ người đã đánh dấu \"Đã xem\" (hoặc Quản trị) được bỏ đánh dấu.", 403);
+    }
+    await sql`
+      DELETE FROM production.anomaly_reviews
+      WHERE organization_id = ${organizationId} AND kind = ${input.kind} AND subject_key = ${input.key}
+    `;
+  }
   return { kind: input.kind, key: input.key, reviewedAt: null };
 };

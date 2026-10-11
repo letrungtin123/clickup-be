@@ -1,5 +1,5 @@
 import type { QuerySql } from "../../lib/db-types.js";
-import { loadSettings } from "./catalog.service.js";
+import { closeDaysOf, loadSettings } from "./catalog.service.js";
 import { getCreditRule } from "./credit-rules.js";
 import {
   computeAdjustment,
@@ -81,7 +81,7 @@ const loadOriginals = (sql: QuerySql, organizationId: string, taskId: string) =>
 
 const eventTime = async (sql: QuerySql, organizationId: string, at: Date): Promise<EventTime> => {
   const settings = await loadSettings(sql, organizationId);
-  return { at, day: businessDay(at), period: periodMonth(at, settings.kpiCloseDay) };
+  return { at, day: businessDay(at), period: periodMonth(at, closeDaysOf(settings)) };
 };
 
 /** The single active QC process ("Checking") whose rule prices QC credit (PD-010). */
