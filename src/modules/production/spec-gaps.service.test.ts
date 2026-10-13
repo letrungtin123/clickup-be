@@ -155,6 +155,7 @@ const taskRow = (overrides: Partial<TaskRow> = {}): TaskRow => ({
   requires_ot_hours: false,
   qty_assigned: 10,
   qty_done: null,
+  error_qty: null,
   ot_hours: null,
   assigned_at: new Date("2026-10-10T02:00:00Z"),
   deadline: new Date("2099-01-01T00:00:00Z"),
@@ -168,6 +169,7 @@ const taskRow = (overrides: Partial<TaskRow> = {}): TaskRow => ({
   parent_task_id: null,
   feedback_id: null,
   note: null,
+  work_link: null,
   is_late: false,
   qc_fail_count: 0,
   custom_values: {},
@@ -190,7 +192,7 @@ const splitQueries = (extra: (call: Call) => unknown[] | undefined = () => undef
     return answer;
   }
   if (call.text.includes("FROM production.jobs j JOIN production.projects p")) {
-    return [{ id: jobId, leader_id: me, deadline: new Date("2099-01-01T00:00:00Z"), total_images: 100, qc_buffer_hours: 2, archived_at: null }];
+    return [{ id: jobId, leader_id: me, received_at: new Date("2026-10-01T00:00:00Z"), deadline: new Date("2099-01-01T00:00:00Z"), total_images: 100, total_images_manual: true, qc_buffer_hours: 2, archived_at: null }];
   }
   if (call.text.startsWith("SELECT om.user_id")) {
     return [
@@ -333,7 +335,9 @@ describe("G11 — history: task tag changes and job edits", () => {
       project_id: projectId,
       leader_id: me,
       deadline: new Date("2026-10-20T10:00:00Z"),
+      received_at: new Date("2026-10-19T00:00:00Z"),
       total_images: 100,
+      total_images_manual: true,
       drive_link: null,
       custom_values: { ma_don_hang: "PO-1" },
       archived_at: null
@@ -358,13 +362,15 @@ describe("G11 — history: task tag changes and job edits", () => {
       project_id: projectId,
       leader_id: me,
       deadline: new Date("2026-10-20T10:00:00Z"),
+      received_at: new Date("2026-10-19T00:00:00Z"),
       total_images: 100,
+      total_images_manual: true,
       drive_link: null,
       custom_values: {},
       archived_at: null
     };
     db.state.handler = (call) => {
-      if (call.text.includes("FROM production.jobs WHERE organization_id = $ AND id = $ FOR UPDATE")) {
+      if (call.text.includes("FROM production.jobs WHERE organization_id = $ AND id = $ AND deleted_at IS NULL FOR UPDATE")) {
         return [before];
       }
       if (call.text.startsWith("SELECT code, name, project_id, leader_id")) {

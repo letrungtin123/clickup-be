@@ -167,7 +167,9 @@ describe("report SQL builder", () => {
 
   it("PR-17: the KPI period of score entries follows the CURRENT close day, not the stored period_month", () => {
     const query = build({ dimensions: ["period"], measures: ["points", "task_count"] });
-    expect(query.text).toMatch(/date_trunc\('month', \(e\.business_day - \$\d+::int\) \+ interval '1 month'\)/);
+    expect(query.text).toMatch(
+      /to_char\(e\.business_day \+ CASE WHEN extract\(day FROM e\.business_day\) <= \$\d+::int THEN interval '0 months' ELSE interval '1 month' END, 'YYYY-MM'\)/
+    );
     expect(query.text).not.toContain("period_month");
     expect(query.params).toContain(25);
   });
@@ -183,7 +185,9 @@ describe("report SQL builder", () => {
 
   it("KPI period dimension binds the close day; totals-only reports have no GROUP BY", () => {
     const query = build({ dimensions: ["period"], measures: ["task_count"] });
-    expect(query.text).toMatch(/date_trunc\('month', \(\(t\.done_at AT TIME ZONE \$\d+::text\)::date - \$\d+::int\) \+ interval '1 month'\)/);
+    expect(query.text).toMatch(
+      /to_char\(\(t\.done_at AT TIME ZONE (\$\d+)::text\)::date \+ CASE WHEN extract\(day FROM \(t\.done_at AT TIME ZONE \1::text\)::date\) <= \$\d+::int THEN/
+    );
     expect(query.params).toContain(25);
     const totals = build({ measures: ["points", "task_count"] });
     expect(totals.text).not.toContain("GROUPING");

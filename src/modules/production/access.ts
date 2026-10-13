@@ -34,6 +34,14 @@ export const isProductionAdmin = (context: AccessContext) => productionRolesOf(c
 export const leadsJob = (context: AccessContext, leaderId: string | null | undefined) =>
   Boolean(leaderId) && leaderId === context.user.id && hasProductionRole(context, "LEADER", "ADMIN");
 
+/**
+ * The caller acts as the job leader (workflow actor JOB_LEADER, "Giao lại", job chat, private score rows): they lead
+ * it (`leadsJob`), or the job has no leader (PD-035) and they hold LEADER or ADMIN — an unled job belongs to every
+ * Leader until one is named.
+ */
+export const actsAsJobLeader = (context: AccessContext, leaderId: string | null | undefined) =>
+  leaderId ? leadsJob(context, leaderId) : hasProductionRole(context, "LEADER", "ADMIN");
+
 /** Any production role: the module is invisible (404) to everyone else. */
 export const assertProductionMember = (context: AccessContext) => {
   if (productionRolesOf(context).size === 0) {

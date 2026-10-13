@@ -155,11 +155,11 @@ const contextOf = (notification: EmailNotification) => {
     hasTask: taskNumber !== null,
     note: text(payload.note),
     productionFacts: [
-      ["Job", jobCode],
+      ["Gói công việc", jobCode],
       ["Task", taskNumber !== null ? `#${taskNumber}` : null],
       ["Công đoạn", text(payload.processName)],
       ["Số lượng", qty !== null ? `${qty} tấm` : null],
-      ["Deadline", formatDateTime(payload.deadline)]
+      ["Ngày giao", formatDateTime(payload.deadline)]
     ] satisfies Fact[]
   };
 };
@@ -278,7 +278,7 @@ const templates = {
   "production.feedback": (n, c) => ({
     headline: `Có feedback từ khách hàng cho job ${c.jobCode}`,
     facts: [
-      ["Job", c.jobCode],
+      ["Gói công việc", c.jobCode],
       ["Loại feedback", text(n.payload.feedbackType)]
     ],
     excerpt: c.note ?? c.excerpt

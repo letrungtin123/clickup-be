@@ -127,8 +127,12 @@ const waitFor = async (s, predicate) => {
 };
 
 try {
+  // The SPEC §8.6 cases below are the IF_KPI rule; ALWAYS (the default since PD-033) is compared further down.
+  let r = await admin.call("PATCH", "/production/settings", { khoanPayPolicy: "IF_KPI" });
+  ok("Khoán pay policy set to IF_KPI for the SPEC cases", r.status === 200 && r.body.khoanPayPolicy === "IF_KPI");
+
   // Access
-  let r = await outsider.call("GET", "/production/kpi/settlements?period=2019-03");
+  r = await outsider.call("GET", "/production/kpi/settlements?period=2019-03");
   ok("non-member gets 404", r.status === 404);
   r = await run(staff, "2019-03", "thử chốt");
   ok("STAFF cannot run a settlement (403)", r.status === 403);
@@ -187,6 +191,24 @@ try {
   ok("not-met person notified", leaderNote?.payload.met === false && leaderNote.payload.khoanPointsConverted === 30, leaderNote ? "" : "(none)");
   const summary = await waitFor(admin, (item) => item.payload.runId === run2.id && item.payload.summary === true);
   ok("admins get one summary per run", summary?.payload.settled === 2 && summary.payload.met === 1, summary ? "" : "(none)");
+
+  // PD-033: re-running the same period with the other Khoán pay policy, then back
+  r = await admin.call("PATCH", "/production/settings", { khoanPayPolicy: "ALWAYS" });
+  ok("admin switches the Khoán policy to ALWAYS", r.status === 200 && r.body.khoanPayPolicy === "ALWAYS");
+  r = await run(admin, "2019-03", "So sánh: luôn trả Khoán");
+  a = byUser(r.body.items, leaderId);
+  ok(
+    "ALWAYS: not met, Khoán money still paid, nothing converted",
+    r.body.run?.khoanPolicy === "ALWAYS" && r.body.run.khoanMoneyTotal === 300000 && r.body.run.khoanPointsConvertedTotal === 0 &&
+      a?.met === false && a.khoanPolicy === "ALWAYS" && a.khoanMoney === 150000 && a.khoanPointsConverted === 0 && a.totalPoints === 80,
+    JSON.stringify(a)
+  );
+  await admin.call("PATCH", "/production/settings", { khoanPayPolicy: "IF_KPI" });
+  r = await run(admin, "2019-03", "So sánh: chỉ trả khi đạt KPI");
+  a = byUser(r.body.items, leaderId);
+  ok("back to IF_KPI: the re-run converts again", r.body.run?.khoanPolicy === "IF_KPI" && a?.met === false && a.khoanMoney === 0 && a.khoanPointsConverted === 30);
+  r = await admin.call("GET", "/production/kpi/settlement-runs?period=2019-03");
+  ok("the run history shows each run's policy", r.body.items?.slice(0, 2).map((item) => item.khoanPolicy).join() === "IF_KPI,ALWAYS", JSON.stringify(r.body?.items?.map((item) => item.khoanPolicy)));
 
   // Data changes → an Admin re-run reflects them
   localSql(`${insertEntries([[leaderId, fx.tB5, "QC", "POINTS", "checking", "official", 2.5, 0, 10, "2019-03-08", "2019-03-01"]])}`);
@@ -252,6 +274,6 @@ try {
   r = await admin.call("GET", `/production/scores/task/${randomUUID()}`);
   ok("unknown task (404)", r.status === 404);
 } finally {
-  await admin.call("PATCH", "/production/settings", { kpiCloseDay: originalSettings.kpiCloseDay });
+  await admin.call("PATCH", "/production/settings", { kpiCloseDay: originalSettings.kpiCloseDay, khoanPayPolicy: originalSettings.khoanPayPolicy });
   cleanup();
 }

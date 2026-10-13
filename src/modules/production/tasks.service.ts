@@ -6,6 +6,7 @@ import type { CustomFieldFilter, CustomValues } from "../../contracts/production
 import type {
   AssignTaskRequestSchema,
   CreateTaskLine,
+  DeleteTaskResult,
   MyProductionTasksQuery,
   ProductionTask,
   ProductionTaskPage,
@@ -31,8 +32,8 @@ import {
 } from "./custom-fields.js";
 import { syncJobChat } from "./job-chat.service.js";
 import {
-  canManageTask,
-  canViewTask,
+  assertJobVisible,
+  assertTaskVisible,
   finishedStatusIds,
   jobArchivedError,
   loadMemberRoles,
@@ -48,12 +49,12 @@ import {
 } from "./jobs.repo.js";
 import { enqueueProductionEvents, taskAssignedEvent, taskQtyEvent, taskStatusEvent } from "./notifications.js";
 import { publishProductionChange } from "./realtime.js";
-import { onTaskQtyChanged, onTaskStatusEntered } from "./scoring-hooks.js";
+import { assertLinesCreatable, forbidden, lineAllowed } from "./job-permissions.js";
+import { onTaskDeleted, onTaskQtyChanged, onTaskStatusEntered } from "./scoring-hooks.js";
 import {
   assertDeclaredDoneQty,
   assertTransition,
   computeIsLate,
-  defaultTaskDeadline,
   deriveJobStatus,
   feedbackTaskDeadline,
   isQcFail,
@@ -75,7 +76,9 @@ const notFound = () => new AppError("TASK_NOT_FOUND", "Không tìm thấy task."
 
 /** Locks the job first, then the task (same order everywhere, so concurrent changes never deadlock). */
 export const lockTaskForUpdate = async (tx: QuerySql, organizationId: string, taskId: string) => {
-  const row = (await tx<{ job_id: string }[]>`SELECT job_id FROM production.tasks WHERE organization_id = ${organizationId} AND id = ${taskId}`)[0];
+  const row = (
+    await tx<{ job_id: string }[]>`SELECT job_id FROM production.tasks WHERE organization_id = ${organizationId} AND id = ${taskId} AND deleted_at IS NULL`
+  )[0];
   if (!row) {
     throw notFound();
   }
@@ -88,7 +91,7 @@ type LogInput = {
   taskId: string;
   jobId: string;
   userId: string | null;
-  action: "CREATE" | "STATUS" | "QTY" | "ASSIGN" | "NOTE" | "FIELD";
+  action: "CREATE" | "STATUS" | "QTY" | "ASSIGN" | "NOTE" | "FIELD" | "DELETE";
   from?: Record<string, unknown> | null;
   to?: Record<string, unknown> | null;
   note?: string | null;
@@ -162,10 +165,8 @@ export const moveTasks = async (
       qtyDone = extras.qtyDone ?? task.qty_assigned;
       // SEC2-03: the declared quantity feeds points / Khoán money in the append-only ledger.
       assertDeclaredDoneQty(task.qty_assigned, qtyDone);
-      if (task.requires_ot_hours) {
-        if (extras.otHours === undefined) {
-          throw new AppError("OT_HOURS_REQUIRED", "Ca OT cần nhập số giờ OT khi Done.", 400);
-        }
+      // PD-035: "Giờ OT" is optional, also on the OT shift; sent at Done it replaces the line's own value.
+      if (extras.otHours !== undefined) {
         otHours = extras.otHours;
       }
     } else if (extras.qtyDone !== undefined && extras.qtyDone !== task.qty_done) {
@@ -300,7 +301,7 @@ export const releaseParkedTasks = async (
   const checked = workflow.statuses.filter((status) => status.countsChecked).map((status) => status.id);
   const ids = (
     await tx<{ id: string }[]>`
-      SELECT id FROM production.tasks WHERE organization_id = ${organizationId} AND job_id = ${jobId}
+      SELECT id FROM production.tasks WHERE organization_id = ${organizationId} AND job_id = ${jobId} AND deleted_at IS NULL
         AND (status_id = ${statusByCode(workflow, "FEEDBACK").id}
           OR (feedback_id IS NOT NULL AND status_id = ANY(${checked}::uuid[])))
       ORDER BY created_at FOR UPDATE
@@ -311,15 +312,36 @@ export const releaseParkedTasks = async (
 };
 
 /**
+ * "Tổng tấm" of a job that was not typed (total_images_manual = false, PD-035): the sum of its NORMAL work lines
+ * (feedback redo lines are extra work, and Checking lines check the same images, PD-037). Call after lines are
+ * added, changed or removed.
+ */
+export const syncJobTotalImages = async (tx: QuerySql, organizationId: string, jobId: string) => {
+  await tx`
+    UPDATE production.jobs j SET total_images = s.total, updated_at = now()
+    FROM (
+      SELECT coalesce(sum(t.qty_assigned), 0)::int AS total FROM production.tasks t
+      JOIN production.processes p ON p.organization_id = t.organization_id AND p.id = t.process_id
+      WHERE t.organization_id = ${organizationId} AND t.job_id = ${jobId} AND t.kind = 'NORMAL' AND t.deleted_at IS NULL AND NOT p.is_qc
+    ) s
+    WHERE j.organization_id = ${organizationId} AND j.id = ${jobId} AND NOT j.total_images_manual AND j.total_images <> s.total
+  `;
+};
+
+/**
  * After task changes in a job: resolve feedback whose re-done tasks are all checked (source tasks and FB
- * tasks return to Complete), then store the job status derived from its tasks.
+ * tasks return to Complete), then store the job status derived from its tasks and its automatic Tổng tấm.
  */
 export const settleJob = async (tx: QuerySql, organizationId: string, workflow: Workflow, jobId: string) => {
+  await syncJobTotalImages(tx, organizationId, jobId);
   const ready = await tx<{ id: string }[]>`
     SELECT f.id FROM production.feedbacks f
     WHERE f.organization_id = ${organizationId} AND f.job_id = ${jobId} AND f.status <> 'RESOLVED'
-      AND EXISTS (SELECT 1 FROM production.tasks t WHERE t.organization_id = f.organization_id AND t.feedback_id = f.id)
-      AND NOT EXISTS (SELECT 1 FROM production.tasks t WHERE t.organization_id = f.organization_id AND t.feedback_id = f.id AND t.checked_at IS NULL)
+      AND EXISTS (SELECT 1 FROM production.tasks t WHERE t.organization_id = f.organization_id AND t.feedback_id = f.id AND t.deleted_at IS NULL)
+      AND NOT EXISTS (
+        SELECT 1 FROM production.tasks t
+        WHERE t.organization_id = f.organization_id AND t.feedback_id = f.id AND t.checked_at IS NULL AND t.deleted_at IS NULL
+      )
   `;
   if (ready.length > 0) {
     await tx`
@@ -329,7 +351,9 @@ export const settleJob = async (tx: QuerySql, organizationId: string, workflow: 
     await releaseParkedTasks(tx, organizationId, workflow, jobId, null, "Feedback đã xử lý xong — trở về Complete.");
   }
   const [statusRows, open] = await Promise.all([
-    tx<{ status_id: string }[]>`SELECT DISTINCT status_id FROM production.tasks WHERE organization_id = ${organizationId} AND job_id = ${jobId}`,
+    tx<{ status_id: string }[]>`
+      SELECT DISTINCT status_id FROM production.tasks WHERE organization_id = ${organizationId} AND job_id = ${jobId} AND deleted_at IS NULL
+    `,
     tx<{ open: boolean }[]>`
       SELECT EXISTS (SELECT 1 FROM production.feedbacks WHERE organization_id = ${organizationId} AND job_id = ${jobId} AND status <> 'RESOLVED') AS open
     `
@@ -346,12 +370,9 @@ export const settleJob = async (tx: QuerySql, organizationId: string, workflow: 
 export const getProductionTask = async (context: AccessContext, taskId: string, sql: QuerySql = getSql()): Promise<ProductionTask> => {
   assertProductionMember(context);
   const [task, workflow] = await Promise.all([loadTask(sql, context.organization.id, taskId), loadWorkflowModel(sql, context.organization.id)]);
-  const relation = relationOf(context, task);
-  if (!canViewTask(relation)) {
-    throw notFound();
-  }
+  const scopes = await assertTaskVisible(sql, context, task);
   const extras = await loadTaskExtras(sql, context.organization.id, context.user.id, [task]);
-  return toProductionTask(task, workflow, relation, extras.get(task.id));
+  return toProductionTask(task, workflow, relationOf(context, task), { scopes, userId: context.user.id }, extras.get(task.id));
 };
 
 /**
@@ -415,14 +436,22 @@ export const listQcQueue = async (context: AccessContext, query: QcQueueQuery = 
 
 // Creating tasks -------------------------------------------------------------------------------------------
 
-type JobForTasks = { id: string; leader_id: string; deadline: Date; total_images: number; qc_buffer_hours: number };
+type JobForTasks = {
+  id: string;
+  leader_id: string | null;
+  received_at: Date;
+  deadline: Date;
+  total_images: number;
+  total_images_manual: boolean;
+  qc_buffer_hours: number;
+};
 
 export const loadJobForTasks = async (tx: QuerySql, organizationId: string, jobId: string, lock: boolean) => {
   const job = (
     await tx<(JobForTasks & { archived_at: Date | null })[]>`
-      SELECT j.id, j.leader_id, j.deadline, j.total_images, p.qc_buffer_hours, j.archived_at
+      SELECT j.id, j.leader_id, j.received_at, j.deadline, j.total_images, j.total_images_manual, p.qc_buffer_hours, j.archived_at
       FROM production.jobs j JOIN production.projects p ON p.organization_id = j.organization_id AND p.id = j.project_id
-      WHERE j.organization_id = ${organizationId} AND j.id = ${jobId}
+      WHERE j.organization_id = ${organizationId} AND j.id = ${jobId} AND j.deleted_at IS NULL
       ${lock ? tx`FOR UPDATE OF j` : tx``}
     `
   )[0];
@@ -435,14 +464,13 @@ export const loadJobForTasks = async (tx: QuerySql, organizationId: string, jobI
   return job;
 };
 
-const lineContext = async (tx: QuerySql, organizationId: string, callerId: string, userIds: string[]) => {
+const lineContext = async (tx: QuerySql, organizationId: string, userIds: string[]) => {
   const [memberRoles, processes, shifts] = await Promise.all([
     loadMemberRoles(tx, organizationId, userIds),
     tx<{ id: string; active: boolean; is_qc: boolean; name: string }[]>`SELECT id, active, is_qc, name FROM production.processes WHERE organization_id = ${organizationId}`,
     tx<{ id: string; active: boolean }[]>`SELECT id, active FROM production.shifts WHERE organization_id = ${organizationId}`
   ]);
   return {
-    callerId,
     memberRoles,
     processes: new Map(processes.map((row) => [row.id, { active: row.active, isQc: row.is_qc, name: row.name }])),
     shifts: new Map(shifts.map((row) => [row.id, { active: row.active }]))
@@ -450,22 +478,16 @@ const lineContext = async (tx: QuerySql, organizationId: string, callerId: strin
 };
 
 /** Validates every line (all errors at once, prefixed with the line number) — nothing is written on error. */
-const assertLines = async (
-  tx: QuerySql,
-  organizationId: string,
-  context: AccessContext,
-  job: JobForTasks,
-  lines: (CreateTaskLine & { sourceTaskId?: string | undefined })[]
-) => {
-  const ctx = await lineContext(tx, organizationId, job.leader_id, lines.flatMap((line) => [line.assigneeId, ...(line.qcId ? [line.qcId] : [])]));
+const assertLines = async (tx: QuerySql, organizationId: string, lines: (CreateTaskLine & { sourceTaskId?: string | undefined })[]) => {
+  const ctx = await lineContext(tx, organizationId, lines.flatMap((line) => [line.assigneeId, ...(line.qcId ? [line.qcId] : [])]));
   const errors: string[] = [];
   lines.forEach((line, index) => {
     const lineErrors = taskLineErrors(line, ctx);
-    if (!line.qcId && line.assigneeId === context.user.id && line.assigneeId !== job.leader_id) {
-      lineErrors.push("Tự giao cho mình thì phải chọn QC là người khác.");
-    }
     if (line.deadline && Number.isNaN(Date.parse(line.deadline))) {
-      lineErrors.push("Deadline không hợp lệ.");
+      lineErrors.push("Ngày giao không hợp lệ.");
+    }
+    if (line.assignedAt && line.deadline && Date.parse(line.deadline) < Date.parse(line.assignedAt)) {
+      lineErrors.push("Ngày giao phải từ Ngày nhận trở đi.");
     }
     errors.push(...lineErrors.map((message) => `Dòng ${index + 1}: ${message}`));
   });
@@ -489,7 +511,7 @@ export const insertTasks = async (
   options: { kind: TaskKind; feedbackId: string | null; defaultParentId: string | null; assignedAt?: Date }
 ) => {
   const organizationId = context.organization.id;
-  await assertLines(tx, organizationId, context, job, lines);
+  await assertLines(tx, organizationId, lines);
   const initial = workflow.statuses.find((status) => status.isInitial && status.active);
   if (!initial) {
     throw new AppError("WORKFLOW_INCOMPLETE", "Chưa có trạng thái khởi tạo trong cấu hình.", 409);
@@ -539,26 +561,32 @@ export const insertTasks = async (
     }
   }
   let warning: string | null = null;
-  if (options.kind === "NORMAL") {
+  // An automatic Tổng tấm (PD-035) follows the lines, so only a typed one can be exceeded.
+  if (options.kind === "NORMAL" && job.total_images_manual) {
     const assigned = (
       await tx<{ total: number }[]>`
         SELECT coalesce(sum(qty_assigned), 0)::int AS total FROM production.tasks
-        WHERE organization_id = ${organizationId} AND job_id = ${job.id} AND kind = 'NORMAL'
+        WHERE organization_id = ${organizationId} AND job_id = ${job.id} AND kind = 'NORMAL' AND deleted_at IS NULL
       `
     )[0]!.total;
     warning = overAllocationWarning(job.total_images, assigned, lines.reduce((sum, line) => sum + line.qtyAssigned, 0));
   }
-  const assignedAt = options.assignedAt ?? new Date();
+  // Creation time (history, created_at); `options.assignedAt` replays a past event. "Ngày nhận" of a normal line
+  // defaults to the job's, its "Ngày giao" to the job deadline (PD-035); a feedback redo line is received now.
+  const createdAt = options.assignedAt ?? new Date();
   const rows = lines.map((line, index) => {
     const parentId = line.sourceTaskId ?? options.defaultParentId;
+    const assignedAt = line.assignedAt
+      ? new Date(line.assignedAt)
+      : (options.assignedAt ?? (options.kind === "NORMAL" ? job.received_at : createdAt));
     const deadline = line.deadline
       ? new Date(line.deadline)
       : options.kind === "NORMAL"
-        ? defaultTaskDeadline(job.deadline, job.qc_buffer_hours)
+        ? job.deadline
         : feedbackTaskDeadline({
             jobDeadline: job.deadline,
             qcBufferHours: job.qc_buffer_hours,
-            now: assignedAt,
+            now: createdAt,
             source: parentId ? (parents.get(parentId) ?? null) : null
           });
     return {
@@ -568,21 +596,26 @@ export const insertTasks = async (
       processId: line.processId,
       shiftId: line.shiftId,
       qtyAssigned: line.qtyAssigned,
+      assignedAt: assignedAt.toISOString(),
       deadline: deadline.toISOString(),
+      errorQty: line.errorQty ?? null,
+      otHours: line.otHours ?? null,
       parentId,
       note: line.note?.trim() || null,
+      // "Link chia việc" (PD-040): any text (web link or folder path); empty = none.
+      workLink: line.workLink?.trim() || null,
       customValues: lineValues[index]!.customValues,
-      isLate: computeIsLate({ doneAt: null, closed: false, deadline, now: assignedAt }),
+      isLate: computeIsLate({ doneAt: null, closed: false, deadline, now: createdAt }),
       tagIds: lineValues[index]!.tagIds
     };
   });
   await tx`
     INSERT INTO production.tasks (id, organization_id, job_id, assignee_id, qc_id, process_id, shift_id, qty_assigned, deadline,
-      status_id, kind, parent_task_id, feedback_id, note, custom_values, created_by, is_late, assigned_at, created_at)
+      error_qty, ot_hours, status_id, kind, parent_task_id, feedback_id, note, work_link, custom_values, created_by, is_late, assigned_at, created_at)
     SELECT (r->>'id')::uuid, ${organizationId}, ${job.id}, (r->>'assigneeId')::uuid, (r->>'qcId')::uuid, (r->>'processId')::uuid,
-      (r->>'shiftId')::uuid, (r->>'qtyAssigned')::int, (r->>'deadline')::timestamptz, ${initial.id}, ${options.kind},
-      (r->>'parentId')::uuid, ${options.feedbackId}, r->>'note', r->'customValues', ${context.user.id}, (r->>'isLate')::boolean,
-      ${assignedAt}, ${assignedAt}
+      (r->>'shiftId')::uuid, (r->>'qtyAssigned')::int, (r->>'deadline')::timestamptz, (r->>'errorQty')::int, (r->>'otHours')::numeric,
+      ${initial.id}, ${options.kind}, (r->>'parentId')::uuid, ${options.feedbackId}, r->>'note', r->>'workLink', r->'customValues', ${context.user.id},
+      (r->>'isLate')::boolean, (r->>'assignedAt')::timestamptz, ${createdAt}
     FROM jsonb_array_elements(${tx.json(
       rows.map((row) => ({
         id: row.id,
@@ -591,9 +624,13 @@ export const insertTasks = async (
         processId: row.processId,
         shiftId: row.shiftId,
         qtyAssigned: row.qtyAssigned,
+        assignedAt: row.assignedAt,
         deadline: row.deadline,
+        errorQty: row.errorQty,
+        otHours: row.otHours,
         parentId: row.parentId,
         note: row.note,
+        workLink: row.workLink,
         customValues: row.customValues,
         isLate: row.isLate
       }))
@@ -626,9 +663,9 @@ export const createProductionTasks = async (context: AccessContext, jobId: strin
   const sql = getSql();
   const result = await sql.begin(async (tx) => {
     const job = await loadJobForTasks(tx, organizationId, jobId, true);
-    if (!canManageTask({ ...relationOf(context, { assignee_id: "", qc_id: null, job_leader_id: job.leader_id }) })) {
-      throw new AppError("FORBIDDEN", "Chỉ Leader của job (hoặc Quản trị) được chia task.", 403);
-    }
+    // PD-036 "create": lines for anyone ("all") or only for myself ("own"), on a job I may see.
+    const scopes = await assertJobVisible(tx, context, jobId);
+    assertLinesCreatable(scopes, lines.map((line) => line.assigneeId), context.user.id);
     const workflow = await loadWorkflowModel(tx, organizationId);
     const created = await insertTasks(tx, context, workflow, job, lines, { kind: "NORMAL", feedbackId: null, defaultParentId: null });
     await settleJob(tx, organizationId, workflow, jobId);
@@ -651,14 +688,11 @@ const lockedTask = async (tx: QuerySql, context: AccessContext, taskId: string) 
   const organizationId = context.organization.id;
   await lockTaskForUpdate(tx, organizationId, taskId);
   const [task, workflow] = await Promise.all([loadTask(tx, organizationId, taskId), loadWorkflowModel(tx, organizationId)]);
-  const relation = relationOf(context, task);
-  if (!canViewTask(relation)) {
-    throw notFound();
-  }
+  const scopes = await assertTaskVisible(tx, context, task);
   if (task.job_archived) {
     throw jobArchivedError();
   }
-  return { task, workflow, relation };
+  return { task, workflow, relation: relationOf(context, task), scopes, mine: task.assignee_id === context.user.id };
 };
 
 export const transitionProductionTask = async (context: AccessContext, taskId: string, input: TransitionTaskRequest) => {
@@ -688,9 +722,10 @@ export const updateProductionTaskQty = async (context: AccessContext, taskId: st
   const organizationId = context.organization.id;
   const sql = getSql();
   const jobId = await sql.begin(async (tx) => {
-    const { task, relation } = await lockedTask(tx, context, taskId);
-    if (!canManageTask(relation)) {
-      throw new AppError("FORBIDDEN", "Chỉ Leader của job (hoặc Quản trị) được sửa số lượng sau khi Done.", 403);
+    const { task, scopes } = await lockedTask(tx, context, taskId);
+    // It changes recorded points: "update: all" only (PD-036), never one's own line under "own".
+    if (scopes.update !== "all") {
+      throw forbidden("Chỉ người có quyền sửa mọi công việc mới sửa được số lượng sau khi Done.");
     }
     if (task.done_at === null || task.qty_done === null) {
       throw new AppError("TASK_NOT_DONE", "Task chưa Done — người làm nhập số lượng khi bấm Done.", 409);
@@ -723,12 +758,16 @@ export const assignProductionTask = async (context: AccessContext, taskId: strin
   const organizationId = context.organization.id;
   const sql = getSql();
   const result = await sql.begin(async (tx) => {
-    const { task, workflow, relation } = await lockedTask(tx, context, taskId);
-    if (!canManageTask(relation)) {
-      throw new AppError("FORBIDDEN", "Chỉ Leader của job (hoặc Quản trị) được giao lại task.", 403);
+    const { task, workflow, scopes, mine } = await lockedTask(tx, context, taskId);
+    if (!lineAllowed(scopes.update, mine)) {
+      throw forbidden("Bạn không có quyền sửa công việc này.");
     }
     const assigneeId = input.assigneeId ?? task.assignee_id;
     const qcId = input.qcId === undefined ? task.qc_id : input.qcId;
+    // With "own", the line stays mine: only its QC can change.
+    if (assigneeId !== task.assignee_id && scopes.update !== "all") {
+      throw forbidden("Bạn chỉ đổi được QC của công việc của mình, không giao cho người khác.");
+    }
     if (assigneeId !== task.assignee_id && task.done_at !== null) {
       throw new AppError("TASK_ALREADY_DONE", "Task đã Done, không đổi người làm được.", 409);
     }
@@ -738,10 +777,10 @@ export const assignProductionTask = async (context: AccessContext, taskId: strin
     if (qcId === null && task.status_code === "WAITING_QC") {
       throw new AppError("QC_REQUIRED", "Task đang chờ QC — chỉ có thể đổi sang QC khác.", 409);
     }
-    const ctx = await lineContext(tx, organizationId, task.job_leader_id, [assigneeId, ...(qcId ? [qcId] : [])]);
+    const ctx = await lineContext(tx, organizationId, [assigneeId, ...(qcId ? [qcId] : [])]);
     const errors = taskLineErrors({ assigneeId, qcId, processId: task.process_id, shiftId: task.shift_id, qtyAssigned: task.qty_assigned }, ctx).filter(
       // Catalog rows of an existing task may since have been deactivated; only people are re-validated here.
-      (message) => !message.startsWith("Quy trình") && !message.startsWith("Ca làm") && !message.includes("quy trình QC")
+      (message) => !message.startsWith("Quy trình") && !message.startsWith("Ca làm")
     );
     if (errors.length > 0) {
       throw new AppError("ASSIGNMENT_INVALID", errors.join(" "), 400);
@@ -799,21 +838,30 @@ export const updateProductionTask = async (context: AccessContext, taskId: strin
   const organizationId = context.organization.id;
   const sql = getSql();
   const jobId = await sql.begin(async (tx) => {
-    const { task, relation } = await lockedTask(tx, context, taskId);
-    if (!canManageTask(relation)) {
-      throw new AppError("FORBIDDEN", "Chỉ Leader của job (hoặc Quản trị) được sửa task.", 403);
+    const { task, scopes, mine } = await lockedTask(tx, context, taskId);
+    if (!lineAllowed(scopes.update, mine)) {
+      throw forbidden("Bạn không có quyền sửa công việc này.");
     }
     const structural =
       (input.qtyAssigned !== undefined && input.qtyAssigned !== task.qty_assigned) ||
       (input.processId !== undefined && input.processId !== task.process_id) ||
       (input.shiftId !== undefined && input.shiftId !== task.shift_id);
     if (structural && task.done_at !== null) {
-      throw new AppError("TASK_ALREADY_DONE", "Task đã Done — chỉ sửa được số lượng hoàn thành, deadline, ghi chú và trường tuỳ biến.", 409);
+      throw new AppError(
+        "TASK_ALREADY_DONE",
+        "Task đã Done — không đổi được quy trình, ca và số lượng giao; vẫn sửa được số tấm hoàn thành, ngày nhận / giao, hình lỗi, giờ OT, ghi chú, link chia việc và trường tuỳ biến.",
+        409
+      );
     }
     if (input.processId !== undefined && input.processId !== task.process_id) {
-      const process = (await tx<{ active: boolean; is_qc: boolean }[]>`SELECT active, is_qc FROM production.processes WHERE organization_id = ${organizationId} AND id = ${input.processId}`)[0];
-      if (!process?.active || process.is_qc) {
-        throw new AppError("PROCESS_INVALID", "Quy trình không hợp lệ.", 400);
+      // The new process must fit the line's people (a Checking line: a QC person, no QC of its own — PD-037).
+      const ctx = await lineContext(tx, organizationId, [task.assignee_id, ...(task.qc_id ? [task.qc_id] : [])]);
+      const errors = taskLineErrors(
+        { assigneeId: task.assignee_id, qcId: task.qc_id, processId: input.processId, shiftId: task.shift_id, qtyAssigned: task.qty_assigned },
+        ctx
+      ).filter((message) => !message.startsWith("Ca làm"));
+      if (errors.length > 0) {
+        throw new AppError("PROCESS_INVALID", errors.join(" "), 400);
       }
     }
     if (input.shiftId !== undefined && input.shiftId !== task.shift_id) {
@@ -823,21 +871,32 @@ export const updateProductionTask = async (context: AccessContext, taskId: strin
       }
     }
     const deadline = input.deadline ? new Date(input.deadline) : task.deadline;
+    const assignedAt = input.assignedAt ? new Date(input.assignedAt) : task.assigned_at;
+    if ((input.deadline || input.assignedAt) && deadline < assignedAt) {
+      throw new AppError("TASK_DATES_INVALID", "Ngày giao phải từ Ngày nhận trở đi.", 400);
+    }
+    const errorQty = input.errorQty === undefined ? task.error_qty : input.errorQty;
+    const otHours = input.otHours === undefined ? (task.ot_hours === null ? null : Number(task.ot_hours)) : input.otHours;
     // Required TASK fields are checked whenever values are sent (like jobs and clients), and at creation.
     const customValues =
       input.customValues !== undefined
         ? await resolveCustomValues(tx, organizationId, "TASK", input.customValues, { existing: task.custom_values as never, enforceRequired: true })
         : task.custom_values;
     const note = input.note === undefined ? task.note : input.note?.trim() || null;
+    // "Link chia việc" (PD-040): same rule as Ghi chú — the line's "update" scope above; null / "" clears it.
+    const workLink = input.workLink === undefined ? task.work_link : input.workLink?.trim() || null;
     // A deadline moved into the past makes the task late now; the next scan notifies once for that deadline (BUG-PR-03).
     const isLate = computeIsLate({ doneAt: task.done_at, closed: task.closed_at !== null, deadline, now: new Date() });
     await tx`
       UPDATE production.tasks
       SET qty_assigned = ${input.qtyAssigned ?? task.qty_assigned}, process_id = ${input.processId ?? task.process_id},
-          shift_id = ${input.shiftId ?? task.shift_id}, deadline = ${deadline}, note = ${note}, is_late = ${isLate},
-          custom_values = ${tx.json(customValues as never)}, updated_at = now()
+          shift_id = ${input.shiftId ?? task.shift_id}, assigned_at = ${assignedAt}, deadline = ${deadline}, note = ${note}, work_link = ${workLink}, is_late = ${isLate},
+          error_qty = ${errorQty}, ot_hours = ${otHours}, custom_values = ${tx.json(customValues as never)}, updated_at = now()
       WHERE organization_id = ${organizationId} AND id = ${taskId}
     `;
+    if (input.qtyAssigned !== undefined && input.qtyAssigned !== task.qty_assigned) {
+      await syncJobTotalImages(tx, organizationId, task.job_id);
+    }
     if (input.tagIds) {
       await setEntityTags(tx, organizationId, "TASK", taskId, input.tagIds);
     }
@@ -856,7 +915,11 @@ export const updateProductionTask = async (context: AccessContext, taskId: strin
     track("qtyAssigned", task.qty_assigned, input.qtyAssigned ?? task.qty_assigned);
     track("processId", task.process_id, input.processId ?? task.process_id);
     track("shiftId", task.shift_id, input.shiftId ?? task.shift_id);
+    track("assignedAt", task.assigned_at.toISOString(), assignedAt.toISOString());
     track("deadline", task.deadline.toISOString(), deadline.toISOString());
+    track("errorQty", task.error_qty, errorQty);
+    track("otHours", task.ot_hours === null ? null : Number(task.ot_hours), otHours);
+    track("workLink", task.work_link, workLink);
     track("customValues", task.custom_values, customValues);
     const logs: LogInput[] = [];
     if (Object.keys(to).length > 0) {
@@ -870,6 +933,63 @@ export const updateProductionTask = async (context: AccessContext, taskId: strin
   });
   publishProductionChange(organizationId, jobId, [taskId], "tasks", context.user.id);
   return await getProductionTask(context, taskId);
+};
+
+// Deleting lines (PD-036) ------------------------------------------------------------------------------------
+
+/**
+ * Deletes locked lines of a locked job: the points / money already recorded for each line are reversed with adjustment
+ * entries (the ledger stays append-only, totals drop to zero), then the line is hidden (deleted_at / deleted_by) and a
+ * DELETE row is added to its history. Callers check permissions first and settle the job afterwards. Returns the
+ * number of adjustment rows written.
+ */
+export const softDeleteTasks = async (tx: QuerySql, organizationId: string, actorId: string, tasks: TaskRow[], options: { withJob: boolean }) => {
+  if (tasks.length === 0) {
+    return 0;
+  }
+  const at = new Date();
+  const reversed = new Map<string, number>();
+  for (const task of tasks) {
+    reversed.set(task.id, await onTaskDeleted(tx, { organizationId, taskId: task.id, taskNumber: Number(task.number), at }));
+  }
+  await tx`
+    UPDATE production.tasks SET deleted_at = ${at}, deleted_by = ${actorId}, updated_at = now()
+    WHERE organization_id = ${organizationId} AND id = ANY(${tasks.map((task) => task.id)}::uuid[]) AND deleted_at IS NULL
+  `;
+  await insertTaskLogs(
+    tx,
+    organizationId,
+    tasks.map((task) => ({
+      taskId: task.id,
+      jobId: task.job_id,
+      userId: actorId,
+      action: "DELETE" as const,
+      from: { statusId: task.status_id, code: task.status_code, name: task.status_name, assigneeId: task.assignee_id, qtyAssigned: task.qty_assigned, qtyDone: task.qty_done },
+      to: { reversedEntries: reversed.get(task.id) ?? 0, ...(options.withJob ? { withJob: true } : {}) },
+      at
+    }))
+  );
+  return [...reversed.values()].reduce((sum, count) => sum + count, 0);
+};
+
+/** DELETE /production/tasks/:taskId — "delete: all", or "own" for my own line (PD-036). */
+export const deleteProductionTask = async (context: AccessContext, taskId: string): Promise<DeleteTaskResult> => {
+  assertProductionMember(context);
+  const organizationId = context.organization.id;
+  const sql = getSql();
+  const result = await sql.begin(async (tx) => {
+    const { task, workflow, scopes, mine } = await lockedTask(tx, context, taskId);
+    if (!lineAllowed(scopes.delete, mine)) {
+      throw forbidden(scopes.delete === "own" ? "Bạn chỉ xoá được công việc của chính mình." : "Bạn không có quyền xoá công việc.");
+    }
+    const reversedEntries = await softDeleteTasks(tx, organizationId, context.user.id, [task], { withJob: false });
+    await settleJob(tx, organizationId, workflow, task.job_id);
+    return { taskId, jobId: task.job_id, reversedEntries, people: [task.assignee_id, task.qc_id] };
+  });
+  // The line's people lose it from their lists (and possibly the job from theirs); the job chat follows.
+  publishProductionChange(organizationId, result.jobId, [taskId], "tasks", context.user.id, result.people);
+  await syncJobChat(context, result.jobId);
+  return { taskId: result.taskId, jobId: result.jobId, reversedEntries: result.reversedEntries };
 };
 
 // Lateness scan (worker) ------------------------------------------------------------------------------------
@@ -886,7 +1006,7 @@ export const markLateTasks = async (sql: QuerySql = getSql()) => {
       SELECT t.id, NOT t.is_late AS flagged, t.late_notified_deadline IS DISTINCT FROM t.deadline AS notify
       FROM production.tasks t
       JOIN production.jobs j ON j.organization_id = t.organization_id AND j.id = t.job_id AND j.archived_at IS NULL
-      WHERE t.done_at IS NULL AND t.closed_at IS NULL AND t.deadline < now()
+      WHERE t.done_at IS NULL AND t.closed_at IS NULL AND t.deleted_at IS NULL AND t.deadline < now()
         AND (NOT t.is_late OR t.late_notified_deadline IS DISTINCT FROM t.deadline)
       ORDER BY t.deadline
       LIMIT 5000
@@ -920,7 +1040,7 @@ export const markDueSoonTasks = (sql: QuerySql = getSql()) => sql<{ organization
     FROM production.tasks t
     JOIN production.jobs j ON j.organization_id = t.organization_id AND j.id = t.job_id AND j.archived_at IS NULL
     LEFT JOIN production.settings s ON s.organization_id = t.organization_id AND s.key = 'due_soon_hours'
-    WHERE t.done_at IS NULL AND t.closed_at IS NULL AND t.deadline > now()
+    WHERE t.done_at IS NULL AND t.closed_at IS NULL AND t.deleted_at IS NULL AND t.deadline > now()
       AND t.deadline <= now() + make_interval(hours => coalesce((s.value #>> '{}')::int, 2))
       AND t.due_soon_notified_deadline IS DISTINCT FROM t.deadline
     ORDER BY t.deadline

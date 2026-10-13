@@ -412,7 +412,7 @@ export const AnomalyListSchema = z.object({
   days: z.number().int(),
   /** settings.anomalyFailRate. */
   threshold: z.number(),
-  /** null = every job (ADMIN); otherwise the jobs led by this user. */
+  /** null = every job (ADMIN); otherwise the jobs led by this user and the jobs without a leader (PD-035). */
   leaderId: Id.nullable(),
   /** Unreviewed rows per kind (whatever includeReviewed is). */
   counts: z.record(AnomalyKindSchema, z.number().int()),
@@ -465,7 +465,7 @@ export const WorkloadRowSchema = z.object({
   leaveToday: z.enum(["FULL_DAY", "MORNING", "AFTERNOON"]).nullable()
 });
 
-/** GET /production/dashboard/leader — LEADER (own jobs) or ADMIN. */
+/** GET /production/dashboard/leader — LEADER (own jobs and jobs without a leader, PD-035) or ADMIN. */
 export const LeaderDashboardSchema = z.object({
   generatedAt: IsoDate,
   today: DateOnly,
@@ -491,7 +491,8 @@ const ReportCardSchema = z.object({ title: z.string(), config: ReportConfigSchem
 export const LateJobSchema = z.object({
   job: z.object({ id: Id, number: z.number().int(), code: z.string() }),
   projectCode: z.string(),
-  leader: UserRefSchema,
+  /** null: the job has no leader (PD-035). */
+  leader: UserRefSchema.nullable(),
   deadline: IsoDate,
   lateTaskCount: z.number().int(),
   /** Earliest deadline among its late open tasks. */
@@ -547,7 +548,8 @@ export const AdminDashboardSchema = z.object({
 export type AdminDashboard = z.infer<typeof AdminDashboardSchema>;
 
 // Exports -----------------------------------------------------------------------------------------------
-// GET /production/jobs/export          — query = JobQuerySchema (production-jobs), cursor/limit ignored, ≤ 5000 jobs.
+// GET /production/jobs/export          — query = JobExportQuerySchema (production-jobs), cursor/limit ignored, ≤ 5000 jobs;
+//                                        view=worklog: one row per line with the work-log Excel columns (PD-035).
 // GET /production/scores/board/export  — query = ScoreBoardQuerySchema (production-scores); board visibility.
 // GET /production/kpi/export           — query = KpiReportQuerySchema (production-scores); KPI report visibility.
 // POST /production/reports/export      — body = ReportExportRequestSchema; report query permissions.

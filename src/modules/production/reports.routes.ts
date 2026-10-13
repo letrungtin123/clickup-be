@@ -1,7 +1,7 @@
 import { Router, type Router as ExpressRouter } from "express";
 
 import { withCustomFieldFilters } from "../../contracts/production-catalog.js";
-import { JobQuerySchema } from "../../contracts/production-jobs.js";
+import { JobExportQuerySchema } from "../../contracts/production-jobs.js";
 import {
   AdminDashboardSchema,
   AnomalyListSchema,
@@ -89,7 +89,7 @@ export const createProductionReportRoutes = (): ExpressRouter => {
   routes.get(
     "/production/jobs/export",
     handle(async (context, req, res) => {
-      await exportJobs(context, res, JobQuerySchema.parse(withCustomFieldFilters(req.query)));
+      await exportJobs(context, res, JobExportQuerySchema.parse(withCustomFieldFilters(req.query)));
     })
   );
   routes.get(

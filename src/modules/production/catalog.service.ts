@@ -23,7 +23,7 @@ import type {
   ReplaceTransitionsRequestSchema,
   UpdateProductionSettingsRequestSchema
 } from "../../contracts/production-catalog.js";
-import { productionRoleCodes } from "../../contracts/production-catalog.js";
+import { defaultJobPermissions, effectiveJobScopes, productionRoleCodes } from "../../contracts/production-catalog.js";
 import { closeDayOfPeriod, kpiPeriodOfDay } from "../../contracts/production-scores.js";
 import { getSql } from "../../db/client.js";
 import { AppError } from "../../lib/app-error.js";
@@ -49,11 +49,13 @@ const settingKeys: Record<Exclude<keyof ProductionSettings, "kpiCloseDays">, str
   scoresPublic: "scores_public",
   moneyPublic: "money_public",
   kpiProrateLeave: "kpi_prorate_leave",
+  khoanPayPolicy: "khoan_pay_policy",
   anomalyFailRate: "anomaly_fail_rate",
   dueSoonHours: "due_soon_hours",
   kpiDefaultMember: "kpi_default_member",
   kpiDefaultLeader: "kpi_default_leader",
   chatAttachmentsEnabled: "chat_attachments_enabled",
+  jobPermissions: "job_permissions",
   timezone: "timezone"
 };
 
@@ -63,11 +65,15 @@ const defaults: ProductionSettings = {
   scoresPublic: true,
   moneyPublic: false,
   kpiProrateLeave: false,
+  // PD-033: the owner's choice of 2026-10-12 (like the company's Excel); migration 20261012_0110 seeds it.
+  khoanPayPolicy: "ALWAYS",
   anomalyFailRate: 0.15,
   dueSoonHours: 2,
   kpiDefaultMember: 2600,
   kpiDefaultLeader: 1848,
   chatAttachmentsEnabled: true,
+  // PD-036: the owner's defaults; migration 20261013_0110 seeds them.
+  jobPermissions: defaultJobPermissions,
   timezone: "Asia/Ho_Chi_Minh"
 };
 
@@ -155,6 +161,11 @@ export const getSettings = async (context: AccessContext) => {
   return await loadSettings(getSql(), org(context));
 };
 
+/**
+ * PATCH /production/settings (ADMIN). Every key keeps who changed it last and when (production.settings updated_by /
+ * updated_at); the form re-sends unchanged keys, which are not touched so that trail stays the real change — e.g. who
+ * switched the Khoán pay policy (PD-033). The close day also writes its history (kpi_close_days.created_by).
+ */
 export const updateSettings = async (context: AccessContext, input: In<typeof UpdateProductionSettingsRequestSchema>) => {
   assertProductionAdmin(context);
   const sql = getSql();
@@ -171,6 +182,7 @@ export const updateSettings = async (context: AccessContext, input: In<typeof Up
         INSERT INTO production.settings (organization_id, key, value, updated_by)
         VALUES (${org(context)}, ${key}, ${tx.json(value)}, ${context.user.id})
         ON CONFLICT (organization_id, key) DO UPDATE SET value = EXCLUDED.value, updated_by = EXCLUDED.updated_by, updated_at = now()
+        WHERE production.settings.value IS DISTINCT FROM EXCLUDED.value
       `;
     }
   });
@@ -193,10 +205,12 @@ export const getProductionMe = async (context: AccessContext): Promise<Productio
     roles,
     isAdmin: isProductionAdmin(context),
     teamId: profile?.team_id ?? null,
+    jobPermissions: effectiveJobScopes(roles, settings.jobPermissions),
     settings: {
       // The close day of the current period (a new day applies from the next period, G15); kpiCloseDays has them all.
       kpiCloseDay: closeDayOfPeriod(closeDaysOf(settings), kpiPeriodOfDay(businessDay(new Date()), closeDaysOf(settings))),
       kpiCloseDays: closeDaysOf(settings),
+      khoanPayPolicy: settings.khoanPayPolicy,
       scoresPublic: settings.scoresPublic,
       moneyPublic: settings.moneyPublic,
       chatAttachmentsEnabled: settings.chatAttachmentsEnabled,
@@ -423,11 +437,21 @@ export const upsertClient = async (context: AccessContext, id: string | null, in
 
 // Projects ----------------------------------------------------------------------------------------
 
-type ProjectRow = { id: string; code: string; name: string; client_id: string | null; client_name: string | null; qc_buffer_hours: number; active: boolean };
+type ProjectRow = {
+  id: string;
+  code: string;
+  name: string;
+  description: string | null;
+  client_id: string | null;
+  client_name: string | null;
+  qc_buffer_hours: number;
+  active: boolean;
+};
 const toProject = (row: ProjectRow) => ({
   id: row.id,
   code: row.code,
   name: row.name,
+  description: row.description,
   clientId: row.client_id,
   clientName: row.client_name,
   qcBufferHours: row.qc_buffer_hours,
@@ -435,7 +459,7 @@ const toProject = (row: ProjectRow) => ({
 });
 
 export const selectProductionProjects = (sql: QuerySql, organizationId: string) => sql<ProjectRow[]>`
-  SELECT p.id, p.code, p.name, p.client_id, c.name AS client_name, p.qc_buffer_hours, p.active
+  SELECT p.id, p.code, p.name, p.description, p.client_id, c.name AS client_name, p.qc_buffer_hours, p.active
   FROM production.projects p
   LEFT JOIN production.clients c ON c.id = p.client_id AND c.organization_id = p.organization_id
   WHERE p.organization_id = ${organizationId}
@@ -461,6 +485,7 @@ export const upsertProject = async (context: AccessContext, id: string | null, i
     const rows = await sql`
       UPDATE production.projects
       SET code = ${input.code}, name = ${input.name},
+          description = CASE WHEN ${input.description !== undefined} THEN ${input.description?.trim() || null} ELSE description END,
           client_id = CASE WHEN ${input.clientId !== undefined} THEN ${input.clientId ?? null}::uuid ELSE client_id END,
           qc_buffer_hours = coalesce(${input.qcBufferHours ?? null}, qc_buffer_hours),
           active = coalesce(${input.active ?? null}, active)
@@ -471,8 +496,8 @@ export const upsertProject = async (context: AccessContext, id: string | null, i
     }
   } else {
     await sql`
-      INSERT INTO production.projects (organization_id, code, name, client_id, qc_buffer_hours)
-      VALUES (${org(context)}, ${input.code}, ${input.name}, ${input.clientId ?? null}, ${input.qcBufferHours ?? 0})
+      INSERT INTO production.projects (organization_id, code, name, description, client_id, qc_buffer_hours)
+      VALUES (${org(context)}, ${input.code}, ${input.name}, ${input.description?.trim() || null}, ${input.clientId ?? null}, ${input.qcBufferHours ?? 0})
     `;
   }
   return await listProjects(context);
@@ -508,6 +533,39 @@ export const upsertProcess = async (context: AccessContext, id: string | null, i
       VALUES (${org(context)}, ${input.name}, ${input.isQc ?? false}, ${input.sortOrder ?? 0})
     `;
   }
+  return await listProcesses(context);
+};
+
+/**
+ * DELETE /production/processes/:id (ADMIN, PD-035 "Quy trình" catalog): only a process nothing refers to — no line (also
+ * deleted ones, kept for audit), no price (credit rule) and no score entry. Otherwise 409: deactivate it instead.
+ */
+export const deleteProcess = async (context: AccessContext, id: string) => {
+  assertProductionAdmin(context);
+  const sql = getSql();
+  await sql.begin(async (tx) => {
+    const usage = (
+      await tx<{ found: boolean; tasks: number; rules: number; entries: number }[]>`
+        SELECT EXISTS (SELECT 1 FROM production.processes WHERE organization_id = ${org(context)} AND id = ${id}) AS found,
+          (SELECT count(*)::int FROM production.tasks WHERE organization_id = ${org(context)} AND process_id = ${id}) AS tasks,
+          (SELECT count(*)::int FROM production.credit_rules WHERE organization_id = ${org(context)} AND process_id = ${id}) AS rules,
+          (SELECT count(*)::int FROM production.score_entries WHERE organization_id = ${org(context)} AND process_id = ${id}) AS entries
+      `
+    )[0]!;
+    if (!usage.found) {
+      throw new AppError("PROCESS_NOT_FOUND", "Không tìm thấy quy trình.", 404);
+    }
+    if (usage.tasks > 0 || usage.rules > 0 || usage.entries > 0) {
+      const uses = [
+        usage.tasks > 0 ? `${usage.tasks} task` : null,
+        usage.rules > 0 ? `${usage.rules} đơn giá` : null,
+        usage.entries > 0 ? `${usage.entries} dòng điểm` : null
+      ].filter(Boolean);
+      throw new AppError("PROCESS_IN_USE", `Quy trình đang được dùng (${uses.join(", ")}) — hãy tắt thay vì xoá.`, 409);
+    }
+    await tx`DELETE FROM production.processes WHERE organization_id = ${org(context)} AND id = ${id}`;
+  });
+  await invalidateProductionConfig(org(context));
   return await listProcesses(context);
 };
 

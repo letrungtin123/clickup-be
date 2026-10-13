@@ -305,13 +305,14 @@ describe("worker handlers load the people the rules need", () => {
   });
 
   it("leader removed → production admins get the list of open jobs; nothing once the person leads again", async () => {
-    const jobs = [{ id: jobId, code: "JOB-9", name: null, deadline: new Date("2026-10-20T00:00:00Z"), status_code: "PROCESSING", status_name: "Đang làm", task_count: 2 }];
+    const jobs = [{ id: jobId, code: "JOB-9", name: null, deadline: new Date("2026-10-20T00:00:00Z"), job_status_id: jobId, job_status_name: "Đang làm", job_status_color: "blue", job_status_closed: false, task_count: 2 }];
     let leaderActive = false;
     db.state.handler = (call) => {
       if (call.text.includes("AS leader_active FROM public.app_users")) {
         return [{ display_name: "Lead Một", leader_active: leaderActive }];
       }
-      if (call.text.includes("FROM production.jobs j LEFT JOIN production.statuses")) {
+      // Open = manual job status not closed (PD-038).
+      if (call.text.includes("FROM production.jobs j JOIN production.job_statuses js") && call.text.includes("NOT js.is_closed")) {
         return jobs;
       }
       if (call.text.includes("role_code = 'ADMIN'")) {

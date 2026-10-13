@@ -1,6 +1,6 @@
 import { z } from "zod";
 
-import { colorTokens } from "./work.js";
+import { colorTokens, UserRefSchema } from "./work.js";
 
 /**
  * Production (Photo Retouch) catalog contract — docs/retouch/SPEC.md Phase 0–1. Shared FE/BE.
@@ -114,6 +114,17 @@ export const IdListQuerySchema = z.preprocess(
 // KPI close day history (G15) ---------------------------------------------------------------------------
 
 /**
+ * Close day 31 = "Cuối tháng" (PD-032): the period closes on the last day of each month (28/29 in February, 30 or 31
+ * otherwise), so a period "MM/YYYY" is exactly that calendar month. Every other close day is 1–28 (PD-016).
+ */
+export const kpiCloseDayEndOfMonth = 31;
+
+/** A valid KPI close day: 1–28, or 31 = "Cuối tháng". */
+export const isKpiCloseDay = (day: number) => Number.isInteger(day) && ((day >= 1 && day <= 28) || day === kpiCloseDayEndOfMonth);
+
+export const KpiCloseDaySchema = z.number().int().refine(isKpiCloseDay, "Ngày chốt là 1–28 hoặc 31 (cuối tháng).");
+
+/**
  * One version of the KPI close day. A new close day applies from the NEXT KPI period; the current period keeps
  * its boundaries (no overlap, no gap). The close day of period P is the version with the latest fromPeriod ≤ P.
  */
@@ -123,9 +134,73 @@ export const KpiCloseDayVersionSchema = z.object({
     .string()
     .regex(/^\d{4}-(0[1-9]|1[0-2])$/)
     .nullable(),
-  closeDay: z.number().int().min(1).max(28)
+  closeDay: KpiCloseDaySchema
 });
 export type KpiCloseDayVersion = z.infer<typeof KpiCloseDayVersionSchema>;
+
+// Khoán pay policy (PD-033) -------------------------------------------------------------------------
+
+/**
+ * What the KPI settlement does with Khoán (MONEY_IF_KPI) work. Both: met = official points (Chính thức + OT + QC)
+ * ≥ target, no target → met.
+ * - ALWAYS (default, like the company's Excel): the Khoán money is always paid; Khoán credits are never converted
+ *   and never count toward the KPI.
+ * - IF_KPI: met → the money is paid; not met → no money, the Khoán credits are converted into KPI points.
+ * Each settlement run records the policy it used (KpiSettlementRun.khoanPolicy).
+ */
+export const KhoanPayPolicySchema = z.enum(["ALWAYS", "IF_KPI"]);
+export type KhoanPayPolicy = z.infer<typeof KhoanPayPolicySchema>;
+
+// Job permission matrix (PD-036) ------------------------------------------------------------------
+
+/** CRUD of jobs and their lines; workflow moves keep their own rules (PD-014). */
+export const jobPermissionActions = ["view", "create", "update", "delete"] as const;
+export type JobPermissionAction = (typeof jobPermissionActions)[number];
+/**
+ * none: not at all. all: any job / line. own:
+ * - view: jobs where I am the assignee or QC of a line (or lead the job);
+ * - create: lines for myself only (assignee = me), and the job of a new package while doing so ("Nhập công việc");
+ * - update / delete: lines assigned to me; a job's own fields (or the whole job) only when every line of it is mine.
+ */
+export const jobPermissionScopes = ["none", "own", "all"] as const;
+export const JobPermissionScopeSchema = z.enum(jobPermissionScopes);
+export type JobPermissionScope = z.infer<typeof JobPermissionScopeSchema>;
+export const JobScopesSchema = z
+  .object({ view: JobPermissionScopeSchema, create: JobPermissionScopeSchema, update: JobPermissionScopeSchema, delete: JobPermissionScopeSchema })
+  .strict();
+export type JobScopes = z.infer<typeof JobScopesSchema>;
+/** The roles an Admin configures; ADMIN is always "all" everywhere and is not stored. */
+export const jobPermissionRoles = ["ACCOUNT", "LEADER", "QC", "STAFF"] as const satisfies readonly ProductionRole[];
+export type JobPermissionRole = (typeof jobPermissionRoles)[number];
+export const JobPermissionMatrixSchema = z
+  .object({ ACCOUNT: JobScopesSchema, LEADER: JobScopesSchema, QC: JobScopesSchema, STAFF: JobScopesSchema })
+  .strict();
+export type JobPermissionMatrix = z.infer<typeof JobPermissionMatrixSchema>;
+
+const allScopes: JobScopes = { view: "all", create: "all", update: "all", delete: "all" };
+const ownScopes: JobScopes = { view: "own", create: "own", update: "own", delete: "own" };
+const noScopes: JobScopes = { view: "none", create: "none", update: "none", delete: "none" };
+/** The owner's defaults (seeded by migration 20261013_0110). */
+export const defaultJobPermissions: JobPermissionMatrix = { ACCOUNT: allScopes, LEADER: allScopes, QC: ownScopes, STAFF: ownScopes };
+
+const scopeRank: Record<JobPermissionScope, number> = { none: 0, own: 1, all: 2 };
+/** The more permissive of two scopes. */
+export const widerScope = (a: JobPermissionScope, b: JobPermissionScope): JobPermissionScope => (scopeRank[a] >= scopeRank[b] ? a : b);
+
+/** A user's scopes: the most permissive over their production roles; ADMIN is "all"; no role is "none". */
+export const effectiveJobScopes = (roles: Iterable<ProductionRole>, matrix: JobPermissionMatrix): JobScopes => {
+  const result = { ...noScopes };
+  for (const role of roles) {
+    const scopes = role === "ADMIN" ? allScopes : (matrix as Partial<Record<ProductionRole, JobScopes>>)[role];
+    if (!scopes) {
+      continue;
+    }
+    for (const action of jobPermissionActions) {
+      result[action] = widerScope(result[action], scopes[action]);
+    }
+  }
+  return result;
+};
 
 // Members -----------------------------------------------------------------------------------------
 
@@ -165,11 +240,18 @@ export const ProductionMeSchema = z.object({
   roles: z.array(ProductionRoleSchema),
   isAdmin: z.boolean(),
   teamId: Id.nullable(),
+  /** My scopes in the job permission matrix (PD-036): the job menu, "Tạo job", "Nhập công việc", the assignee picker. */
+  jobPermissions: JobScopesSchema,
   settings: z.object({
-    /** Close day of the CURRENT KPI period (an Admin's change applies from the next period, see kpiCloseDays). */
+    /**
+     * Close day of the CURRENT KPI period (an Admin's change applies from the next period, see kpiCloseDays);
+     * 31 = "Cuối tháng" (kpiCloseDayEndOfMonth).
+     */
     kpiCloseDay: z.number().int(),
     /** Close-day versions, oldest first (the first has fromPeriod null): compute any period's dates with them. */
     kpiCloseDays: z.array(KpiCloseDayVersionSchema).min(1),
+    /** What the next settlement does with Khoán money (PD-033); the scores pages word their hints after it. */
+    khoanPayPolicy: KhoanPayPolicySchema,
     scoresPublic: z.boolean(),
     moneyPublic: z.boolean(),
     chatAttachmentsEnabled: z.boolean(),
@@ -211,6 +293,9 @@ export const ProductionProjectSchema = z.object({
   id: Id,
   code: z.string(),
   name: z.string(),
+  /** "Mô tả" (free text). */
+  description: z.string().nullable(),
+  /** Not entered in the project form any more (2026-10-13); kept for older data and the credit grid. */
   clientId: Id.nullable(),
   clientName: z.string().nullable(),
   qcBufferHours: z.number().int(),
@@ -222,6 +307,7 @@ export const UpsertProductionProjectRequestSchema = z
   .object({
     code: SafeText().trim().min(1).max(40),
     name: SafeText().trim().min(1).max(160),
+    description: SafeText().trim().max(2000).nullable().optional(),
     clientId: Id.nullable().optional(),
     qcBufferHours: z.number().int().min(0).max(720).optional(),
     active: z.boolean().optional()
@@ -432,24 +518,82 @@ export const UpsertTagRequestSchema = z
   .object({ name: SafeText().trim().min(1).max(60), color: Color.default("slate"), active: z.boolean().optional() })
   .strict();
 
+// Job statuses (PD-038) ---------------------------------------------------------------------------
+
+/**
+ * The manual, ClickUp-style job status ("Cấu hình → Trạng thái job", ADMIN): set by people on a job, separate from the
+ * 9-step line workflow (PD-014, unchanged). Ordered by `position`; closed statuses ("đóng", e.g. Đã giao khách) come
+ * after the open ones wherever jobs are picked. Names are unique per organization (case-insensitive); the last status
+ * cannot be deleted, and deleting one that jobs use needs a replacement (all of them move in one statement).
+ *
+ *   GET    /production/job-statuses                      → JobStatusCollection (every production member)
+ *   POST   /production/job-statuses                      → JobStatusCollection (ADMIN), body CreateJobStatusRequest
+ *   PATCH  /production/job-statuses/:id                  → JobStatusCollection (ADMIN), body UpdateJobStatusRequest
+ *   PUT    /production/job-statuses/order                → JobStatusCollection (ADMIN), body ReorderJobStatusesRequest
+ *   DELETE /production/job-statuses/:id?replacementId=   → DeleteJobStatusResult (ADMIN)
+ */
+export const jobStatusNameMaxLength = 60;
+/** At most this many statuses per organization. */
+export const jobStatusLimit = 50;
+
+export const JobStatusSchema = z.object({
+  id: Id,
+  name: z.string(),
+  color: Color,
+  position: z.number().int(),
+  isClosed: z.boolean(),
+  /** Jobs (not deleted) in this status; null for non-admins (the settings page shows it). */
+  jobCount: z.number().int().nullable(),
+  /** Last change of the status (like settings' updated_by / updated_at); updatedBy null = migration / system. */
+  updatedAt: IsoDate,
+  updatedBy: UserRefSchema.nullable()
+});
+export type JobStatus = z.infer<typeof JobStatusSchema>;
+export const JobStatusCollectionSchema = z.object({ items: z.array(JobStatusSchema) });
+export type JobStatusCollection = z.infer<typeof JobStatusCollectionSchema>;
+
+const JobStatusName = SafeText().trim().min(1, "Nhập tên trạng thái.").max(jobStatusNameMaxLength);
+export const CreateJobStatusRequestSchema = z
+  .object({ name: JobStatusName, color: Color.default("slate"), isClosed: z.boolean().default(false) })
+  .strict();
+export type CreateJobStatusRequest = z.infer<typeof CreateJobStatusRequestSchema>;
+export const UpdateJobStatusRequestSchema = z
+  .object({ name: JobStatusName.optional(), color: Color.optional(), isClosed: z.boolean().optional() })
+  .strict()
+  .refine((value) => Object.values(value).some((entry) => entry !== undefined), { message: "Gửi ít nhất một trường cần sửa." });
+export type UpdateJobStatusRequest = z.infer<typeof UpdateJobStatusRequestSchema>;
+/** Every status of the organization, in the new order. */
+export const ReorderJobStatusesRequestSchema = z.object({ ids: z.array(Id).min(1).max(jobStatusLimit) }).strict();
+/** `replacementId`: where the jobs of the deleted status go (required while jobs use it). */
+export const DeleteJobStatusQuerySchema = z.object({ replacementId: Id.optional() });
+export const DeleteJobStatusResultSchema = JobStatusCollectionSchema.extend({
+  /** Jobs moved to the replacement (each gets a history row). */
+  movedJobs: z.number().int()
+});
+export type DeleteJobStatusResult = z.infer<typeof DeleteJobStatusResultSchema>;
+
 // Settings & whitelist ----------------------------------------------------------------------------
 
 export const ProductionSettingsSchema = z.object({
   /**
-   * The close day last configured. A change applies from the NEXT KPI period (the current period keeps its
-   * boundaries); kpiCloseDays lists every version (read only).
+   * The close day last configured: 1–28, or 31 = "Cuối tháng" (last day of each month, PD-032). A change applies
+   * from the NEXT KPI period (the current period keeps its boundaries); kpiCloseDays lists every version (read only).
    */
-  kpiCloseDay: z.number().int().min(1).max(28),
+  kpiCloseDay: KpiCloseDaySchema,
   /** Read only: close-day versions, oldest first (the first has fromPeriod null). */
   kpiCloseDays: z.array(KpiCloseDayVersionSchema).min(1),
   scoresPublic: z.boolean(),
   moneyPublic: z.boolean(),
   kpiProrateLeave: z.boolean(),
+  /** Khoán pay policy of the settlement (PD-033); applies to the next run (automatic or manual) and to provisional figures. */
+  khoanPayPolicy: KhoanPayPolicySchema,
   anomalyFailRate: z.number().min(0).max(1),
   dueSoonHours: z.number().int().min(1).max(72),
   kpiDefaultMember: z.number().min(0).max(1_000_000),
   kpiDefaultLeader: z.number().min(0).max(1_000_000),
   chatAttachmentsEnabled: z.boolean(),
+  /** "Phân quyền Job" (PD-036): role × action scopes; ADMIN is always "all" (not part of the value). */
+  jobPermissions: JobPermissionMatrixSchema,
   timezone: z.string()
 });
 export type ProductionSettings = z.infer<typeof ProductionSettingsSchema>;

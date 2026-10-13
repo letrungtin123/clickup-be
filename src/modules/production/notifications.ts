@@ -6,6 +6,8 @@ import type { QuerySql } from "../../lib/db-types.js";
 import type { DomainEventEnvelope, DomainEventInput } from "../events/outbox.js";
 import { enqueueDomainEvents } from "../events/outbox.js";
 import { deliverNotifications } from "../notifications/notifications.service.js";
+import { loadSettings } from "./catalog.service.js";
+import { rolesWithAll } from "./job-permissions.js";
 import { kpiSettlementNotificationHandlers } from "./kpi-settlement-notifications.js";
 import { listOpenJobsLedBy, loadProductionAdminIds } from "./member-lookups.js";
 
@@ -160,8 +162,11 @@ const leaderActiveSql = (sql: QuerySql) => sql`
   )
 `;
 
-/** The job creator (`j.created_by`) may still see every job: Account / Leader / Admin or superadmin (PD-014). */
-const creatorSeesJobsSql = (sql: QuerySql) => sql`
+/**
+ * The job creator (`j.created_by`) may still see every job: a role whose "view" scope is "all" in the job permission
+ * matrix (PD-036; by default Account / Leader / Admin) or superadmin.
+ */
+const creatorSeesJobsSql = (sql: QuerySql, viewAllRoles: readonly string[]) => sql`
   EXISTS (
     SELECT 1 FROM public.organization_memberships com
     WHERE com.organization_id = j.organization_id AND com.user_id = j.created_by AND com.status = 'active' AND com.deleted_at IS NULL
@@ -169,7 +174,7 @@ const creatorSeesJobsSql = (sql: QuerySql) => sql`
         EXISTS (SELECT 1 FROM public.roles cr WHERE cr.id = com.role_id AND cr.key = 'superadmin')
         OR EXISTS (
           SELECT 1 FROM production.user_roles cur
-          WHERE cur.organization_id = com.organization_id AND cur.user_id = com.user_id AND cur.role_code IN ('ADMIN', 'ACCOUNT', 'LEADER')
+          WHERE cur.organization_id = com.organization_id AND cur.user_id = com.user_id AND cur.role_code = ANY(${[...viewAllRoles]}::text[])
         )
       )
   )
@@ -180,7 +185,7 @@ type TaskInfo = {
   number: string | number;
   job_id: string;
   job_code: string;
-  leader_id: string;
+  leader_id: string | null;
   leader_active: boolean;
   assignee_id: string;
   qc_id: string | null;
@@ -201,7 +206,7 @@ const loadTaskInfos = async (organizationId: string, taskIds: string[]) => {
     FROM production.tasks t
     JOIN production.jobs j ON j.organization_id = t.organization_id AND j.id = t.job_id
     JOIN production.processes pr ON pr.organization_id = t.organization_id AND pr.id = t.process_id
-    WHERE t.organization_id = ${organizationId} AND t.id = ANY(${taskIds}::uuid[])
+    WHERE t.organization_id = ${organizationId} AND t.id = ANY(${taskIds}::uuid[]) AND t.deleted_at IS NULL
   `;
 };
 
@@ -300,16 +305,16 @@ export const productionNotificationHandlers: Record<string, (event: DomainEventE
     const parked = strArray(envelope.payload.taskIds);
     const sql = getSql();
     const job = (
-      await sql<{ code: string; leader_id: string; leader_active: boolean; workers: string[] }[]>`
+      await sql<{ code: string; leader_id: string | null; leader_active: boolean; workers: string[] }[]>`
         SELECT j.code, j.leader_id, ${leaderActiveSql(sql)} AS leader_active,
           coalesce((SELECT array_agg(DISTINCT t.assignee_id) FROM production.tasks t
-            WHERE t.organization_id = j.organization_id AND t.job_id = j.id
+            WHERE t.organization_id = j.organization_id AND t.job_id = j.id AND t.deleted_at IS NULL
               AND CASE
                 WHEN ${sourceTaskId}::uuid IS NOT NULL THEN t.id = ${sourceTaskId}::uuid
                 WHEN cardinality(${parked}::uuid[]) > 0 THEN t.id = ANY(${parked}::uuid[])
                 ELSE t.kind = 'NORMAL'
               END), '{}') AS workers
-        FROM production.jobs j WHERE j.organization_id = ${envelope.organizationId} AND j.id = ${jobId}
+        FROM production.jobs j WHERE j.organization_id = ${envelope.organizationId} AND j.id = ${jobId} AND j.deleted_at IS NULL
       `
     )[0];
     if (!job) {
@@ -353,13 +358,14 @@ export const productionNotificationHandlers: Record<string, (event: DomainEventE
     const taskId = str(envelope.payload.taskId);
     const task = taskId ? await loadTaskInfo(envelope.organizationId, taskId) : null;
     const job = (
-      await sql<{ code: string; leader_id: string; leader_active: boolean; created_by: string; creator_sees_jobs: boolean; workers: string[] }[]>`
-        SELECT j.code, j.leader_id, ${leaderActiveSql(sql)} AS leader_active, j.created_by, ${creatorSeesJobsSql(sql)} AS creator_sees_jobs,
+      await sql<{ code: string; leader_id: string | null; leader_active: boolean; created_by: string; creator_sees_jobs: boolean; workers: string[] }[]>`
+        SELECT j.code, j.leader_id, ${leaderActiveSql(sql)} AS leader_active, j.created_by,
+          ${creatorSeesJobsSql(sql, rolesWithAll((await loadSettings(sql, envelope.organizationId)).jobPermissions, "view"))} AS creator_sees_jobs,
           coalesce((
             SELECT array_agg(DISTINCT p) FROM production.tasks t, unnest(ARRAY[t.assignee_id, t.qc_id]) AS p
-            WHERE t.organization_id = j.organization_id AND t.job_id = j.id AND p IS NOT NULL
+            WHERE t.organization_id = j.organization_id AND t.job_id = j.id AND t.deleted_at IS NULL AND p IS NOT NULL
           ), '{}') AS workers
-        FROM production.jobs j WHERE j.organization_id = ${envelope.organizationId} AND j.id = ${jobId}
+        FROM production.jobs j WHERE j.organization_id = ${envelope.organizationId} AND j.id = ${jobId} AND j.deleted_at IS NULL
       `
     )[0];
     if (!job || (taskId && !task)) {

@@ -85,17 +85,24 @@ vi.mock("./notifications.js", async (importOriginal) => ({
   ...(await importOriginal<typeof NotificationsModule>()),
   enqueueProductionEvents: vi.fn(() => Promise.resolve())
 }));
-vi.mock("./catalog.service.js", async (importOriginal) => ({
-  ...(await importOriginal<typeof CatalogModule>()),
-  loadSettings: vi.fn(() => Promise.resolve(fixtures.settings as ProductionSettings))
-}));
+vi.mock("./catalog.service.js", async (importOriginal) => {
+  const { defaultJobPermissions } = await import("../../contracts/production-catalog.js");
+  return {
+    ...(await importOriginal<typeof CatalogModule>()),
+    // The default job permission matrix (PD-036) unless a test sets its own.
+    loadSettings: vi.fn(() => Promise.resolve({ jobPermissions: defaultJobPermissions, ...fixtures.settings } as ProductionSettings))
+  };
+});
 vi.mock("./jobs.repo.js", async (importOriginal) => ({
   ...(await importOriginal<typeof JobsRepoModule>()),
   loadWorkflowModel: vi.fn(() => Promise.resolve(fixtures.workflow as Workflow))
 }));
 
 const { leadsJob } = await import("./access.js");
-const { canManageTask, relationOf, toProductionTask, assertJobVisible } = await import("./jobs.repo.js");
+const { relationOf, toProductionTask, assertJobVisible } = await import("./jobs.repo.js");
+const { effectiveJobScopes, defaultJobPermissions } = await import("../../contracts/production-catalog.js");
+/** The caller's access with the default job permission matrix (PD-036). */
+const accessOf = (roles: string[], userId = me) => ({ scopes: effectiveJobScopes(roles as never, defaultJobPermissions), userId });
 const { moveTasks, transitionProductionTask, updateProductionTaskQty } = await import("./tasks.service.js");
 const { updateJob } = await import("./jobs.service.js");
 const { getTaskScores } = await import("./scores.service.js");
@@ -178,6 +185,7 @@ const taskRow = (overrides: Partial<TaskRow> = {}): TaskRow => ({
   requires_ot_hours: false,
   qty_assigned: 10,
   qty_done: null,
+  error_qty: null,
   ot_hours: null,
   assigned_at: new Date("2026-10-10T02:00:00Z"),
   deadline: new Date("2099-01-01T00:00:00Z"),
@@ -191,6 +199,7 @@ const taskRow = (overrides: Partial<TaskRow> = {}): TaskRow => ({
   parent_task_id: null,
   feedback_id: null,
   note: null,
+  work_link: null,
   is_late: false,
   qc_fail_count: 0,
   custom_values: {},
@@ -281,15 +290,15 @@ describe("SEC2-04 — job-leader powers need the LEADER (or ADMIN) role", () => 
     const task = taskRow({ job_leader_id: me, assignee_id: third, qc_id: me, status_id: "CHECKED", status_code: "CHECKED" });
     const demoted = relationOf(contextWith(["STAFF", "QC"]), task);
     expect(demoted.isJobLeader).toBe(false);
-    expect(canManageTask(demoted)).toBe(false);
-    const view = toProductionTask(task, workflow, demoted);
-    expect(view.capabilities).toMatchObject({ canEdit: false, canAssign: false, canEditQty: false });
+    const view = toProductionTask(task, workflow, demoted, accessOf(["STAFF", "QC"]));
+    expect(view.capabilities).toMatchObject({ canEdit: false, canAssign: false, canEditQty: false, canDelete: false });
     // CHECKED → COMPLETE belongs to the JOB_LEADER actor.
     expect(view.capabilities.transitions.map((option) => option.toStatusId)).not.toContain("COMPLETE");
 
     const leader = relationOf(contextWith(["LEADER"]), task);
-    expect(canManageTask(leader)).toBe(true);
-    expect(toProductionTask(task, workflow, leader).capabilities.transitions.map((option) => option.toStatusId)).toContain("COMPLETE");
+    const led = toProductionTask(task, workflow, leader, accessOf(["LEADER"]));
+    expect(led.capabilities).toMatchObject({ canEdit: true, canDelete: true });
+    expect(led.capabilities.transitions.map((option) => option.toStatusId)).toContain("COMPLETE");
   });
 
   it("quantity correction by a demoted leader → 403, nothing written", async () => {
@@ -436,7 +445,7 @@ describe("SEC2-11 — anomaly reviews", () => {
     expect(await failure(reviewAnomaly(leader, { kind: "FAST_DONE", key: taskId }))).toEqual({ code: "ANOMALY_NOT_FOUND", status: 404 });
     const check = db.state.calls.find((call) => call.text.includes("make_interval(mins"))!;
     // Scoped to the leader's jobs and to the subject.
-    expect(check.text).toContain("AND j.leader_id = $");
+    expect(check.text).toContain("AND (j.leader_id = $ OR j.leader_id IS NULL)");
     expect(check.values).toContain(me);
     expect(check.values).toContain(taskId);
     expect(wrote(/INSERT INTO production\.anomaly_reviews/)).toBe(false);
@@ -466,7 +475,7 @@ describe("SEC2-11 — anomaly reviews", () => {
     expect(await failure(reviewAnomaly(leader, { kind: "WORKER_FAIL_RATE", key: `${third}:0:2` }))).toEqual({ code: "ANOMALY_NOT_FOUND", status: 404 });
     expect(wrote(/INSERT INTO production\.anomaly_reviews/)).toBe(false);
     const scope = db.state.calls.find((call) => call.text.includes("t.qc_fail_count > 0 AS qc_failed"))!;
-    expect(scope.text).toContain("AND j.leader_id = $");
+    expect(scope.text).toContain("AND (j.leader_id = $ OR j.leader_id IS NULL)");
     await reviewAnomaly(leader, { kind: "WORKER_FAIL_RATE", key: `${third}:0:1` });
     expect(wrote(/INSERT INTO production\.anomaly_reviews/)).toBe(true);
   });

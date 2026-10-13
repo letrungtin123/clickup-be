@@ -1,10 +1,11 @@
-import { closeDayOfPeriod, kpiPeriodOfDay, kpiPeriodRange, type KpiCloseDays } from "../../contracts/production-scores.js";
+import type { KhoanPayPolicy } from "../../contracts/production-catalog.js";
+import { kpiPeriodOfDay, kpiPeriodRange, type KpiCloseDays } from "../../contracts/production-scores.js";
 import { addDays, businessDay } from "./time.js";
 
-export type { KpiCloseDays };
+export type { KhoanPayPolicy, KpiCloseDays };
 
 /**
- * Score and KPI rules (docs/retouch/SPEC.md Phase 3, PLAN §5–§6, PD-010) as pure functions.
+ * Score and KPI rules (docs/retouch/SPEC.md Phase 3, PLAN §5–§6, PD-037) as pure functions.
  * The hooks (scoring-hooks.ts) and services load data and call these; scoring.test.ts covers them.
  *
  * Decisions recorded here (see also the migration 20261009_2300_production_scores.sql):
@@ -12,11 +13,12 @@ export type { KpiCloseDays };
  * - No credit rule for (project, process) on the business day → the entry is still written with
  *   0 credits / 0 money and `creditRuleId = null`, so the anomalies report can flag it and an
  *   Admin can correct it with an adjustment. The workflow is never blocked by a missing price.
- * - FB_WRONG tasks earn nothing for anyone (PLAN §5 "FB sai → —"): worker and QC entries are
- *   recorded with their qty and 0 credits / 0 money.
- * - QC entries never carry money and are always pay mode POINTS: QC credit counts toward the KPI
- *   whatever the task's shift (Checking has no price; a MONEY_IF_KPI QC entry could only lose credit
- *   at settlement). The task's shift is still copied for reporting.
+ * - One entry per line, at its first Done (PD-037): role WORKER for a work line, role QC for a Checking line (its
+ *   process is the QC process). Both are priced the same way by the line's own (project, process) rule and follow the
+ *   line's shift (pay mode, money) — a Checking line on a Khoán shift earns Khoán points, outside the official total,
+ *   like the company's Excel. Checked no longer credits the task's QC (PD-010 superseded).
+ * - FB_WRONG lines earn nothing (PLAN §5 "FB sai → —"): the entry is recorded with its qty and 0 credits / 0 money.
+ * - "Hình lỗi" (error images) never changes points or money (PD-035).
  * - Adjustments (qty edited after the entry) reuse the original entry's unit price — prices are
  *   fixed at the time of Done/Checked (PLAN §10) — and are booked on the day they happen.
  */
@@ -42,9 +44,6 @@ export type ScoreDraft = {
   money: number;
 };
 
-/** Pay mode of every QC entry (see decisions above). */
-export const qcPayMode: PayMode = "POINTS";
-
 const toCents = (value: number) => Math.round(value * 100);
 /** `+ 0` turns -0 into 0. */
 const fromCents = (cents: number) => cents / 100 + 0;
@@ -62,35 +61,24 @@ const draft = (role: ScoreRole, payMode: PayMode, rule: RuleSnapshot | null, qty
   money: unitMoney * qty + 0
 });
 
-/** SPEC §5.2: Done → WORKER entry for the assignee, priced by the task's (project, process) rule. */
-export const computeWorkerEntry = (input: { rule: RuleSnapshot | null; qtyDone: number; payMode: PayMode; kind: TaskKind }): ScoreDraft => {
+/** PD-037: the role of a line's entry — QC for a Checking line (its process is the QC process), WORKER otherwise. */
+export const lineScoreRole = (processIsQc: boolean): ScoreRole => (processIsQc ? "QC" : "WORKER");
+
+/**
+ * SPEC §5.2 / PD-037: a line's first Done → one entry for its assignee, priced by the line's (project, process) rule on
+ * the business day: credits per image; money per image only on a Khoán (MONEY_IF_KPI) shift with a priced rule.
+ * A Checking line (role QC) is priced exactly like a work line.
+ */
+export const computeLineEntry = (input: { role: ScoreRole; rule: RuleSnapshot | null; qtyDone: number; payMode: PayMode; kind: TaskKind }): ScoreDraft => {
   const priced = input.rule !== null && input.kind !== "FB_WRONG";
   const unitCredits = priced ? fromCents(toCents(input.rule!.creditPerImage)) : 0;
   const unitMoney = priced && input.payMode === "MONEY_IF_KPI" && input.rule!.moneyPerImage !== null ? input.rule!.moneyPerImage : 0;
-  return draft("WORKER", input.payMode, input.rule, input.qtyDone, unitCredits, unitMoney);
+  return draft(input.role, input.payMode, input.rule, input.qtyDone, unitCredits, unitMoney);
 };
 
-/** SPEC §5.2 / PD-010: Checked → QC entry for qc_id, priced by the project's QC process ("Checking") rule. */
-export const computeQcEntry = (input: { rule: RuleSnapshot | null; qtyDone: number; kind: TaskKind }): ScoreDraft => {
-  const priced = input.rule !== null && input.kind !== "FB_WRONG";
-  const unitCredits = priced ? fromCents(toCents(input.rule!.creditPerImage)) : 0;
-  return draft("QC", qcPayMode, input.rule, input.qtyDone, unitCredits, 0);
-};
-
-/**
- * Roles whose original entry must be written when a task enters a status: only the first time
- * (an original entry for the role does not exist yet). QC fail → Done again writes nothing.
- */
-export const rolesToRecord = (input: { countsDone: boolean; countsChecked: boolean; hasQc: boolean; recorded: ReadonlySet<ScoreRole> }): ScoreRole[] => {
-  const roles: ScoreRole[] = [];
-  if (input.countsDone && !input.recorded.has("WORKER")) {
-    roles.push("WORKER");
-  }
-  if (input.countsChecked && input.hasQc && !input.recorded.has("QC")) {
-    roles.push("QC");
-  }
-  return roles;
-};
+/** A work line's entry (role WORKER), see computeLineEntry. */
+export const computeWorkerEntry = (input: { rule: RuleSnapshot | null; qtyDone: number; payMode: PayMode; kind: TaskKind }): ScoreDraft =>
+  computeLineEntry({ ...input, role: "WORKER" });
 
 /**
  * Adjustment entry (new − old) when the qty behind an entry changes. `ledgerQty` is the qty the
@@ -186,9 +174,9 @@ export type ScoreTotals = {
   pointsOfficial: number;
   /** Credits of Khoán (MONEY_IF_KPI) entries: settled on the close day (Phase 6). */
   pointsKhoan: number;
-  /** Provisional Khoán money (paid only if the KPI is met at settlement). */
+  /** Provisional Khoán money (paid at settlement always, or only if the KPI is met — settings.khoanPayPolicy, PD-033). */
   moneyKhoanProvisional: number;
-  /** Images done in Khoán shifts (worker entries). */
+  /** Images of the person's own lines done in Khoán shifts (Checking lines included, PD-037). */
   qtyKhoan: number;
   /** Part of pointsOfficial earned as QC. */
   qcPoints: number;
@@ -215,9 +203,8 @@ export const totals = (entries: readonly SummaryEntry[]): ScoreTotals => {
     } else {
       khoan += cents;
       money += entry.money;
-      if (entry.role === "WORKER") {
-        qtyKhoan += entry.qty;
-      }
+      // Every entry is the person's own line since PD-037 (a Checking line included).
+      qtyKhoan += entry.qty;
     }
   }
   return {
@@ -249,9 +236,7 @@ export const summarize = (entries: readonly SummaryEntry[], range?: { from: stri
       day.khoan += cents;
       project.khoan += cents;
     }
-    if (entry.role === "WORKER") {
-      project.qty += entry.qty;
-    }
+    project.qty += entry.qty;
     days.set(entry.businessDay, day);
     projects.set(entry.projectId, project);
   }
@@ -437,6 +422,8 @@ export type SettlementInput = {
   /** Credits and provisional money of Khoán (MONEY_IF_KPI) entries. */
   khoanCredits: number;
   khoanMoneyRaw: number;
+  /** settings.khoanPayPolicy (PD-033). */
+  khoanPolicy: KhoanPayPolicy;
 };
 
 export type SettlementResult = SettlementInput & {
@@ -453,20 +440,23 @@ export type SettlementResult = SettlementInput & {
 };
 
 /**
- * PLAN §6 / SPEC §8.2 for one person: met = official points ≥ target (no target → met). Met → Khoán
- * money is paid and its credits do not count; not met → no money, Khoán credits convert into KPI points.
+ * PLAN §6 / SPEC §8.2 for one person: met = official points (Chính thức + OT + QC) ≥ target (no target → met);
+ * Khoán credits never decide "met". The Khoán work follows the policy (PD-033):
+ * - ALWAYS: the Khoán money is always paid and its credits never count toward the KPI (nothing converted).
+ * - IF_KPI: met → the money is paid and its credits do not count; not met → no money, the credits convert into KPI points.
  */
 export const settleUser = (input: SettlementInput): SettlementResult => {
   const target =
     input.targetBase === null ? null : input.prorateLeave ? prorateTarget(input.targetBase, input.workingDays, input.leaveDays) : input.targetBase;
   const met = target === null || toCents(input.pointsOfficial) >= toCents(target);
-  const khoanPointsConverted = met ? 0 : input.khoanCredits;
+  const paid = met || input.khoanPolicy === "ALWAYS";
+  const khoanPointsConverted = paid ? 0 : input.khoanCredits;
   const totalPoints = fromCents(toCents(input.pointsOfficial) + toCents(khoanPointsConverted));
   return {
     ...input,
     target,
     met,
-    khoanMoney: met ? input.khoanMoneyRaw : 0,
+    khoanMoney: paid ? input.khoanMoneyRaw : 0,
     khoanPointsConverted,
     totalPoints,
     percent: percentKpi(totalPoints, target),
@@ -484,7 +474,13 @@ export type SettlementUserInput = {
 };
 
 /** Settles every given person for a period. Deterministic: the same inputs always give the same rows. */
-export const settlePeriod = (input: { period: string; closeDay: KpiCloseDays; prorateLeave: boolean; users: readonly SettlementUserInput[] }) => {
+export const settlePeriod = (input: {
+  period: string;
+  closeDay: KpiCloseDays;
+  prorateLeave: boolean;
+  khoanPolicy: KhoanPayPolicy;
+  users: readonly SettlementUserInput[];
+}) => {
   const { from, to } = periodRange(input.period, input.closeDay);
   const workingDays = countWorkingDays(from, to);
   return {
@@ -501,14 +497,18 @@ export const settlePeriod = (input: { period: string; closeDay: KpiCloseDays; pr
         leaveDays: user.leaveDays,
         pointsOfficial: user.pointsOfficial,
         khoanCredits: user.khoanCredits,
-        khoanMoneyRaw: user.khoanMoneyRaw
+        khoanMoneyRaw: user.khoanMoneyRaw,
+        khoanPolicy: input.khoanPolicy
       })
     }))
   };
 };
 
-/** SPEC §8.3: a period closes at 23:59 business time on its close day. */
-export const periodCloseInstant = (period: string, closeDay: KpiCloseDays) => new Date(`${period}-${pad(closeDayOfPeriod(closeDay, period))}T23:59:00+07:00`);
+/**
+ * SPEC §8.3: a period closes at 23:59 business time on its closing day — the close day, or the month's last day for
+ * 31 "Cuối tháng" (PD-032): 28/02, 30/04, 31/10…
+ */
+export const periodCloseInstant = (period: string, closeDay: KpiCloseDays) => new Date(`${periodRange(period, closeDay).to}T23:59:00+07:00`);
 
 /** The most recent period whose close instant is not after `now`. */
 export const latestClosedPeriod = (now: Date, closeDay: KpiCloseDays) => {

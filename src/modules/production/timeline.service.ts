@@ -5,9 +5,10 @@ import { toIso, toNullableIso, type QuerySql } from "../../lib/db-types.js";
 import type { AccessContext } from "../access/access-context.js";
 import { toUserRef, type UserRefJson } from "../work/mappers.js";
 import { userJsonSql } from "../work/tasks.repo.js";
-import { assertProductionMember, hasProductionRole, isProductionAdmin } from "./access.js";
+import { assertProductionMember, isProductionAdmin } from "./access.js";
 import { cursorInstantSql, cursorTextSql, decodeTimeCursor, encodeTimeCursor } from "./cursor.js";
-import { canViewTask, jobArchivedError, loadMemberRoles, loadTask, relationOf } from "./jobs.repo.js";
+import { leadsForView, loadJobScopes } from "./job-permissions.js";
+import { assertTaskVisible, jobArchivedError, loadMemberRoles, loadTask } from "./jobs.repo.js";
 import { commentCreatedEvent, enqueueProductionEvents } from "./notifications.js";
 import { publishProductionChange } from "./realtime.js";
 
@@ -27,24 +28,26 @@ const resolveTarget = async (sql: QuerySql, context: AccessContext, entity: "JOB
   const organizationId = context.organization.id;
   if (entity === "TASK") {
     const task = await loadTask(sql, organizationId, id);
-    if (!canViewTask(relationOf(context, task))) {
-      throw new AppError("TASK_NOT_FOUND", "Không tìm thấy task.", 404);
-    }
+    await assertTaskVisible(sql, context, task);
     const viewers = new Set([task.assignee_id, ...(task.qc_id ? [task.qc_id] : [])]);
     return { entity, entityId: id, jobId: task.job_id, archived: task.job_archived, viewers };
   }
-  const job = (
-    await sql<{ archived: boolean; people: string[] }[]>`
-      SELECT j.archived_at IS NOT NULL AS archived,
-        coalesce((
+  const [rows, scopes] = await Promise.all([
+    sql<{ archived: boolean; leader_id: string | null; people: string[] }[]>`
+      SELECT j.archived_at IS NOT NULL AS archived, coalesce((
           SELECT array_agg(DISTINCT p) FROM production.tasks t, unnest(ARRAY[t.assignee_id, t.qc_id]) AS p
-          WHERE t.organization_id = j.organization_id AND t.job_id = j.id AND p IS NOT NULL
-        ), '{}') AS people
-      FROM production.jobs j WHERE j.organization_id = ${organizationId} AND j.id = ${id}
-    `
-  )[0];
+          WHERE t.organization_id = j.organization_id AND t.job_id = j.id AND t.deleted_at IS NULL AND p IS NOT NULL
+        ), '{}') AS people, j.leader_id
+      FROM production.jobs j WHERE j.organization_id = ${organizationId} AND j.id = ${id} AND j.deleted_at IS NULL
+    `,
+    loadJobScopes(sql, context)
+  ]);
+  const job = rows[0];
   const viewers = new Set(job ? job.people : []);
-  if (!job || !(isProductionAdmin(context) || hasProductionRole(context, "ACCOUNT", "LEADER") || viewers.has(context.user.id))) {
+  // PD-036 "view": every job, or with "own" the jobs where I work / check or that I lead.
+  const visible =
+    scopes.view === "all" || (scopes.view === "own" && (viewers.has(context.user.id) || leadsForView(context, job?.leader_id ?? null)));
+  if (!job || !visible) {
     throw new AppError("JOB_NOT_FOUND", "Không tìm thấy job.", 404);
   }
   return { entity, entityId: id, jobId: id, archived: job.archived, viewers };

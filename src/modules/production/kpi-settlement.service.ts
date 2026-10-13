@@ -9,7 +9,7 @@ import type {
   KpiSettlementRunResult
 } from "../../contracts/production-scores.js";
 import { closeDayOfPeriod } from "../../contracts/production-scores.js";
-import type { CustomFieldFilter, CustomValues } from "../../contracts/production-catalog.js";
+import type { CustomFieldFilter, CustomValues, KhoanPayPolicy } from "../../contracts/production-catalog.js";
 import { getSql } from "../../db/client.js";
 import { AppError } from "../../lib/app-error.js";
 import { toIso, toNullableIso, type QuerySql } from "../../lib/db-types.js";
@@ -75,12 +75,13 @@ const loadTargets = async (sql: QuerySql, organizationId: string, userIds: strin
 /**
  * What settling `period` gives right now, without writing anything: everyone with a score entry in the
  * period plus active members with a MONTH target effective for it (optionally only `onlyUserIds`).
+ * `khoanPolicy` is settings.khoanPayPolicy (PD-033).
  */
 export const computeSettlement = async (
   sql: QuerySql,
   organizationId: string,
   period: string,
-  options: { closeDay: KpiCloseDays; prorateLeave: boolean; onlyUserIds?: string[] | null }
+  options: { closeDay: KpiCloseDays; prorateLeave: boolean; khoanPolicy: KhoanPayPolicy; onlyUserIds?: string[] | null }
 ) => {
   const { from, to } = periodRange(period, options.closeDay);
   const only = options.onlyUserIds ?? null;
@@ -114,6 +115,7 @@ export const computeSettlement = async (
     period,
     closeDay: options.closeDay,
     prorateLeave: options.prorateLeave,
+    khoanPolicy: options.khoanPolicy,
     users: userIds.map((userId) => ({
       userId,
       targets: targets.get(userId) ?? [],
@@ -128,6 +130,8 @@ export const computeSettlement = async (
 /**
  * SPEC §8.2 settleMonth: settles `period` and replaces its rows (idempotent: the same data gives the
  * same rows, never duplicates), records the run, and queues the notifications. Call inside a transaction.
+ * The run uses the settings at run time (close day of the period, leave proration, Khoán pay policy — PD-033) and
+ * records them, so re-running a period after switching the policy replaces its rows with the other outcome.
  */
 export const settleMonth = async (
   tx: QuerySql,
@@ -137,16 +141,20 @@ export const settleMonth = async (
 ) => {
   await tx`SELECT pg_advisory_xact_lock(hashtextextended(${settlementLockKey(organizationId)}, 0))`;
   const settings = await loadSettings(tx, organizationId);
-  const result = await computeSettlement(tx, organizationId, period, { closeDay: closeDaysOf(settings), prorateLeave: settings.kpiProrateLeave });
+  const result = await computeSettlement(tx, organizationId, period, {
+    closeDay: closeDaysOf(settings),
+    prorateLeave: settings.kpiProrateLeave,
+    khoanPolicy: settings.khoanPayPolicy
+  });
   const met = result.items.filter((item) => item.met).length;
   const run = (
     await tx<{ id: string }[]>`
       INSERT INTO production.kpi_settlement_runs (
-        organization_id, period_month, period_from, period_to, close_day, trigger, run_by, reason, prorate_leave,
+        organization_id, period_month, period_from, period_to, close_day, trigger, run_by, reason, prorate_leave, khoan_policy,
         user_count, met_count, not_met_count, khoan_money_total, khoan_points_converted_total
       ) VALUES (
         ${organizationId}, ${`${period}-01`}::date, ${result.from}::date, ${result.to}::date, ${closeDayOfPeriod(closeDaysOf(settings), period)}, ${options.trigger},
-        ${options.runBy}, ${options.reason}, ${settings.kpiProrateLeave}, ${result.items.length}, ${met}, ${result.items.length - met},
+        ${options.runBy}, ${options.reason}, ${settings.kpiProrateLeave}, ${settings.khoanPayPolicy}, ${result.items.length}, ${met}, ${result.items.length - met},
         ${result.items.reduce((sum, item) => sum + item.khoanMoney, 0)},
         ${Math.round(result.items.reduce((sum, item) => sum + item.khoanPointsConverted * 100, 0)) / 100}
       )
@@ -205,6 +213,7 @@ type SettlementRow = UserRefJson & {
   khoan_money: string;
   khoan_points_converted: string;
   total_points: string;
+  khoan_policy: KhoanPayPolicy;
   run_id: string;
   run_at: Date;
   note: string | null;
@@ -219,9 +228,11 @@ const selectSettlements = (sql: QuerySql, organizationId: string, filter: { from
       to_char(ks.period_to, 'YYYY-MM-DD') AS period_to, ks.target_base::text AS target_base, ks.target_points::text AS target_points,
       ks.prorate_leave, ks.working_days, ks.leave_days::text AS leave_days, ks.points_official::text AS points_official, ks.met,
       ks.khoan_credits::text AS khoan_credits, ks.khoan_money_raw::text AS khoan_money_raw, ks.khoan_money::text AS khoan_money,
-      ks.khoan_points_converted::text AS khoan_points_converted, ks.total_points::text AS total_points, ks.run_id, ks.run_at, ks.note
+      ks.khoan_points_converted::text AS khoan_points_converted, ks.total_points::text AS total_points, r.khoan_policy,
+      ks.run_id, ks.run_at, ks.note
     FROM production.kpi_settlements ks
     JOIN public.app_users au ON au.id = ks.user_id
+    JOIN production.kpi_settlement_runs r ON r.organization_id = ks.organization_id AND r.id = ks.run_id
     WHERE ks.organization_id = ${organizationId}
       AND ks.period_month BETWEEN ${`${filter.fromPeriod}-01`}::date AND ${`${filter.toPeriod}-01`}::date
       AND (${filter.userIds}::uuid[] IS NULL OR ks.user_id = ANY(${filter.userIds}::uuid[]))
@@ -254,6 +265,7 @@ const toSettlement = (row: SettlementRow, viewer: { id: string; admin: boolean }
     totalPoints,
     percent: percentKpi(totalPoints, target),
     difference: target === null ? null : Math.round((totalPoints - target) * 100) / 100 + 0,
+    khoanPolicy: row.khoan_policy,
     runId: row.run_id,
     runAt: toIso(row.run_at),
     note: row.note
@@ -270,6 +282,7 @@ type RunRow = {
   run_by: UserRefJson | null;
   reason: string | null;
   prorate_leave: boolean;
+  khoan_policy: KhoanPayPolicy;
   user_count: number;
   met_count: number;
   not_met_count: number;
@@ -283,7 +296,7 @@ type RunRow = {
 
 const selectRuns = (sql: QuerySql, organizationId: string, filter: { ids?: string[]; period?: string | undefined; limit: number }) => sql<RunRow[]>`
   SELECT r.id, to_char(r.period_month, 'YYYY-MM') AS period, to_char(r.period_from, 'YYYY-MM-DD') AS period_from,
-    to_char(r.period_to, 'YYYY-MM-DD') AS period_to, r.close_day, r.trigger, r.reason, r.prorate_leave, r.user_count, r.met_count,
+    to_char(r.period_to, 'YYYY-MM-DD') AS period_to, r.close_day, r.trigger, r.reason, r.prorate_leave, r.khoan_policy, r.user_count, r.met_count,
     r.not_met_count, r.khoan_money_total::text AS khoan_money_total, r.khoan_points_converted_total::text AS khoan_points_converted_total,
     r.replaced_count, r.started_at, r.finished_at,
     CASE WHEN u.id IS NULL THEN NULL
@@ -312,6 +325,7 @@ const toRun = (row: RunRow): KpiSettlementRun => ({
   runBy: toUserRef(row.run_by),
   reason: row.reason,
   prorateLeave: row.prorate_leave,
+  khoanPolicy: row.khoan_policy,
   userCount: row.user_count,
   metCount: row.met_count,
   notMetCount: row.not_met_count,
@@ -463,7 +477,12 @@ export const getKpiReport = async (
   const userInfo = new Map<string, UserRefJson>(settledRows.map((row) => [row.id, row]));
 
   for (const period of readPeriods.filter((item) => !settledPeriods.has(item) && started(item) && dataFrom !== null && item >= dataFrom)) {
-    const provisional = await computeSettlement(sql, organizationId, period, { closeDay: closeDays, prorateLeave: settings.kpiProrateLeave, onlyUserIds });
+    const provisional = await computeSettlement(sql, organizationId, period, {
+      closeDay: closeDays,
+      prorateLeave: settings.kpiProrateLeave,
+      khoanPolicy: settings.khoanPayPolicy,
+      onlyUserIds
+    });
     for (const item of provisional.items) {
       rows.push(reportRow(item.userId, period, false, item, admin || item.userId === context.user.id));
     }

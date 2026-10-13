@@ -210,7 +210,10 @@ export const computeIsLate = (input: { doneAt: Date | null; closed: boolean; dea
 
 const hourMs = 3_600_000;
 
-/** Default deadline of a task line: the job deadline minus the project's QC buffer (PLAN §10). */
+/**
+ * The job deadline minus the project's QC buffer (PLAN §10). Since PD-035 a normal line defaults to the job's own
+ * Ngày giao; this is still the basis of the feedback redo default (feedbackTaskDeadline).
+ */
 export const defaultTaskDeadline = (jobDeadline: Date, qcBufferHours: number) => new Date(jobDeadline.getTime() - qcBufferHours * hourMs);
 
 /**
@@ -238,35 +241,47 @@ export const feedbackTaskDeadline = (input: {
 export type TaskLineInput = { assigneeId: string; qcId?: string | null | undefined; processId: string; shiftId: string; qtyAssigned: number };
 
 export type TaskLineContext = {
-  callerId: string;
   memberRoles: ReadonlyMap<string, ReadonlySet<ProductionRole>>;
   processes: ReadonlyMap<string, { active: boolean; isQc: boolean; name: string }>;
   shifts: ReadonlyMap<string, { active: boolean }>;
 };
 
-/** SPEC Phase 2 §2 + PLAN §10: returns the problems of one task line (empty = valid). */
+/**
+ * SPEC Phase 2 §2 + PLAN §10: returns the problems of one task line (empty = valid). QC is optional on every line,
+ * also when someone enters a line for themselves (PD-035: staff enter their own work-log rows).
+ *
+ * A Checking line (its process is the QC process, PD-037) is a work line of the QC person: its assignee holds QC (or
+ * LEADER / ADMIN) and it has no QC of its own — its flow goes Done → Complete. Any other line is done by a STAFF or
+ * LEADER and may name a QC (another person holding QC).
+ */
 export const taskLineErrors = (line: TaskLineInput, context: TaskLineContext): string[] => {
   const errors: string[] = [];
-  const assigneeRoles = context.memberRoles.get(line.assigneeId);
-  if (!assigneeRoles || !(assigneeRoles.has("STAFF") || assigneeRoles.has("LEADER"))) {
-    errors.push("Người làm phải có vai trò Nhân viên hoặc Leader.");
-  }
-  if (line.qcId) {
-    const qcRoles = context.memberRoles.get(line.qcId);
-    if (!qcRoles?.has("QC")) {
-      errors.push("Người QC phải có vai trò QC.");
-    }
-    if (line.qcId === line.assigneeId) {
-      errors.push("QC phải khác người làm.");
-    }
-  } else if (line.assigneeId === context.callerId) {
-    errors.push("Leader tự giao cho mình thì phải chọn QC là người khác.");
-  }
   const process = context.processes.get(line.processId);
+  const checking = process?.isQc === true;
+  const assigneeRoles = context.memberRoles.get(line.assigneeId);
+  if (checking) {
+    if (!assigneeRoles || !(assigneeRoles.has("QC") || assigneeRoles.has("LEADER") || assigneeRoles.has("ADMIN"))) {
+      errors.push("Người làm dòng Checking phải có vai trò QC (hoặc Leader).");
+    }
+    if (line.qcId) {
+      errors.push("Dòng Checking không có QC riêng — người làm chính là người kiểm.");
+    }
+  } else {
+    if (!assigneeRoles || !(assigneeRoles.has("STAFF") || assigneeRoles.has("LEADER"))) {
+      errors.push("Người làm phải có vai trò Nhân viên hoặc Leader.");
+    }
+    if (line.qcId) {
+      const qcRoles = context.memberRoles.get(line.qcId);
+      if (!qcRoles?.has("QC")) {
+        errors.push("Người QC phải có vai trò QC.");
+      }
+      if (line.qcId === line.assigneeId) {
+        errors.push("QC phải khác người làm.");
+      }
+    }
+  }
   if (!process?.active) {
     errors.push("Quy trình không tồn tại hoặc đã ngừng.");
-  } else if (process.isQc) {
-    errors.push(`"${process.name}" là quy trình QC — điểm QC được ghi tự động khi Checked, không giao như task.`);
   }
   if (!context.shifts.get(line.shiftId)?.active) {
     errors.push("Ca làm không tồn tại hoặc đã ngừng.");

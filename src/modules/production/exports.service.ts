@@ -1,7 +1,8 @@
 import type { Response } from "express";
 
 import { customFieldEmptyValue, type CustomFieldFilter } from "../../contracts/production-catalog.js";
-import type { JobQuery, JobSummary } from "../../contracts/production-jobs.js";
+import type { JobExportQuery, JobPersonShare, JobPersonTotals, JobSummary, JobWorker } from "../../contracts/production-jobs.js";
+import { noLeaderFilter } from "../../contracts/production-jobs.js";
 import {
   reportDimensionInfo,
   reportMeasureInfo,
@@ -270,12 +271,132 @@ const customFilterRows = (fields: readonly ExportField[], filters: readonly Cust
 
 // Jobs -------------------------------------------------------------------------------------------------
 
-/** GET /production/jobs/export — the GET /production/jobs filters (all pages, at most 5000 jobs). */
-export const exportJobs = async (context: AccessContext, res: Response, query: JobQuery) => {
+/** "Người làm" cell: "Name · 25 tấm, Other · 10 tấm" (most images first, like the list). */
+export const workersCell = (workers: readonly JobWorker[]): CellValue =>
+  workers.length > 0 ? workers.map((worker) => `${worker.user.displayName} · ${worker.qty} tấm`).join(", ") : null;
+
+/** Per-person view (`personId`): the person's columns, next to the job totals. */
+export const personColumns = (name: string): SheetColumn[] => [
+  { header: `Công đoạn (${name})`, key: "personProcesses", width: 30 },
+  { header: `Giao (${name})`, key: "personAssigned", width: 16, numFmt: numberFormats.images },
+  { header: `Done (${name})`, key: "personDone", width: 16, numFmt: numberFormats.images },
+  { header: `Checked (${name})`, key: "personChecked", width: 16, numFmt: numberFormats.images }
+];
+
+export const personCells = (share: JobPersonShare | null): Record<string, CellValue> => ({
+  personProcesses: share && share.processes.length > 0 ? share.processes.join(", ") : null,
+  personAssigned: share?.qtyAssigned ?? 0,
+  personDone: share?.qtyDone ?? 0,
+  personChecked: share?.qtyChecked ?? 0
+});
+
+/**
+ * The work-log Excel's columns (PD-035), exactly its headers and order, then Trạng thái (the line's workflow status), QC,
+ * Trạng thái job (the manual job status, PD-038) and Link chia việc (PD-040, as text): one row per line, so the file
+ * reads like the company's own work log. New columns go at the end; the 11 work-log columns keep their order.
+ */
+export const workLogColumns: SheetColumn[] = [
+  { header: "Nhân viên thực hiện", key: "assignee", width: 24 },
+  { header: "Dự án", key: "project", width: 12 },
+  { header: "Gói công việc (Folder hình, hỏi leader nếu không rõ)", key: "jobCode", width: 48 },
+  { header: "Quy trình", key: "process", width: 18 },
+  { header: "Ngày nhận", key: "assignedAt", width: 12, numFmt: numberFormats.day },
+  { header: "Ngày giao", key: "deadline", width: 12, numFmt: numberFormats.day },
+  { header: "Ca làm việc", key: "shift", width: 14 },
+  { header: "Số lượng", key: "qty", width: 10, numFmt: numberFormats.images },
+  { header: "Hình lỗi", key: "errorQty", width: 10, numFmt: numberFormats.images },
+  { header: "Giờ OT", key: "otHours", width: 10, numFmt: numberFormats.hours },
+  { header: "Ghi chú", key: "note", width: 36 },
+  { header: "Trạng thái", key: "status", width: 16 },
+  { header: "QC", key: "qc", width: 22 },
+  { header: "Trạng thái job", key: "jobStatus", width: 18 },
+  { header: "Link chia việc", key: "workLink", width: 48 }
+];
+
+type WorkLogRow = {
+  job_id: string;
+  assignee: string;
+  project_code: string;
+  job_code: string;
+  process: string;
+  assigned_at: Date;
+  deadline: Date;
+  shift: string;
+  qty_assigned: number;
+  error_qty: number | null;
+  ot_hours: string | null;
+  note: string | null;
+  status: string;
+  qc: string | null;
+  job_status: string;
+  work_link: string | null;
+};
+
+const workLogRowLimit = 20_000;
+
+/** The lines of the exported jobs, in the list's job order (then line order); with a person, only their lines. */
+const loadWorkLog = async (sql: QuerySql, organizationId: string, jobIds: string[], personId: string | undefined) => {
+  const rows: WorkLogRow[] = [];
+  // Chunks keep each statement's array small; the job order is kept chunk by chunk.
+  for (let start = 0; start < jobIds.length && rows.length <= workLogRowLimit; start += 500) {
+    const ids = jobIds.slice(start, start + 500);
+    rows.push(
+      ...(await sql<WorkLogRow[]>`
+        SELECT t.job_id, au.display_name AS assignee, p.code AS project_code, j.code AS job_code, pr.name AS process,
+          t.assigned_at, t.deadline, sh.name AS shift, t.qty_assigned, t.error_qty, t.ot_hours::text AS ot_hours, t.note,
+          st.name AS status, qa.display_name AS qc, js.name AS job_status, t.work_link
+        FROM production.tasks t
+        JOIN production.jobs j ON j.organization_id = t.organization_id AND j.id = t.job_id
+        JOIN production.job_statuses js ON js.organization_id = j.organization_id AND js.id = j.job_status_id
+        JOIN production.projects p ON p.organization_id = j.organization_id AND p.id = j.project_id
+        JOIN production.processes pr ON pr.organization_id = t.organization_id AND pr.id = t.process_id
+        JOIN production.shifts sh ON sh.organization_id = t.organization_id AND sh.id = t.shift_id
+        JOIN production.statuses st ON st.organization_id = t.organization_id AND st.id = t.status_id
+        JOIN public.app_users au ON au.id = t.assignee_id
+        LEFT JOIN public.app_users qa ON qa.id = t.qc_id
+        WHERE t.organization_id = ${organizationId} AND t.job_id = ANY(${ids}::uuid[]) AND t.deleted_at IS NULL
+          ${personId ? sql`AND t.assignee_id = ${personId}` : sql``}
+        ORDER BY array_position(${ids}::uuid[], t.job_id), t.created_at, t.number
+        LIMIT ${workLogRowLimit + 1}
+      `)
+    );
+  }
+  return rows;
+};
+
+/** A business-day date cell (dd/mm/yyyy) of an instant. */
+const businessDayCell = (at: Date) => dayCell(businessDay(at));
+
+export const workLogCells = (row: WorkLogRow): Record<string, CellValue> => ({
+  assignee: row.assignee,
+  project: row.project_code,
+  jobCode: row.job_code,
+  process: row.process,
+  assignedAt: businessDayCell(row.assigned_at),
+  deadline: businessDayCell(row.deadline),
+  shift: row.shift,
+  qty: row.qty_assigned,
+  errorQty: row.error_qty,
+  otHours: row.ot_hours === null ? null : Number(row.ot_hours),
+  note: row.note,
+  status: row.status,
+  qc: row.qc,
+  jobStatus: row.job_status,
+  workLink: row.work_link
+});
+
+/**
+ * GET /production/jobs/export — the GET /production/jobs filters (all pages, at most 5000 jobs). `view=worklog`: the
+ * lines of those jobs as the work-log Excel (PD-035) instead of one row per job.
+ */
+export const exportJobs = async (context: AccessContext, res: Response, query: JobExportQuery) => {
   const items: JobSummary[] = [];
   let cursor: string | undefined;
+  let totals: JobPersonTotals | null = null;
   do {
     const page = await listJobs(context, { ...query, limit: 100, cursor });
+    // Per-person totals come with the first page, over every matching job (also beyond the row limit).
+    totals ??= page.personTotals;
     items.push(...page.items);
     cursor = page.pageInfo.nextCursor ?? undefined;
   } while (cursor && items.length < exportRowLimit);
@@ -283,18 +404,77 @@ export const exportJobs = async (context: AccessContext, res: Response, query: J
   const { now, today } = exportedAt();
   const fields = await loadExportFields(getSql(), org(context), "JOB");
   const tableFields = fields.filter((field) => field.show_in_table);
+  const sql = getSql();
+  const nameOf = async (lookup: NamedFilter, id: string | undefined) =>
+    id ? ((await filterLookups[lookup].query(sql, org(context), [id]))[0]?.name ?? id) : null;
+  const personName = query.personId ? await nameOf("user", query.personId) : null;
+
+  const filters: [string, CellValue][] = [];
+  if (query.q) filters.push(["Tìm kiếm", query.q]);
+  if (query.projectId) filters.push(["Lọc – Dự án", await nameOf("project", query.projectId)]);
+  if (query.jobStatusId?.length) {
+    const names = await sql<{ name: string }[]>`
+      SELECT name FROM production.job_statuses WHERE organization_id = ${org(context)} AND id = ANY(${query.jobStatusId}::uuid[]) ORDER BY position
+    `;
+    filters.push(["Lọc – Trạng thái", names.map((row) => row.name).join(", ")]);
+  }
+  if (query.leaderId) filters.push(["Lọc – Leader", query.leaderId === noLeaderFilter ? "Chưa có leader" : await nameOf("user", query.leaderId)]);
+  if (personName) {
+    filters.push(["Lọc – Nhân viên (người làm)", personName]);
+    if (totals) {
+      filters.push(
+        [`Số job của ${personName}`, totals.jobCount],
+        [`Tấm giao của ${personName}`, totals.qtyAssigned],
+        [`Tấm done của ${personName}`, totals.qtyDone],
+        [`Tấm checked của ${personName}`, totals.qtyChecked]
+      );
+    }
+  }
+  if (query.tagId?.length) filters.push(["Lọc – Tag", (await filterLookups.tag.query(sql, org(context), query.tagId)).map((row) => row.name).join(", ")]);
+  if (query.deadlineFrom) filters.push(["Ngày giao từ", businessDate(query.deadlineFrom)]);
+  if (query.deadlineTo) filters.push(["Ngày giao trước", businessDate(query.deadlineTo)]);
+  if (query.late) filters.push(["Chỉ job có task trễ", "Có"]);
+  if (query.includeArchived) filters.push(["Gồm job đã lưu trữ", "Có"]);
+  filters.push(...customFilterRows(fields, query.cf));
+
+  if (query.view === "worklog") {
+    const lines = await loadWorkLog(
+      sql,
+      org(context),
+      items.slice(0, exportRowLimit).map((job) => job.id),
+      query.personId
+    );
+    const lineRows = lines.slice(0, workLogRowLimit).map(workLogCells);
+    await sendWorkbook(res, exportFilename("Work log", null, today), [
+      { name: "Work log", columns: workLogColumns, rows: lineRows },
+      infoSheet([
+        ...filters,
+        ["Số job", Math.min(items.length, exportRowLimit)],
+        ["Số dòng", lineRows.length],
+        [
+          "Bị cắt bớt",
+          truncated || lines.length > workLogRowLimit ? `Có (tối đa ${exportRowLimit} job, ${workLogRowLimit} dòng)` : "Không"
+        ],
+        ...exporterRows(context, now)
+      ])
+    ]);
+    return;
+  }
 
   const columns: SheetColumn[] = [
-    { header: "Mã job", key: "code", width: 36 },
+    { header: "Gói công việc", key: "code", width: 48 },
     { header: "Tên job", key: "name", width: 32 },
     { header: "Dự án", key: "project", width: 14 },
     { header: "Client", key: "client", width: 20 },
     { header: "Leader", key: "leader", width: 22 },
-    { header: "Deadline", key: "deadline", width: 18, numFmt: numberFormats.datetime },
+    { header: "Người làm", key: "workers", width: 40 },
+    { header: "Ngày nhận", key: "receivedAt", width: 12, numFmt: numberFormats.day },
+    { header: "Ngày giao", key: "deadline", width: 18, numFmt: numberFormats.datetime },
     { header: "Tổng tấm", key: "totalImages", numFmt: numberFormats.images },
     { header: "Đã giao", key: "qtyAssigned", numFmt: numberFormats.images },
     { header: "Đã done", key: "qtyDone", numFmt: numberFormats.images },
     { header: "Đã checked", key: "qtyChecked", numFmt: numberFormats.images },
+    ...(personName ? personColumns(personName) : []),
     { header: "Số task", key: "taskCount", numFmt: numberFormats.count },
     { header: "Task trễ", key: "lateTaskCount", numFmt: numberFormats.count },
     { header: "FB đang mở", key: "openFeedbackCount", numFmt: numberFormats.count },
@@ -310,33 +490,23 @@ export const exportJobs = async (context: AccessContext, res: Response, query: J
     name: job.name,
     project: job.project.code,
     client: job.project.clientName,
-    leader: job.leader.displayName,
+    leader: job.leader?.displayName ?? "Chưa có leader",
+    workers: workersCell(job.people.workers),
+    receivedAt: businessDayCell(new Date(job.receivedAt)),
     deadline: businessDate(job.deadline),
     totalImages: job.totalImages,
     qtyAssigned: job.qtyAssigned,
     qtyDone: job.qtyDone,
     qtyChecked: job.qtyChecked,
+    ...(personName ? personCells(job.personShare) : {}),
     taskCount: job.taskCount,
     lateTaskCount: job.lateTaskCount,
     openFeedbackCount: job.openFeedbackCount,
-    status: job.status?.name ?? "Chưa chia",
+    // PD-038: the manual job status (the line statuses stay in the work-log view).
+    status: job.jobStatus.name,
     createdAt: businessDate(job.createdAt),
     archived: job.archived ? "Có" : "Không"
   }));
-  const sql = getSql();
-  const nameOf = async (lookup: NamedFilter, id: string | undefined) =>
-    id ? ((await filterLookups[lookup].query(sql, org(context), [id]))[0]?.name ?? id) : null;
-  const filters: [string, CellValue][] = [];
-  if (query.q) filters.push(["Tìm kiếm", query.q]);
-  if (query.projectId) filters.push(["Lọc – Dự án", await nameOf("project", query.projectId)]);
-  if (query.statusId) filters.push(["Lọc – Trạng thái", await nameOf("status", query.statusId)]);
-  if (query.leaderId) filters.push(["Lọc – Leader", await nameOf("user", query.leaderId)]);
-  if (query.tagId?.length) filters.push(["Lọc – Tag", (await filterLookups.tag.query(sql, org(context), query.tagId)).map((row) => row.name).join(", ")]);
-  if (query.deadlineFrom) filters.push(["Deadline từ", businessDate(query.deadlineFrom)]);
-  if (query.deadlineTo) filters.push(["Deadline trước", businessDate(query.deadlineTo)]);
-  if (query.late) filters.push(["Chỉ job có task trễ", "Có"]);
-  if (query.includeArchived) filters.push(["Gồm job đã lưu trữ", "Có"]);
-  filters.push(...customFilterRows(fields, query.cf));
 
   await sendWorkbook(res, exportFilename("Danh sách job", null, today), [
     { name: "Job", columns, rows },

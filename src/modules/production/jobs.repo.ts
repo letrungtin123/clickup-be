@@ -1,14 +1,15 @@
-import type { ProductionRole } from "../../contracts/production-catalog.js";
+import type { JobScopes, ProductionRole } from "../../contracts/production-catalog.js";
 import { productionRoleCodes } from "../../contracts/production-catalog.js";
-import type { FeedbackSchema, JobSummary, ProductionTask, TaskKind } from "../../contracts/production-jobs.js";
+import type { FeedbackSchema, JobPeople, JobPersonShare, JobStatusRef, JobSummary, ProductionTask, TaskKind } from "../../contracts/production-jobs.js";
 import { AppError } from "../../lib/app-error.js";
 import { toIso, toNullableIso, type QuerySql } from "../../lib/db-types.js";
 import type { AccessContext } from "../access/access-context.js";
 import { toColor, toUserRef, type UserRefJson } from "../work/mappers.js";
 import { userJsonSql } from "../work/tasks.repo.js";
-import { leadsJob, productionRolesOf } from "./access.js";
+import { actsAsJobLeader, productionRolesOf } from "./access.js";
 import { cachedConfig } from "./catalog-cache.js";
 import { cursorTextSql } from "./cursor.js";
+import { leadsForView, lineAllowed, loadJobScopes, ownJobsSql } from "./job-permissions.js";
 import { allowedTransitions, finishedStatusIds, statusById, type TaskRelation, type Workflow } from "./workflow.js";
 import type { z } from "zod";
 
@@ -99,7 +100,8 @@ export type TaskRow = {
   number: string | number;
   job_id: string;
   job_code: string;
-  job_leader_id: string;
+  /** null: the job has no leader (PD-035). */
+  job_leader_id: string | null;
   project_id: string;
   project_code: string;
   project_name: string;
@@ -116,6 +118,7 @@ export type TaskRow = {
   requires_ot_hours: boolean;
   qty_assigned: number;
   qty_done: number | null;
+  error_qty: number | null;
   ot_hours: string | null;
   assigned_at: Date;
   deadline: Date;
@@ -129,6 +132,8 @@ export type TaskRow = {
   parent_task_id: string | null;
   feedback_id: string | null;
   note: string | null;
+  /** "Link chia việc" (PD-040). */
+  work_link: string | null;
   is_late: boolean;
   qc_fail_count: number;
   custom_values: Record<string, unknown>;
@@ -155,13 +160,14 @@ export const taskSelectSql = (sql: QuerySql) => sql`
     t.qc_id, (SELECT ${userJsonSql(sql)} FROM public.app_users au WHERE au.id = t.qc_id) AS qc,
     pr.id AS process_id, pr.name AS process_name, pr.is_qc AS process_is_qc,
     sh.id AS shift_id, sh.name AS shift_name, sh.pay_mode, sh.requires_ot_hours,
-    t.qty_assigned, t.qty_done, t.ot_hours::text, t.assigned_at, t.deadline, t.done_at, t.checked_at,
+    t.qty_assigned, t.qty_done, t.error_qty, t.ot_hours::text, t.assigned_at, t.deadline, t.done_at, t.checked_at,
     st.id AS status_id, st.code AS status_code, st.name AS status_name, st.color AS status_color,
-    t.kind, t.parent_task_id, t.feedback_id, t.note, t.is_late, t.qc_fail_count, t.custom_values,
+    t.kind, t.parent_task_id, t.feedback_id, t.note, t.work_link, t.is_late, t.qc_fail_count, t.custom_values,
     (SELECT array_agg(et.tag_id ORDER BY et.created_at) FROM production.entity_tags et
       WHERE et.organization_id = t.organization_id AND et.entity = 'TASK' AND et.entity_id = t.id) AS tag_ids,
     t.created_at, t.updated_at
-  FROM production.tasks t
+  -- Deleted lines (PD-036) are kept for audit only: no read through this select ever shows them.
+  FROM (SELECT * FROM production.tasks WHERE deleted_at IS NULL) t
   JOIN production.jobs j ON j.organization_id = t.organization_id AND j.id = t.job_id
   JOIN production.projects p ON p.organization_id = t.organization_id AND p.id = j.project_id
   JOIN production.processes pr ON pr.organization_id = t.organization_id AND pr.id = t.process_id
@@ -194,44 +200,71 @@ export const relationOf = (
   roles: productionRolesOf(context),
   isAssignee: task.assignee_id === context.user.id,
   isQc: task.qc_id === context.user.id,
-  // SEC2-04: leading the job counts only while the caller still holds LEADER (or ADMIN).
-  isJobLeader: leadsJob(context, task.job_leader_id),
+  // SEC2-04: leading the job counts only while the caller still holds LEADER (or ADMIN); a job without a leader is
+  // led by every Leader / Admin (PD-035).
+  isJobLeader: actsAsJobLeader(context, task.job_leader_id),
   jobHasOpenFeedback: task.job_open_feedback ?? false,
   jobArchived: task.job_archived ?? false
 });
 
-/** Who may see a task: its assignee, QC, the job leader, Account/Leader/Admin roles. */
-export const canViewTask = (relation: TaskRelation) =>
-  relation.isAssignee || relation.isQc || relation.isJobLeader || ["ACCOUNT", "LEADER", "ADMIN"].some((role) => relation.roles.has(role as ProductionRole));
-
-export const canManageTask = (relation: TaskRelation) => relation.isJobLeader || relation.roles.has("ADMIN");
-
-/** Account / Leader / Admin see every job (PD-014); others only jobs where they lead, work or check. */
-export const canSeeAllJobs = (context: AccessContext) => {
-  const roles = productionRolesOf(context);
-  return roles.has("ADMIN") || roles.has("ACCOUNT") || roles.has("LEADER");
-};
+const taskNotFound = () => new AppError("TASK_NOT_FOUND", "Không tìm thấy task.", 404);
 
 /**
- * 404 unless the caller may see the job: all-jobs roles (Account / Leader / Admin — every job leader who
- * still holds LEADER is one of them) or someone working/checking in it. A leader who lost the LEADER role no
- * longer sees the job through `leader_id` alone (SEC2-04).
+ * 404 unless the caller may see the job (PD-036 "view"): "all", or "own" when a live line of it is theirs (assignee
+ * or QC) or they lead it — a leader who lost the LEADER role no longer counts (SEC2-04). With "all" nothing is read:
+ * callers load the job themselves (a missing or deleted job is a 404 there). Returns the caller's scopes for the
+ * checks that follow.
  */
-export const assertJobVisible = async (sql: QuerySql, context: AccessContext, jobId: string) => {
-  if (canSeeAllJobs(context)) {
-    return;
+export const assertJobVisible = async (sql: QuerySql, context: AccessContext, jobId: string, scopes?: JobScopes): Promise<JobScopes> => {
+  const mine = scopes ?? (await loadJobScopes(sql, context));
+  if (mine.view === "all") {
+    return mine;
   }
-  const rows = await sql`
-    SELECT 1 FROM production.jobs j
-    WHERE j.organization_id = ${context.organization.id} AND j.id = ${jobId}
-      AND EXISTS (
-        SELECT 1 FROM production.tasks t WHERE t.organization_id = j.organization_id AND t.job_id = j.id
-          AND (t.assignee_id = ${context.user.id} OR t.qc_id = ${context.user.id}))
-  `;
+  const rows =
+    mine.view === "none"
+      ? []
+      : await sql`
+          SELECT 1 FROM production.jobs j
+          WHERE j.organization_id = ${context.organization.id} AND j.id = ${jobId} AND j.deleted_at IS NULL
+            AND ${ownJobsSql(sql, context)}
+        `;
   if (rows.length === 0) {
     throw new AppError("JOB_NOT_FOUND", "Không tìm thấy job.", 404);
   }
+  return mine;
 };
+
+/**
+ * 404 unless the caller may see the task: its assignee and its QC always (it is their work — "Việc của tôi", the QC
+ * queue and the workflow need it); anyone else through the job's view scope (assertJobVisible). Returns the scopes.
+ */
+export const assertTaskVisible = async (
+  sql: QuerySql,
+  context: AccessContext,
+  task: Pick<TaskRow, "assignee_id" | "qc_id" | "job_id" | "job_leader_id">,
+  scopes?: JobScopes
+): Promise<JobScopes> => {
+  const mine = scopes ?? (await loadJobScopes(sql, context));
+  if (task.assignee_id === context.user.id || task.qc_id === context.user.id || mine.view === "all") {
+    return mine;
+  }
+  if (mine.view === "own") {
+    if (leadsForView(context, task.job_leader_id)) {
+      return mine;
+    }
+    const rows = await sql`
+      SELECT 1 FROM production.jobs j
+      WHERE j.organization_id = ${context.organization.id} AND j.id = ${task.job_id} AND j.deleted_at IS NULL AND ${ownJobsSql(sql, context)}
+    `;
+    if (rows.length > 0) {
+      return mine;
+    }
+  }
+  throw taskNotFound();
+};
+
+/** The caller's access to tasks, for their capabilities (toProductionTask). */
+export type TaskAccess = { scopes: JobScopes; userId: string };
 
 export const jobArchivedError = () => new AppError("JOB_ARCHIVED", "Job đã lưu trữ — khôi phục trước khi thay đổi.", 409);
 
@@ -283,15 +316,35 @@ export const loadTaskExtras = async (sql: QuerySql, organizationId: string, user
   return result;
 };
 
-/** Task rows → API tasks for the caller, with the card extras (loadTaskExtras). */
-export const toProductionTasks = async (sql: QuerySql, context: AccessContext, workflow: Workflow, rows: readonly TaskRow[]) => {
-  const extras = await loadTaskExtras(sql, context.organization.id, context.user.id, rows);
-  return rows.map((row) => toProductionTask(row, workflow, relationOf(context, row), extras.get(row.id)));
+/** Task rows → API tasks for the caller, with the card extras (loadTaskExtras) and their capabilities. */
+export const toProductionTasks = async (sql: QuerySql, context: AccessContext, workflow: Workflow, rows: readonly TaskRow[], scopes?: JobScopes) => {
+  const [extras, mine] = await Promise.all([
+    loadTaskExtras(sql, context.organization.id, context.user.id, rows),
+    scopes ? Promise.resolve(scopes) : loadJobScopes(sql, context)
+  ]);
+  const access: TaskAccess = { scopes: mine, userId: context.user.id };
+  return rows.map((row) => toProductionTask(row, workflow, relationOf(context, row), access, extras.get(row.id)));
 };
 
-export const toProductionTask = (row: TaskRow, workflow: Workflow, relation: TaskRelation, extras: TaskExtras = noExtras): ProductionTask => {
-  // Archived jobs are read-only (BUG-PR-04).
-  const manage = canManageTask(relation) && !row.job_archived;
+/**
+ * What the caller may do with a line besides workflow moves (PD-036 matrix; archived jobs are read-only, BUG-PR-04):
+ * edit its fields ("update" all / own line), change its QC (same, until Checked), give it to someone else (update
+ * "all", before Done), correct its Done quantity (update "all", after Done — it changes scores) and delete it.
+ */
+export const taskCapabilities = (row: Pick<TaskRow, "assignee_id" | "job_archived" | "done_at" | "checked_at">, access: TaskAccess) => {
+  const live = !row.job_archived;
+  const mine = row.assignee_id === access.userId;
+  const canEdit = live && lineAllowed(access.scopes.update, mine);
+  return {
+    canEdit,
+    canAssign: canEdit && row.checked_at === null,
+    canChangeAssignee: canEdit && access.scopes.update === "all" && row.done_at === null,
+    canEditQty: live && access.scopes.update === "all" && row.done_at !== null,
+    canDelete: live && lineAllowed(access.scopes.delete, mine)
+  };
+};
+
+export const toProductionTask = (row: TaskRow, workflow: Workflow, relation: TaskRelation, access: TaskAccess, extras: TaskExtras = noExtras): ProductionTask => {
   const doneStatusIds = new Set(workflow.statuses.filter((status) => status.countsDone).map((status) => status.id));
   return {
     id: row.id,
@@ -305,6 +358,7 @@ export const toProductionTask = (row: TaskRow, workflow: Workflow, relation: Tas
     shift: { id: row.shift_id, name: row.shift_name, payMode: row.pay_mode, requiresOtHours: row.requires_ot_hours },
     qtyAssigned: row.qty_assigned,
     qtyDone: row.qty_done,
+    errorQty: row.error_qty,
     otHours: row.ot_hours === null ? null : Number(row.ot_hours),
     assignedAt: toIso(row.assigned_at),
     deadline: toIso(row.deadline),
@@ -315,6 +369,7 @@ export const toProductionTask = (row: TaskRow, workflow: Workflow, relation: Tas
     parentTaskId: row.parent_task_id,
     feedbackId: row.feedback_id,
     note: row.note,
+    workLink: row.work_link,
     isLate: row.is_late,
     jobArchived: row.job_archived,
     qcFailCount: row.qc_fail_count,
@@ -334,9 +389,7 @@ export const toProductionTask = (row: TaskRow, workflow: Workflow, relation: Tas
           asksOtHours: entersDone && row.requires_ot_hours
         };
       }),
-      canEdit: manage,
-      canAssign: manage && row.checked_at === null,
-      canEditQty: manage && row.done_at !== null
+      ...taskCapabilities(row, access)
     }
   };
 };
@@ -355,12 +408,21 @@ export type JobRow = {
   project_code: string;
   project_name: string;
   client_name: string | null;
-  leader_id: string;
-  leader: UserRefJson;
+  /** null: no leader (PD-035). */
+  leader_id: string | null;
+  leader: UserRefJson | null;
+  received_at: Date;
   deadline: Date;
   total_images: number;
+  total_images_manual: boolean;
   drive_link: string | null;
   channel_id: string | null;
+  /** Manual job status (PD-038). */
+  job_status_id: string;
+  job_status_name: string;
+  job_status_color: string;
+  job_status_closed: boolean;
+  /** Derived workflow status (internal, PD-014). */
   status_id: string | null;
   status_code: string | null;
   status_name: string | null;
@@ -371,6 +433,12 @@ export type JobRow = {
   task_count: number;
   late_task_count: number;
   open_feedback_count: number;
+  /** Distinct task assignees, most images first (null: no task). */
+  workers: { user: UserRefJson; qty: number; task_count: number }[] | null;
+  /** Distinct task QC people, by name (null: none). */
+  qc_people: UserRefJson[] | null;
+  /** The `personId` person's part of the job (job list per-person view); null otherwise. */
+  person_share: { processes: string[] | null; task_count: number; qty_assigned: number; qty_done: number; qty_checked: number } | null;
   custom_values: Record<string, unknown>;
   tag_ids: string[] | null;
   created_by: UserRefJson | null;
@@ -380,16 +448,23 @@ export type JobRow = {
   archived_at: Date | null;
 };
 
-export const jobSelectSql = (sql: QuerySql) => sql`
+/**
+ * Job rows (list and detail). With `personId` (job list per-person view) each row also carries that person's
+ * part of the job: their own tasks' processes and quantities.
+ */
+export const jobSelectSql = (sql: QuerySql, personId?: string) => sql`
   SELECT j.id, j.number, j.code, j.name, p.id AS project_id, p.code AS project_code, p.name AS project_name, c.name AS client_name,
     ${cursorTextSql(sql, "j.created_at")} AS created_cursor,
     j.leader_id, (SELECT ${userJsonSql(sql)} FROM public.app_users au WHERE au.id = j.leader_id) AS leader,
-    j.deadline, j.total_images, j.drive_link, j.channel_id,
+    j.received_at, j.deadline, j.total_images, j.total_images_manual, j.drive_link, j.channel_id,
+    js.id AS job_status_id, js.name AS job_status_name, js.color AS job_status_color, js.is_closed AS job_status_closed,
     st.id AS status_id, st.code AS status_code, st.name AS status_name, st.color AS status_color,
     coalesce(agg.qty_assigned, 0)::int AS qty_assigned, coalesce(agg.qty_done, 0)::int AS qty_done,
     coalesce(agg.qty_checked, 0)::int AS qty_checked, coalesce(agg.task_count, 0)::int AS task_count,
     coalesce(agg.late_task_count, 0)::int AS late_task_count,
     (SELECT count(*)::int FROM production.feedbacks f WHERE f.organization_id = j.organization_id AND f.job_id = j.id AND f.status <> 'RESOLVED') AS open_feedback_count,
+    people.workers, people.qc_people,
+    ${personId ? sql`mine.person_share` : sql`NULL::json AS person_share`},
     j.custom_values,
     (SELECT array_agg(et.tag_id ORDER BY et.created_at) FROM production.entity_tags et
       WHERE et.organization_id = j.organization_id AND et.entity = 'JOB' AND et.entity_id = j.id) AS tag_ids,
@@ -398,17 +473,89 @@ export const jobSelectSql = (sql: QuerySql) => sql`
   FROM production.jobs j
   JOIN production.projects p ON p.organization_id = j.organization_id AND p.id = j.project_id
   LEFT JOIN production.clients c ON c.organization_id = j.organization_id AND c.id = p.client_id
+  JOIN production.job_statuses js ON js.organization_id = j.organization_id AND js.id = j.job_status_id
   LEFT JOIN production.statuses st ON st.organization_id = j.organization_id AND st.id = j.status_id
   LEFT JOIN LATERAL (
-    -- Image totals compare with total_images, so feedback redo tasks (FB_*) are not counted.
-    SELECT sum(t.qty_assigned) FILTER (WHERE t.kind = 'NORMAL') AS qty_assigned,
-      sum(coalesce(t.qty_done, 0)) FILTER (WHERE t.done_at IS NOT NULL AND t.kind = 'NORMAL') AS qty_done,
-      sum(coalesce(t.qty_done, 0)) FILTER (WHERE t.checked_at IS NOT NULL AND t.kind = 'NORMAL') AS qty_checked,
+    -- Image totals compare with total_images, so feedback redo tasks (FB_*) and Checking lines (they check the same
+    -- images) are not counted. Checked = lines checked by their QC, or Checking lines that are Done (PD-037).
+    SELECT sum(t.qty_assigned) FILTER (WHERE t.kind = 'NORMAL' AND NOT tp.is_qc) AS qty_assigned,
+      sum(coalesce(t.qty_done, 0)) FILTER (WHERE t.done_at IS NOT NULL AND t.kind = 'NORMAL' AND NOT tp.is_qc) AS qty_done,
+      sum(coalesce(t.qty_done, 0)) FILTER (WHERE t.kind = 'NORMAL' AND (t.checked_at IS NOT NULL OR (tp.is_qc AND t.done_at IS NOT NULL))) AS qty_checked,
       count(*) AS task_count,
       count(*) FILTER (WHERE t.is_late AND t.done_at IS NULL AND t.closed_at IS NULL) AS late_task_count
-    FROM production.tasks t WHERE t.organization_id = j.organization_id AND t.job_id = j.id
+    FROM production.tasks t
+    JOIN production.processes tp ON tp.organization_id = t.organization_id AND tp.id = t.process_id
+    WHERE t.organization_id = j.organization_id AND t.job_id = j.id AND t.deleted_at IS NULL
   ) agg ON true
+  LEFT JOIN LATERAL (
+    -- "Người làm": every task of the job (feedback redo included), like the job detail's task list (PD-014).
+    -- Per job of the page, through production_tasks_job_idx (a few rows each).
+    SELECT
+      (SELECT json_agg(json_build_object('user', ${userJsonSql(sql)}, 'qty', w.qty, 'task_count', w.task_count) ORDER BY w.qty DESC, au.display_name, au.id)
+        FROM (
+          SELECT t.assignee_id, sum(t.qty_assigned)::int AS qty, count(*)::int AS task_count
+          FROM production.tasks t WHERE t.organization_id = j.organization_id AND t.job_id = j.id AND t.deleted_at IS NULL
+          GROUP BY t.assignee_id
+        ) w
+        JOIN public.app_users au ON au.id = w.assignee_id) AS workers,
+      (SELECT json_agg(${userJsonSql(sql)} ORDER BY au.display_name, au.id)
+        FROM (
+          SELECT t.qc_id FROM production.tasks t
+          WHERE t.organization_id = j.organization_id AND t.job_id = j.id AND t.qc_id IS NOT NULL AND t.deleted_at IS NULL
+          GROUP BY t.qc_id
+        ) q
+        JOIN public.app_users au ON au.id = q.qc_id) AS qc_people
+  ) people ON true
+  ${personId ? personShareSql(sql, personId) : sql``}
 `;
+
+/** The person's own tasks of the job `j` (assignee only), through production_tasks_job_idx. */
+const personShareSql = (sql: QuerySql, personId: string) => sql`
+  LEFT JOIN LATERAL (
+    SELECT json_build_object(
+      'processes', (
+        SELECT array_agg(pr.name ORDER BY pr.sort_order, pr.name) FROM production.processes pr
+        WHERE pr.organization_id = j.organization_id
+          AND pr.id IN (
+            SELECT t2.process_id FROM production.tasks t2
+            WHERE t2.organization_id = j.organization_id AND t2.job_id = j.id AND t2.assignee_id = ${personId} AND t2.deleted_at IS NULL
+          )
+      ),
+      'task_count', count(*),
+      'qty_assigned', coalesce(sum(t.qty_assigned), 0),
+      'qty_done', coalesce(sum(coalesce(t.qty_done, 0)) FILTER (WHERE t.done_at IS NOT NULL), 0),
+      'qty_checked', coalesce(sum(coalesce(t.qty_done, 0)) FILTER (WHERE t.checked_at IS NOT NULL OR (tp.is_qc AND t.done_at IS NOT NULL)), 0)
+    ) AS person_share
+    FROM production.tasks t
+    JOIN production.processes tp ON tp.organization_id = t.organization_id AND tp.id = t.process_id
+    WHERE t.organization_id = j.organization_id AND t.job_id = j.id AND t.assignee_id = ${personId} AND t.deleted_at IS NULL
+  ) mine ON true
+`;
+
+export const toJobPersonShare = (share: JobRow["person_share"]): JobPersonShare | null =>
+  share
+    ? {
+        processes: share.processes ?? [],
+        taskCount: Number(share.task_count),
+        qtyAssigned: Number(share.qty_assigned),
+        qtyDone: Number(share.qty_done),
+        qtyChecked: Number(share.qty_checked)
+      }
+    : null;
+
+/** Job people summary from the row's aggregates (empty lists before the job is split). */
+export const toJobPeople = (row: Pick<JobRow, "workers" | "qc_people">): JobPeople => ({
+  workers: (row.workers ?? []).map((worker) => ({ user: toUserRef(worker.user)!, qty: worker.qty, taskCount: worker.task_count })),
+  qc: (row.qc_people ?? []).map((user) => toUserRef(user)!)
+});
+
+/** The manual job status columns (PD-038) of a row as the API ref. */
+export const toJobStatusRef = (row: Pick<JobRow, "job_status_id" | "job_status_name" | "job_status_color" | "job_status_closed">): JobStatusRef => ({
+  id: row.job_status_id,
+  name: row.job_status_name,
+  color: toColor(row.job_status_color),
+  isClosed: row.job_status_closed
+});
 
 export const toJobSummary = (row: JobRow): JobSummary => ({
   id: row.id,
@@ -416,11 +563,14 @@ export const toJobSummary = (row: JobRow): JobSummary => ({
   code: row.code,
   name: row.name,
   project: { id: row.project_id, code: row.project_code, name: row.project_name, clientName: row.client_name },
-  leader: toUserRef(row.leader)!,
+  leader: toUserRef(row.leader),
+  receivedAt: toIso(row.received_at),
   deadline: toIso(row.deadline),
   totalImages: row.total_images,
+  totalImagesManual: row.total_images_manual,
   driveLink: row.drive_link,
   channelId: row.channel_id,
+  jobStatus: toJobStatusRef(row),
   status:
     row.status_id && row.status_code && row.status_name
       ? { id: row.status_id, code: row.status_code, name: row.status_name, color: toColor(row.status_color ?? "slate") }
@@ -431,6 +581,8 @@ export const toJobSummary = (row: JobRow): JobSummary => ({
   taskCount: row.task_count,
   lateTaskCount: row.late_task_count,
   openFeedbackCount: row.open_feedback_count,
+  people: toJobPeople(row),
+  personShare: toJobPersonShare(row.person_share ?? null),
   customValues: row.custom_values as JobSummary["customValues"],
   tagIds: row.tag_ids ?? [],
   createdBy: toUserRef(row.created_by),
@@ -458,7 +610,8 @@ export const selectFeedbacks = (sql: QuerySql, organizationId: string, jobId: st
   SELECT f.id, f.job_id, f.source_task_id, f.type, f.note, f.status, f.created_at, f.resolved_at, f.resolution, f.resolution_note,
     (SELECT ${userJsonSql(sql)} FROM public.app_users au WHERE au.id = f.created_by) AS created_by,
     (SELECT ${userJsonSql(sql)} FROM public.app_users au WHERE au.id = f.resolved_by) AS resolved_by,
-    (SELECT array_agg(t.id ORDER BY t.created_at) FROM production.tasks t WHERE t.organization_id = f.organization_id AND t.feedback_id = f.id) AS task_ids
+    (SELECT array_agg(t.id ORDER BY t.created_at) FROM production.tasks t
+      WHERE t.organization_id = f.organization_id AND t.feedback_id = f.id AND t.deleted_at IS NULL) AS task_ids
   FROM production.feedbacks f
   WHERE f.organization_id = ${organizationId} AND f.job_id = ${jobId}
   ORDER BY f.created_at DESC

@@ -4,11 +4,11 @@ import { AppError } from "../../lib/app-error.js";
 import { toIso, type QuerySql } from "../../lib/db-types.js";
 import type { AccessContext } from "../access/access-context.js";
 import { toUserRef, type UserRefJson } from "../work/mappers.js";
-import { assertProductionMember, isProductionAdmin, leadsJob } from "./access.js";
+import { actsAsJobLeader, assertProductionMember, isProductionAdmin } from "./access.js";
 import { closeDaysOf, customFieldsForbidden, loadSettings } from "./catalog.service.js";
 import { matchesCustomFieldFilters, resolveCustomFieldFilters } from "./custom-fields.js";
 import { cursorInstantSql, cursorTextSql, decodeTimeCursor, encodeTimeCursor } from "./cursor.js";
-import { canViewTask, loadTask, relationOf } from "./jobs.repo.js";
+import { assertTaskVisible, loadTask } from "./jobs.repo.js";
 import { approvedLeaveDays } from "./leave.service.js";
 import type { CustomFieldFilter, CustomValues } from "../../contracts/production-catalog.js";
 import { closeDayOfPeriod } from "../../contracts/production-scores.js";
@@ -345,7 +345,7 @@ export const getScoreBoard = async (
       SELECT user_id,
         coalesce(sum(credits) FILTER (WHERE pay_mode = 'POINTS'), 0)::text AS points_official,
         coalesce(sum(credits) FILTER (WHERE pay_mode = 'MONEY_IF_KPI'), 0)::text AS points_khoan,
-        coalesce(sum(qty) FILTER (WHERE pay_mode = 'MONEY_IF_KPI' AND role = 'WORKER'), 0)::int AS qty_khoan,
+        coalesce(sum(qty) FILTER (WHERE pay_mode = 'MONEY_IF_KPI'), 0)::int AS qty_khoan,
         coalesce(sum(money) FILTER (WHERE pay_mode = 'MONEY_IF_KPI'), 0)::text AS money
       FROM production.score_entries
       WHERE organization_id = ${organizationId} AND business_day BETWEEN ${from}::date AND ${to}::date
@@ -419,14 +419,12 @@ export const getTaskScores = async (context: AccessContext, taskId: string): Pro
   const sql = getSql();
   const organizationId = org(context);
   const task = await loadTask(sql, organizationId, taskId);
-  if (!canViewTask(relationOf(context, task))) {
-    throw new AppError("TASK_NOT_FOUND", "Không tìm thấy task.", 404);
-  }
+  await assertTaskVisible(sql, context, task);
   const settings = await loadSettings(sql, organizationId);
   const admin = isProductionAdmin(context);
   const moneyVisible = admin || settings.moneyPublic;
-  // SEC2-04: the job leader's view of everyone's rows ends with the LEADER role.
-  const everyone = settings.scoresPublic || admin || leadsJob(context, task.job_leader_id);
+  // SEC2-04: the job leader's view of everyone's rows ends with the LEADER role (a job without a leader: every Leader, PD-035).
+  const everyone = settings.scoresPublic || admin || actsAsJobLeader(context, task.job_leader_id);
   const rows = await sql<(EntryRow & { owner: UserRefJson })[]>`
     SELECT e.id, e.role, e.task_id, t.number::text AS task_number, e.job_id, j.code AS job_code, e.project_id, p.code AS project_code,
       e.process_id, pr.name AS process_name, e.shift_id, s.name AS shift_name, e.pay_mode, e.kind, e.qty,

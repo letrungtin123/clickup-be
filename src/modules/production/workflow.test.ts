@@ -223,7 +223,6 @@ describe("job status", () => {
 describe("task lines", () => {
   const leader = "leader";
   const context = {
-    callerId: leader,
     memberRoles: new Map<string, Set<ProductionRole>>([
       [leader, new Set<ProductionRole>(["LEADER", "QC"])],
       ["staff", new Set<ProductionRole>(["STAFF"])],
@@ -251,18 +250,26 @@ describe("task lines", () => {
     expect(taskLineErrors({ ...line, assigneeId: leader, qcId: leader }, context)).toContain("QC phải khác người làm.");
   });
 
-  it("requires another QC when the leader assigns to themselves", () => {
-    expect(taskLineErrors({ ...line, assigneeId: leader, qcId: null }, context)).toEqual([
-      "Leader tự giao cho mình thì phải chọn QC là người khác."
-    ]);
+  it("lets anyone enter a line for themselves without a QC (PD-035: QC is optional)", () => {
+    expect(taskLineErrors({ ...line, assigneeId: leader, qcId: null }, context)).toEqual([]);
     expect(taskLineErrors({ ...line, assigneeId: leader, qcId: "qc" }, context)).toEqual([]);
   });
 
-  it("checks roles, QC process and inactive catalog rows", () => {
+  it("checks roles and inactive catalog rows", () => {
     expect(taskLineErrors({ ...line, assigneeId: "account" }, context)).toHaveLength(1);
     expect(taskLineErrors({ ...line, qcId: "staff" }, context)).toContain("Người QC phải có vai trò QC.");
-    expect(taskLineErrors({ ...line, processId: "checking" }, context)[0]).toContain("quy trình QC");
     expect(taskLineErrors({ ...line, processId: "old", shiftId: "closed" }, context)).toHaveLength(2);
+  });
+
+  it("a Checking line (PD-037) is the QC person's own work line, without a QC of its own", () => {
+    const checking = { ...line, processId: "checking", assigneeId: "qc", qcId: null };
+    expect(taskLineErrors(checking, context)).toEqual([]);
+    // A Leader may check too; a STAFF-only person may not.
+    expect(taskLineErrors({ ...checking, assigneeId: leader }, context)).toEqual([]);
+    expect(taskLineErrors({ ...checking, assigneeId: "staff" }, context)).toEqual(["Người làm dòng Checking phải có vai trò QC (hoặc Leader)."]);
+    expect(taskLineErrors({ ...checking, qcId: leader }, context)).toEqual(["Dòng Checking không có QC riêng — người làm chính là người kiểm."]);
+    // A work line is still done by STAFF / LEADER (a QC-only person cannot retouch).
+    expect(taskLineErrors({ ...line, assigneeId: "qc", qcId: null }, context)).toEqual(["Người làm phải có vai trò Nhân viên hoặc Leader."]);
   });
 
   it("warns (but allows) over-allocation", () => {

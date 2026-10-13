@@ -5,7 +5,9 @@ import type { QuerySql } from "../../lib/db-types.js";
 import { logger } from "../../lib/logger.js";
 import type { AccessContext } from "../access/access-context.js";
 import { createChannel, setSystemChannelMembers, updateChannelMember } from "../chat/channels.service.js";
-import { assertProductionMember, hasProductionRole, isProductionAdmin, leadsJob } from "./access.js";
+import { actsAsJobLeader, assertProductionMember, hasProductionRole, isProductionAdmin } from "./access.js";
+import { loadSettings } from "./catalog.service.js";
+import { rolesWithAll } from "./job-permissions.js";
 import { assertJobVisible, jobArchivedError, loadMemberRoles } from "./jobs.repo.js";
 import { publishProductionChange } from "./realtime.js";
 
@@ -14,7 +16,8 @@ import { publishProductionChange } from "./realtime.js";
  *
  * Membership (SPEC: "tự thêm leader, account, mọi assignee/qc của job"; SEC-API-05, BUG-PR-13, PD-022): the people
  * related to the job belong to the chat, as long as they are active organization members:
- *   - its leader, while they still lead (hold LEADER or ADMIN, or are superadmin — SEC2-04);
+ *   - its leader, while they still lead (hold LEADER or ADMIN, or are superadmin — SEC2-04); a job without a leader
+ *     (PD-035) has none here — every Leader may still open the chat and is added then;
  *   - its creator, while they may still see every job (Account / Leader / Admin, superadmin);
  *   - every holder of the production ACCOUNT role;
  *   - every worker and QC of its tasks.
@@ -33,7 +36,7 @@ import { publishProductionChange } from "./realtime.js";
 
 type JobChatRow = {
   code: string;
-  leader_id: string;
+  leader_id: string | null;
   created_by: string;
   channel_id: string | null;
   channel_alive: boolean;
@@ -41,7 +44,7 @@ type JobChatRow = {
   related: string[];
 };
 
-const loadJobChat = async (sql: QuerySql, organizationId: string, jobId: string) =>
+const loadJobChat = async (sql: QuerySql, organizationId: string, jobId: string, viewAll: readonly string[]) =>
   (
     await sql<JobChatRow[]>`
       SELECT j.code, j.leader_id, j.created_by, j.channel_id, j.archived_at IS NOT NULL AS archived,
@@ -61,7 +64,7 @@ const loadJobChat = async (sql: QuerySql, organizationId: string, jobId: string)
               )))
               OR (om.user_id = j.created_by AND (r.key = 'superadmin' OR EXISTS (
                 SELECT 1 FROM production.user_roles ur
-                WHERE ur.organization_id = om.organization_id AND ur.user_id = om.user_id AND ur.role_code IN ('ADMIN', 'ACCOUNT', 'LEADER')
+                WHERE ur.organization_id = om.organization_id AND ur.user_id = om.user_id AND ur.role_code = ANY(${viewAll}::text[])
               )))
               OR EXISTS (
                 SELECT 1 FROM production.user_roles ur
@@ -69,11 +72,12 @@ const loadJobChat = async (sql: QuerySql, organizationId: string, jobId: string)
               )
               OR EXISTS (
                 SELECT 1 FROM production.tasks t
-                WHERE t.organization_id = j.organization_id AND t.job_id = j.id AND (t.assignee_id = om.user_id OR t.qc_id = om.user_id)
+                WHERE t.organization_id = j.organization_id AND t.job_id = j.id AND t.deleted_at IS NULL
+                  AND (t.assignee_id = om.user_id OR t.qc_id = om.user_id)
               )
             )
         ), '{}') AS related
-      FROM production.jobs j WHERE j.organization_id = ${organizationId} AND j.id = ${jobId}
+      FROM production.jobs j WHERE j.organization_id = ${organizationId} AND j.id = ${jobId} AND j.deleted_at IS NULL
     `
   )[0];
 
@@ -93,13 +97,17 @@ const membershipContext = (context: AccessContext): AccessContext => ({
   }
 });
 
-const viewsAllJobs = (roles: ReadonlySet<string> | undefined) => Boolean(roles && (roles.has("ADMIN") || roles.has("ACCOUNT") || roles.has("LEADER")));
+/** May see every job: a role whose "view" scope is "all" (PD-036; ADMIN always). */
+const viewsAllJobs = (roles: ReadonlySet<string> | undefined, viewAll: readonly string[]) => Boolean(roles && viewAll.some((role) => roles.has(role)));
+
+/** Roles that see every job in the job permission matrix (PD-036). */
+const viewAllRoles = async (sql: QuerySql, organizationId: string) => rolesWithAll((await loadSettings(sql, organizationId)).jobPermissions, "view");
 
 /**
  * Brings the job chat's members in line with the job (see above). `include` adds people who opened the chat
  * and may see the job. No-op when the job has no live channel or is archived.
  */
-const reconcile = async (context: AccessContext, job: JobChatRow, include: string[]) => {
+const reconcile = async (context: AccessContext, job: JobChatRow, include: string[], viewAll: readonly string[]) => {
   const organizationId = context.organization.id;
   const sql = getSql();
   const channelId = job.channel_id!;
@@ -112,7 +120,7 @@ const reconcile = async (context: AccessContext, job: JobChatRow, include: strin
   const toAdd = [...entitled].filter((id) => !present.has(id));
   const unrelated = members.filter((row) => !entitled.has(row.user_id));
   const roles = await loadMemberRoles(sql, organizationId, unrelated.map((row) => row.user_id));
-  const toRemove = unrelated.filter((row) => !viewsAllJobs(roles.get(row.user_id)) && row.user_id !== context.user.id);
+  const toRemove = unrelated.filter((row) => !viewsAllJobs(roles.get(row.user_id), viewAll) && row.user_id !== context.user.id);
   if (toAdd.length === 0 && toRemove.length === 0) {
     return;
   }
@@ -121,7 +129,7 @@ const reconcile = async (context: AccessContext, job: JobChatRow, include: strin
     const removing = new Set(toRemove.map((row) => row.user_id));
     const staying = members.filter((row) => !removing.has(row.user_id));
     if (staying.length > 0 && !staying.some((row) => row.role === "admin")) {
-      const heir = staying.find((row) => row.user_id === job.leader_id) ?? staying[0]!;
+      const heir = (job.leader_id ? staying.find((row) => row.user_id === job.leader_id) : undefined) ?? staying[0]!;
       await updateChannelMember(membershipContext(context), channelId, heir.user_id, { role: "admin" });
     }
   }
@@ -142,9 +150,11 @@ const reconcile = async (context: AccessContext, job: JobChatRow, include: strin
  */
 export const syncJobChat = async (context: AccessContext, jobId: string) => {
   try {
-    const job = await loadJobChat(getSql(), context.organization.id, jobId);
+    const sql = getSql();
+    const viewAll = await viewAllRoles(sql, context.organization.id);
+    const job = await loadJobChat(sql, context.organization.id, jobId, viewAll);
     if (job?.channel_id && job.channel_alive && !job.archived) {
-      await reconcile(context, job, []);
+      await reconcile(context, job, [], viewAll);
     }
   } catch (error) {
     logger.warn({ err: error, jobId }, "Job chat membership sync failed");
@@ -163,7 +173,7 @@ export const syncJobChatsForMember = async (context: AccessContext, userId: stri
     jobs = await getSql()<{ id: string }[]>`
       SELECT j.id FROM production.jobs j
       JOIN public.channels c ON c.id = j.channel_id AND c.organization_id = j.organization_id AND c.deleted_at IS NULL AND c.archived_at IS NULL
-      WHERE j.organization_id = ${organizationId} AND j.archived_at IS NULL
+      WHERE j.organization_id = ${organizationId} AND j.archived_at IS NULL AND j.deleted_at IS NULL
         AND (j.leader_id = ${userId} OR EXISTS (
           SELECT 1 FROM public.channel_members cm
           WHERE cm.organization_id = j.organization_id AND cm.channel_id = j.channel_id AND cm.user_id = ${userId} AND cm.deleted_at IS NULL
@@ -187,7 +197,8 @@ export const openJobChat = async (context: AccessContext, jobId: string): Promis
   const organizationId = context.organization.id;
   const sql = getSql();
   await assertJobVisible(sql, context, jobId);
-  const job = await loadJobChat(sql, organizationId, jobId);
+  const viewAll = await viewAllRoles(sql, organizationId);
+  const job = await loadJobChat(sql, organizationId, jobId, viewAll);
   if (!job) {
     throw new AppError("JOB_NOT_FOUND", "Không tìm thấy job.", 404);
   }
@@ -196,11 +207,11 @@ export const openJobChat = async (context: AccessContext, jobId: string): Promis
   }
 
   if (job.channel_id && job.channel_alive) {
-    await reconcile(context, job, [context.user.id]);
+    await reconcile(context, job, [context.user.id], viewAll);
     return { channelId: job.channel_id, created: false };
   }
 
-  if (!leadsJob(context, job.leader_id) && !isProductionAdmin(context) && !hasProductionRole(context, "ACCOUNT")) {
+  if (!actsAsJobLeader(context, job.leader_id) && !isProductionAdmin(context) && !hasProductionRole(context, "ACCOUNT")) {
     throw new AppError("FORBIDDEN", "Chỉ Leader của job, Account hoặc Quản trị được tạo nhóm chat cho job.", 403);
   }
   const members = [...new Set([...job.related, context.user.id])];

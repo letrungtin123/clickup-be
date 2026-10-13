@@ -186,8 +186,10 @@ try {
   ok("LEADER cannot read whitelist (403)", r.status === 403);
   r = await admin.call("PATCH", "/production/settings", { kpiCloseDay: 26, anomalyFailRate: 0.2 });
   ok("admin updates settings", r.status === 200 && r.body.kpiCloseDay === 26 && r.body.anomalyFailRate === 0.2);
-  r = await admin.call("PATCH", "/production/settings", { kpiCloseDay: 31 });
-  ok("invalid close day rejected (400)", r.status === 400);
+  r = await admin.call("PATCH", "/production/settings", { kpiCloseDay: 30 });
+  ok("invalid close day rejected (400; 1–28 or 31 = cuối tháng)", r.status === 400);
+  r = await admin.call("PATCH", "/production/settings", { khoanPayPolicy: "SOMETIMES" });
+  ok("unknown Khoán pay policy rejected (400)", r.status === 400);
   r = await admin.call("PATCH", "/production/settings", { timezone: "UTC" });
   ok("timezone is not editable (400)", r.status === 400);
   r = await outsider.call("PATCH", "/me/notification-preferences", { notifyEmail: true });

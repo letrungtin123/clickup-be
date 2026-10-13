@@ -109,7 +109,7 @@ const failure = async (promise: Promise<unknown>) => {
   return null;
 };
 const plainTarget: TargetRow = { status: "active", role_key: "member", org_admin: false, roles: ["LEADER", "QC"] };
-const ledJob = { id: jobId, code: "JOB-1", name: null, deadline: "2026-10-20T00:00:00.000Z", statusCode: "PROCESSING", statusName: "Đang làm", taskCount: 2 };
+const ledJob = { id: jobId, code: "JOB-1", name: null, deadline: "2026-10-20T00:00:00.000Z", jobStatus: { id: jobId, name: "Đang làm", color: "blue" as const, isClosed: false }, taskCount: 2 };
 
 beforeEach(() => {
   db.state.calls = [];

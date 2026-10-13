@@ -12,6 +12,9 @@ registerUniqueViolations({
   production_statuses_single_initial_uidx: { code: "INITIAL_STATUS_EXISTS", message: "Chỉ được có một trạng thái khởi tạo." },
   custom_fields_organization_id_entity_key_key: { code: "FIELD_KEY_TAKEN", message: "Mã trường đã tồn tại cho đối tượng này." },
   production_tags_name_uidx: { code: "TAG_NAME_TAKEN", message: "Tên tag đã tồn tại." },
-  production_jobs_code_uidx: { code: "JOB_CODE_TAKEN", message: "Mã job đã tồn tại." },
+  production_jobs_project_code_uidx: { code: "JOB_CODE_TAKEN", message: "Gói công việc này đã có trong dự án — chọn job đó thay vì tạo mới." },
+  // The index of live jobs since PD-036 (a deleted job frees its package).
+  production_jobs_project_code_live_uidx: { code: "JOB_CODE_TAKEN", message: "Gói công việc này đã có trong dự án — chọn job đó thay vì tạo mới." },
+  production_job_statuses_name_uidx: { code: "JOB_STATUS_NAME_TAKEN", message: "Đã có trạng thái job cùng tên." },
   production_kpi_targets_version_uidx: { code: "KPI_VERSION_EXISTS", message: "Đã có chỉ tiêu KPI bắt đầu từ ngày này." }
 });

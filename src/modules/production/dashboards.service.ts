@@ -78,7 +78,8 @@ export const getLeaderDashboard = async (context: AccessContext, query: { leader
   const todayStart = startOfBusinessDay(today);
   const tomorrowStart = startOfBusinessDay(addDays(today, 1));
 
-  const scope = leaderId ? sql`AND j.leader_id = ${leaderId}` : sql``;
+  // The jobs they lead and the jobs without a leader (every Leader leads those, PD-035).
+  const scope = leaderId ? sql`AND (j.leader_id = ${leaderId} OR j.leader_id IS NULL)` : sql``;
   const openTasks = (window: ReturnType<typeof sql>) => sql<OpenTaskRow[]>`
     SELECT t.id, t.number::text AS number, t.job_id, j.code AS job_code,
       json_build_object('id', ua.id, 'display_name', ua.display_name, 'email', ua.email, 'avatar_url', ua.avatar_url) AS assignee,
@@ -90,7 +91,7 @@ export const getLeaderDashboard = async (context: AccessContext, query: { leader
     JOIN production.statuses s ON s.organization_id = t.organization_id AND s.id = t.status_id
     JOIN public.app_users ua ON ua.id = t.assignee_id
     LEFT JOIN public.app_users uq ON uq.id = t.qc_id
-    WHERE t.organization_id = ${organizationId} AND t.done_at IS NULL AND t.closed_at IS NULL ${window}
+    WHERE t.organization_id = ${organizationId} AND t.deleted_at IS NULL AND t.done_at IS NULL AND t.closed_at IS NULL ${window}
       AND j.archived_at IS NULL ${scope}
     ORDER BY t.deadline, t.number
     LIMIT ${taskListLimit}
@@ -106,7 +107,7 @@ export const getLeaderDashboard = async (context: AccessContext, query: { leader
       SELECT count(*) FILTER (WHERE t.deadline < ${now})::int AS late, count(*) FILTER (WHERE t.deadline >= ${now})::int AS due_soon
       FROM production.tasks t
       JOIN production.jobs j ON j.organization_id = t.organization_id AND j.id = t.job_id
-      WHERE t.organization_id = ${organizationId} AND t.done_at IS NULL AND t.closed_at IS NULL AND t.deadline < ${dueSoonUntil}
+      WHERE t.organization_id = ${organizationId} AND t.deleted_at IS NULL AND t.done_at IS NULL AND t.closed_at IS NULL AND t.deadline < ${dueSoonUntil}
         AND j.archived_at IS NULL ${scope}
     `,
     sql<
@@ -134,13 +135,13 @@ export const getLeaderDashboard = async (context: AccessContext, query: { leader
           count(*)::int AS open_tasks
         FROM production.tasks t
         JOIN production.jobs j ON j.organization_id = t.organization_id AND j.id = t.job_id AND j.archived_at IS NULL
-        WHERE t.organization_id = ${organizationId} AND t.status_id = ANY(${[...notStarted, ...processing]}::uuid[])
+        WHERE t.organization_id = ${organizationId} AND t.deleted_at IS NULL AND t.status_id = ANY(${[...notStarted, ...processing]}::uuid[])
         GROUP BY t.assignee_id
       ), done_today AS (
         SELECT t.assignee_id, coalesce(sum(t.qty_done), 0)::int AS qty_done_today, count(*)::int AS tasks_done_today
         FROM production.tasks t
         JOIN production.jobs j ON j.organization_id = t.organization_id AND j.id = t.job_id AND j.archived_at IS NULL
-        WHERE t.organization_id = ${organizationId} AND t.done_at >= ${todayStart} AND t.done_at < ${tomorrowStart}
+        WHERE t.organization_id = ${organizationId} AND t.deleted_at IS NULL AND t.done_at >= ${todayStart} AND t.done_at < ${tomorrowStart}
         GROUP BY t.assignee_id
       ), leave_today AS (
         SELECT user_id,
@@ -303,7 +304,7 @@ export const getAdminDashboard = async (context: AccessContext): Promise<AdminDa
         number: string;
         code: string;
         project_code: string;
-        leader: UserCols;
+        leader: UserCols | null;
         deadline: Date;
         late_tasks: number;
         oldest: Date;
@@ -312,14 +313,15 @@ export const getAdminDashboard = async (context: AccessContext): Promise<AdminDa
       }[]
     >`
       SELECT j.id, j.number::text AS number, j.code, p.code AS project_code,
-        json_build_object('id', u.id, 'display_name', u.display_name, 'email', u.email, 'avatar_url', u.avatar_url) AS leader,
+        CASE WHEN u.id IS NULL THEN NULL
+          ELSE json_build_object('id', u.id, 'display_name', u.display_name, 'email', u.email, 'avatar_url', u.avatar_url) END AS leader,
         j.deadline, count(*)::int AS late_tasks, min(t.deadline) AS oldest,
         (count(*) OVER ())::int AS job_count, (sum(count(*)) OVER ())::int AS task_count
       FROM production.tasks t
       JOIN production.jobs j ON j.organization_id = t.organization_id AND j.id = t.job_id
       JOIN production.projects p ON p.organization_id = j.organization_id AND p.id = j.project_id
-      JOIN public.app_users u ON u.id = j.leader_id
-      WHERE t.organization_id = ${organizationId} AND t.is_late AND t.done_at IS NULL AND t.closed_at IS NULL
+      LEFT JOIN public.app_users u ON u.id = j.leader_id
+      WHERE t.organization_id = ${organizationId} AND t.deleted_at IS NULL AND t.is_late AND t.done_at IS NULL AND t.closed_at IS NULL
         AND t.deadline >= ${lateFrom} AND t.deadline < ${lateTo} AND j.archived_at IS NULL
       GROUP BY j.id, p.code, u.id
       ORDER BY min(t.deadline), j.code
@@ -352,7 +354,7 @@ export const getAdminDashboard = async (context: AccessContext): Promise<AdminDa
         items: lateJobs.map((row) => ({
           job: { id: row.id, number: Number(row.number), code: row.code },
           projectCode: row.project_code,
-          leader: userRef(row.leader),
+          leader: row.leader ? userRef(row.leader) : null,
           deadline: toIso(row.deadline),
           lateTaskCount: row.late_tasks,
           oldestDeadline: toIso(row.oldest)

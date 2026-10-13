@@ -169,6 +169,10 @@ type DimensionSpec = {
   nullLabel: string;
 };
 
+/** "YYYY-MM" KPI period of a date expression, given the SQL of its close day (`day` and `close` are trusted SQL). */
+const kpiPeriodSql = (day: string, close: string) =>
+  `to_char(${day} + CASE WHEN extract(day FROM ${day}) <= ${close} THEN interval '0 months' ELSE interval '1 month' END, 'YYYY-MM')`;
+
 const dimensionSpecs: Record<ReportDimension, DimensionSpec> = {
   user: {
     expr: { SCORES: () => "e.user_id", TASKS: () => "t.assignee_id" },
@@ -242,11 +246,12 @@ const dimensionSpecs: Record<ReportDimension, DimensionSpec> = {
     nullLabel: ""
   },
   period: {
-    // KPI period: day ≤ close day of its month → this month, else next month (closeDay ≤ 28), with the organization's
-    // close-day versions like the board and the settlement (PR-17, G15) — never the stored period_month.
+    // KPI period: day ≤ close day of its month → this month, else next month, with the organization's close-day
+    // versions like the board and the settlement (PR-17, G15) — never the stored period_month. 31 "Cuối tháng"
+    // (PD-032) keeps every day in its own month (no day number exceeds 31, so no clamping is needed here).
     expr: {
-      SCORES: (ctx) => `to_char(date_trunc('month', (e.business_day - ${ctx.close("e.business_day")}) + interval '1 month'), 'YYYY-MM')`,
-      TASKS: (ctx) => `to_char(date_trunc('month', (${ctx.day()} - ${ctx.close(ctx.day())}) + interval '1 month'), 'YYYY-MM')`
+      SCORES: (ctx) => kpiPeriodSql("e.business_day", ctx.close("e.business_day")),
+      TASKS: (ctx) => kpiPeriodSql(ctx.day(), ctx.close(ctx.day()))
     },
     joins: { SCORES: [], TASKS: [] },
     nullLabel: ""
@@ -551,7 +556,8 @@ export const buildReportQuery = (
     } else {
       const fromTs = startOfBusinessDay(input.from).toISOString();
       const toTs = startOfBusinessDay(addDays(input.to, 1)).toISOString();
-      where.push(`t.organization_id = ${org}`, `${anchor} >= ${params.bind(fromTs, "timestamptz")}`, `${anchor} < ${params.bind(toTs, "timestamptz")}`);
+      // Deleted lines (PD-036) are not work any more; their score rows net to zero on the SCORES side.
+      where.push(`t.organization_id = ${org}`, "t.deleted_at IS NULL", `${anchor} >= ${params.bind(fromTs, "timestamptz")}`, `${anchor} < ${params.bind(toTs, "timestamptz")}`);
     }
     for (const key of filters) {
       const spec = filterSpecs[key];

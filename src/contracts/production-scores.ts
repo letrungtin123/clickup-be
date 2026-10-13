@@ -1,15 +1,23 @@
 import { z } from "zod";
 
-import { CustomFieldFiltersSchema, IdListQuerySchema, PayModeSchema, SafeText, type KpiCloseDayVersion } from "./production-catalog.js";
+import {
+  CustomFieldFiltersSchema,
+  IdListQuerySchema,
+  KhoanPayPolicySchema,
+  PayModeSchema,
+  SafeText,
+  type KpiCloseDayVersion
+} from "./production-catalog.js";
 import { UserRefSchema } from "./work.js";
 
 /**
  * Production (Photo Retouch) scores & KPI — docs/retouch/SPEC.md Phase 3. Shared FE/BE.
  * Credits are decimals with 2 places (numbers); money is VND integers. Days are business calendar
  * days (YYYY-MM-DD, Asia/Ho_Chi_Minh). A KPI period "YYYY-MM" runs from the day after the previous
- * period's close day to this month's close day (e.g. 2026-10 = 26/09–25/10 with close day 25). Each period's
- * close day comes from settings.kpiCloseDays (a change applies from the next period): use kpiPeriodRange /
- * kpiPeriodOfDay below.
+ * period's close day to this month's close day (e.g. 2026-10 = 26/09–25/10 with close day 25). Close day 31
+ * = "Cuối tháng" (PD-032): the last day of each month, so the period is the calendar month (2026-02 = 01/02–28/02).
+ * Each period's close day comes from settings.kpiCloseDays (a change applies from the next period): use
+ * kpiPeriodRange / kpiPeriodOfDay below.
  */
 
 const Id = z.string().uuid();
@@ -52,21 +60,33 @@ export const closeDayOfPeriod = (closeDays: KpiCloseDays, period: string): numbe
   return (best ?? earliest)?.closeDay ?? 25;
 };
 
-/** Business days of a period: the day after the previous period's close day … this period's close day. */
+const daysInMonth = (period: string) => new Date(Date.UTC(Number(period.slice(0, 4)), Number(period.slice(5, 7)), 0)).getUTCDate();
+
+/**
+ * Day of the month on which a period closes: its close day clamped to the month's length, so 31 "Cuối tháng"
+ * (PD-032) is the 28th/29th in February and the 30th in 30-day months; 1–28 exist in every month.
+ */
+export const closingDayOfPeriod = (closeDays: KpiCloseDays, period: string) => Math.min(closeDayOfPeriod(closeDays, period), daysInMonth(period));
+
+/** Business days of a period: the day after the previous period's closing day … this period's closing day. */
 export const kpiPeriodRange = (period: string, closeDays: KpiCloseDays) => {
   const previous = shiftMonth(period, -1);
   return {
-    from: nextDay(`${previous}-${pad2(closeDayOfPeriod(closeDays, previous))}`),
-    to: `${period}-${pad2(closeDayOfPeriod(closeDays, period))}`
+    from: nextDay(`${previous}-${pad2(closingDayOfPeriod(closeDays, previous))}`),
+    to: `${period}-${pad2(closingDayOfPeriod(closeDays, period))}`
   };
 };
 
-/** KPI period ("YYYY-MM") of a business day: this month while the day ≤ this month's close day, else the next one. */
+/**
+ * KPI period ("YYYY-MM") of a business day: this month while the day ≤ this month's closing day, else the next one
+ * (with 31 "Cuối tháng" every day stays in its own month).
+ */
 export const kpiPeriodOfDay = (day: string, closeDays: KpiCloseDays) => {
   const period = day.slice(0, 7);
-  return Number(day.slice(8, 10)) <= closeDayOfPeriod(closeDays, period) ? period : shiftMonth(period, 1);
+  return Number(day.slice(8, 10)) <= closingDayOfPeriod(closeDays, period) ? period : shiftMonth(period, 1);
 };
 
+/** WORKER: a work line's assignee; QC: a Checking line's assignee (PD-037). */
 export const ScoreRoleSchema = z.enum(["WORKER", "QC"]);
 export type ScoreRole = z.infer<typeof ScoreRoleSchema>;
 export const KpiPeriodTypeSchema = z.enum(["MONTH", "QUARTER", "YEAR"]);
@@ -102,11 +122,15 @@ export type ScoreEntry = z.infer<typeof ScoreEntrySchema>;
 export const ScoreTotalsSchema = z.object({
   /** Credits of POINTS shifts (worker + QC): counts toward the KPI. */
   pointsOfficial: z.number(),
-  /** Credits of Khoán (MONEY_IF_KPI) shifts: money if the KPI is met at the close day, else converted to points. */
+  /**
+   * Credits of Khoán (MONEY_IF_KPI) shifts. At the close (settings.khoanPayPolicy, PD-033): ALWAYS → the money is
+   * paid, the credits never count; IF_KPI → money if the KPI is met, else converted to points.
+   */
   pointsKhoan: z.number(),
   moneyKhoanProvisional: z.number().int(),
+  /** Images of the person's own Khoán-shift lines (Checking lines included, PD-037). */
   qtyKhoan: z.number().int(),
-  /** Part of pointsOfficial earned as QC. */
+  /** Part of pointsOfficial earned as QC (POINTS-shift Checking lines, PD-037). */
   qcPoints: z.number()
 });
 export type ScoreTotals = z.infer<typeof ScoreTotalsSchema>;
@@ -172,6 +196,7 @@ export const ScoreForecastSchema = z.object({
   period: PeriodKeySchema,
   from: DateOnly,
   to: DateOnly,
+  /** Configured close day of the period (31 = "Cuối tháng"); `to` is the actual closing date. */
   closeDay: z.number().int(),
   today: DateOnly,
   /** Monthly target before leave proration. */
@@ -360,12 +385,15 @@ export const KpiSettlementRunSchema = z.object({
   period: PeriodKeySchema,
   from: DateOnly,
   to: DateOnly,
+  /** Close day the run used (31 = "Cuối tháng"). */
   closeDay: z.number().int(),
   trigger: SettlementTriggerSchema,
   /** null = the scheduler. */
   runBy: UserRefSchema.nullable(),
   reason: z.string().nullable(),
   prorateLeave: z.boolean(),
+  /** Khoán pay policy the run used (settings.khoanPayPolicy at run time; runs before PD-033 used IF_KPI). */
+  khoanPolicy: KhoanPayPolicySchema,
   userCount: z.number().int(),
   metCount: z.number().int(),
   notMetCount: z.number().int(),
@@ -403,6 +431,8 @@ export const KpiSettlementSchema = z.object({
   percent: z.number().nullable(),
   /** Vượt (+) / thiếu (−) versus the target. */
   difference: z.number().nullable(),
+  /** Khoán pay policy of the run that produced the row (PD-033). */
+  khoanPolicy: KhoanPayPolicySchema,
   runId: Id,
   runAt: IsoDate,
   note: z.string().nullable()

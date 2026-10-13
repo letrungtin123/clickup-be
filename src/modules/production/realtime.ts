@@ -2,23 +2,26 @@ import { getSql } from "../../db/client.js";
 import type { QuerySql } from "../../lib/db-types.js";
 import { logger } from "../../lib/logger.js";
 import { publishToUsers } from "../../realtime/publisher.js";
+import { loadSettings } from "./catalog.service.js";
+import { rolesWithAll } from "./job-permissions.js";
 
 /**
  * `production:changed` cache hints (ids only) after a committed production change.
  *
  * PR-20: the hint names a job and its tasks, so it is not broadcast to the organization's production room
- * (every production member). It goes to the personal rooms of the people who may see that job: holders of an
- * all-jobs role (Account / Leader / Admin, and organization superadmins = production Admin — every job leader
- * who still holds LEADER, SEC2-04) plus everyone working on or checking one of its tasks (PD-014 visibility),
- * plus `extraUserIds` — e.g. someone just taken off a task, whose lists must drop it. Members outside that set get no hint (their
+ * (every production member). It goes to the personal rooms of the people who may see that job: holders of a role whose
+ * "view" scope is "all" in the job permission matrix (PD-036; by default Account / Leader / Admin, and organization
+ * superadmins = production Admin), the job's leader while they still hold LEADER or ADMIN (SEC2-04), plus everyone
+ * working on or checking one of its live lines (PD-014 visibility), plus `extraUserIds` — e.g. someone just taken off a task, whose lists must drop it. Members outside that set get no hint (their
  * screens refresh on focus / their own changes); the client handles the event the same way whatever the room.
  */
 
 export type ProductionChangeKind = "job" | "tasks" | "feedback" | "comment";
 
 /** People allowed to see the job (see above); active organization members only. */
-export const jobAudience = async (sql: QuerySql, organizationId: string, jobId: string) =>
-  (
+export const jobAudience = async (sql: QuerySql, organizationId: string, jobId: string) => {
+  const viewAll = rolesWithAll((await loadSettings(sql, organizationId)).jobPermissions, "view");
+  return (
     await sql<{ user_id: string }[]>`
       SELECT om.user_id
       FROM public.organization_memberships om
@@ -27,15 +30,25 @@ export const jobAudience = async (sql: QuerySql, organizationId: string, jobId: 
           EXISTS (SELECT 1 FROM public.roles r WHERE r.id = om.role_id AND r.key = 'superadmin')
           OR EXISTS (
             SELECT 1 FROM production.user_roles ur
-            WHERE ur.organization_id = om.organization_id AND ur.user_id = om.user_id AND ur.role_code IN ('ADMIN', 'ACCOUNT', 'LEADER')
+            WHERE ur.organization_id = om.organization_id AND ur.user_id = om.user_id AND ur.role_code = ANY(${viewAll}::text[])
+          )
+          OR EXISTS (
+            SELECT 1 FROM production.jobs j
+            WHERE j.organization_id = om.organization_id AND j.id = ${jobId} AND j.leader_id = om.user_id
+              AND EXISTS (
+                SELECT 1 FROM production.user_roles lr
+                WHERE lr.organization_id = om.organization_id AND lr.user_id = om.user_id AND lr.role_code IN ('LEADER', 'ADMIN')
+              )
           )
           OR EXISTS (
             SELECT 1 FROM production.tasks t
-            WHERE t.organization_id = om.organization_id AND t.job_id = ${jobId} AND (t.assignee_id = om.user_id OR t.qc_id = om.user_id)
+            WHERE t.organization_id = om.organization_id AND t.job_id = ${jobId} AND t.deleted_at IS NULL
+              AND (t.assignee_id = om.user_id OR t.qc_id = om.user_id)
           )
         )
     `
   ).map((row) => row.user_id);
+};
 
 export const publishProductionChange = (
   organizationId: string,

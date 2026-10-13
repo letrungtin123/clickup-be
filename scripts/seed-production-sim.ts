@@ -2679,7 +2679,9 @@ const seedKpi = async (
           leaveDays: figure.leave,
           pointsOfficial: figure.points,
           khoanCredits: 0,
-          khoanMoneyRaw: 0
+          khoanMoneyRaw: 0,
+          // No Khoán figures here: "met" does not depend on the policy (PD-033).
+          khoanPolicy: "ALWAYS"
         });
         met += result.met ? 1 : 0;
         total += 1;

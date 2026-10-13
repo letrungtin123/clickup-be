@@ -8,7 +8,9 @@ const intervalMs = 60_000;
 
 /**
  * SPEC §8.3: at 23:59 business time on the period's close day (close-day versions, G15), each organization's period that ends
- * that day is settled automatically (run_by = null). Checked every minute, so a worker that was down
+ * that day is settled automatically (run_by = null). Close day 31 "Cuối tháng" (PD-032) closes on the month's last day
+ * (28/29 February, 30 April…): scoring.periodCloseInstant clamps it. The run uses the Khoán pay policy of the settings at
+ * that moment (PD-033) and records it. Checked every minute, so a worker that was down
  * at 23:59 catches up on its next start (within scoring.autoSettleCatchUpDays). A period is settled
  * automatically only once: any run finished at or after the close (automatic or by an Admin) counts.
  * One instance at a time per organization (transaction-scoped advisory lock shared with manual runs).

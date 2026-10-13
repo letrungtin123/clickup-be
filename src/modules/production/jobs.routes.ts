@@ -8,8 +8,13 @@ import {
   CreateProductionCommentRequestSchema,
   CreateTasksRequestSchema,
   CreateTasksResultSchema,
+  CreateWorkEntryRequestSchema,
+  DeleteJobResultSchema,
+  DeleteTaskResultSchema,
   JobChatResultSchema,
   JobDetailSchema,
+  JobOptionsQuerySchema,
+  JobOptionsSchema,
   JobPageSchema,
   JobQuerySchema,
   JobTransitionRequestSchema,
@@ -24,18 +29,33 @@ import {
   ReassignFeedbackRequestSchema,
   TransitionTaskRequestSchema,
   UpdateJobRequestSchema,
+  UpdateJobStatusRequestSchema,
   UpdateProductionCommentRequestSchema,
   UpdateProductionTaskRequestSchema,
-  UpdateTaskQtyRequestSchema
+  UpdateTaskQtyRequestSchema,
+  WorkEntryResultSchema
 } from "../../contracts/production-jobs.js";
 import { withCustomFieldFilters } from "../../contracts/production-catalog.js";
 import { requireSupabaseUser } from "../../middleware/auth.js";
 import { handle, param } from "./http.js";
 import { openJobChat } from "./job-chat.service.js";
-import { closeFeedback, createFeedback, createJob, getJobDetail, listJobs, reassignFeedback, transitionJob, updateJob } from "./jobs.service.js";
+import {
+  changeJobStatus,
+  closeFeedback,
+  createFeedback,
+  createJob,
+  deleteJob,
+  getJobDetail,
+  listJobOptions,
+  listJobs,
+  reassignFeedback,
+  transitionJob,
+  updateJob
+} from "./jobs.service.js";
 import {
   assignProductionTask,
   createProductionTasks,
+  deleteProductionTask,
   getProductionTask,
   listMyProductionTasks,
   listQcQueue,
@@ -44,6 +64,7 @@ import {
   updateProductionTaskQty
 } from "./tasks.service.js";
 import { createProductionComment, deleteProductionComment, listProductionTimeline, updateProductionComment } from "./timeline.service.js";
+import { createWorkEntry } from "./work-entries.service.js";
 
 /** Production jobs, tasks, feedback and comments — SPEC Phase 2. Every handler enforces production roles. */
 export const createProductionJobRoutes = (): ExpressRouter => {
@@ -53,11 +74,19 @@ export const createProductionJobRoutes = (): ExpressRouter => {
   // Jobs
   routes.get("/production/jobs", handle(async (context, req) => JobPageSchema.parse(await listJobs(context, JobQuerySchema.parse(withCustomFieldFilters(req.query))))));
   routes.post("/production/jobs", handle(async (context, req) => JobDetailSchema.parse(await createJob(context, CreateJobRequestSchema.parse(req.body))), 201));
+  // "Gói công việc" picker of "Nhập công việc" (PD-038); registered before /production/jobs/:jobId.
+  routes.get("/production/jobs/options", handle(async (context, req) => JobOptionsSchema.parse(await listJobOptions(context, JobOptionsQuerySchema.parse(req.query)))));
   routes.get("/production/jobs/:jobId", handle(async (context, req) => JobDetailSchema.parse(await getJobDetail(context, param(req, "jobId")))));
   routes.patch(
     "/production/jobs/:jobId",
     handle(async (context, req) => JobDetailSchema.parse(await updateJob(context, param(req, "jobId"), UpdateJobRequestSchema.parse(req.body))))
   );
+  // Manual job status (PD-038).
+  routes.patch(
+    "/production/jobs/:jobId/status",
+    handle(async (context, req) => JobDetailSchema.parse(await changeJobStatus(context, param(req, "jobId"), UpdateJobStatusRequestSchema.parse(req.body))))
+  );
+  routes.delete("/production/jobs/:jobId", handle(async (context, req) => DeleteJobResultSchema.parse(await deleteJob(context, param(req, "jobId")))));
   routes.post(
     "/production/jobs/:jobId/tasks",
     handle(
@@ -95,6 +124,12 @@ export const createProductionJobRoutes = (): ExpressRouter => {
     )
   );
 
+  // "Nhập công việc": one work-log row (PD-035)
+  routes.post(
+    "/production/work-entries",
+    handle(async (context, req) => WorkEntryResultSchema.parse(await createWorkEntry(context, CreateWorkEntryRequestSchema.parse(req.body))), 201)
+  );
+
   // Tasks
   routes.get(
     "/production/tasks/mine",
@@ -110,6 +145,10 @@ export const createProductionJobRoutes = (): ExpressRouter => {
     handle(async (context, req) =>
       ProductionTaskSchema.parse(await updateProductionTask(context, param(req, "taskId"), UpdateProductionTaskRequestSchema.parse(req.body)))
     )
+  );
+  routes.delete(
+    "/production/tasks/:taskId",
+    handle(async (context, req) => DeleteTaskResultSchema.parse(await deleteProductionTask(context, param(req, "taskId"))))
   );
   routes.post(
     "/production/tasks/:taskId/transition",

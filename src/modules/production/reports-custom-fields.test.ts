@@ -141,12 +141,24 @@ describe("G15 — the KPI period dimension and presets follow the close-day vers
 
   it("several versions: a CASE on the day's month (one version keeps the single bound day)", () => {
     const query = buildReportQuery(config({ dimensions: ["period"], measures: ["points"] }), { organizationId: org, from: "2026-10-01", to: "2026-12-20", closeDay: versions });
-    expect(query.text).toMatch(/\(e\.business_day - \(CASE WHEN e\.business_day >= \$\d+::date THEN \$\d+::int ELSE \$\d+::int END\)\) \+ interval '1 month'/);
+    expect(query.text).toMatch(/extract\(day FROM e\.business_day\) <= \(CASE WHEN e\.business_day >= \$\d+::date THEN \$\d+::int ELSE \$\d+::int END\) THEN/);
     expect(query.params).toContain("2026-11-01");
     expect(query.params).toContain(20);
     expect(query.params).toContain(25);
     const single = buildReportQuery(config({ dimensions: ["period"], measures: ["points"] }), { organizationId: org, from: "2026-10-01", to: "2026-10-20", closeDay: [{ fromPeriod: null, closeDay: 25 }] });
-    expect(single.text).toMatch(/\(e\.business_day - \$\d+::int\) \+ interval '1 month'/);
+    expect(single.text).toMatch(/extract\(day FROM e\.business_day\) <= \$\d+::int THEN/);
+  });
+
+  it("PD-032: close day 31 “Cuối tháng” is bound like any day (every day ≤ 31 stays in its month); presets are calendar months", () => {
+    const endOfMonth = [
+      { fromPeriod: null, closeDay: 25 },
+      { fromPeriod: "2026-11", closeDay: 31 }
+    ];
+    const query = buildReportQuery(config({ dimensions: ["period"], measures: ["points"] }), { organizationId: org, from: "2026-10-01", to: "2026-12-31", closeDay: endOfMonth });
+    expect(query.params).toContain(31);
+    expect(query.params).toContain("2026-11-01");
+    expect(presetRange("THIS_PERIOD", "2026-12-31", endOfMonth)).toEqual({ from: "2026-12-01", to: "2026-12-31" });
+    expect(presetRange("LAST_PERIOD", "2026-12-05", endOfMonth)).toEqual({ from: "2026-10-26", to: "2026-11-30" });
   });
 
   it("THIS_PERIOD / LAST_PERIOD presets", () => {

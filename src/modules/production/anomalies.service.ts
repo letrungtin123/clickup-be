@@ -39,7 +39,8 @@ const taskRef = (row: TaskCols) => ({ id: row.task_id, number: Number(row.task_n
 
 type ReviewRow = { kind: AnomalyKind; subject_key: string; reviewed_at: Date; note: string | null; reviewer: UserCols | null };
 
-const leaderScope = (sql: QuerySql, leaderId: string | null) => (leaderId ? sql`AND j.leader_id = ${leaderId}` : sql``);
+/** A Leader's jobs: the ones they lead and the ones without a leader (every Leader leads those, PD-035). */
+const leaderScope = (sql: QuerySql, leaderId: string | null) => (leaderId ? sql`AND (j.leader_id = ${leaderId} OR j.leader_id IS NULL)` : sql``);
 
 type Draft = Omit<Anomaly, "reviewed"> & { reviewed?: never };
 
@@ -64,7 +65,7 @@ const queryQtyMismatch = async (sql: QuerySql, organizationId: string, since: Da
       LIMIT 1
     ) lg ON true
     LEFT JOIN public.app_users uc ON uc.id = lg.user_id
-    WHERE t.organization_id = ${organizationId} AND t.done_at >= ${since} AND t.qty_done IS NOT NULL AND t.qty_done <> t.qty_assigned
+    WHERE t.organization_id = ${organizationId} AND t.deleted_at IS NULL AND t.done_at >= ${since} AND t.qty_done IS NOT NULL AND t.qty_done <> t.qty_assigned
       ${leaderScope(sql, leaderId)} ${subjectId ? sql`AND t.id = ${subjectId}` : sql``}
     ORDER BY t.done_at DESC, t.id
     LIMIT ${perKindLimit + 1}
@@ -95,7 +96,7 @@ const queryQcFailRepeat = async (sql: QuerySql, organizationId: string, since: D
     JOIN production.jobs j ON j.organization_id = t.organization_id AND j.id = t.job_id
     JOIN production.statuses s ON s.organization_id = t.organization_id AND s.id = t.status_id
     JOIN public.app_users ua ON ua.id = t.assignee_id
-    WHERE t.organization_id = ${organizationId} AND t.done_at >= ${since} AND t.qc_fail_count >= 2
+    WHERE t.organization_id = ${organizationId} AND t.deleted_at IS NULL AND t.done_at >= ${since} AND t.qc_fail_count >= 2
       ${leaderScope(sql, leaderId)} ${subjectId ? sql`AND t.id = ${subjectId}` : sql``}
     ORDER BY t.updated_at DESC, t.id
     LIMIT ${perKindLimit + 1}
@@ -133,7 +134,7 @@ const queryWorkerFailRate = async (
         max(t.done_at) AS last_done
       FROM production.tasks t
       JOIN production.jobs j ON j.organization_id = t.organization_id AND j.id = t.job_id
-      WHERE t.organization_id = ${organizationId} AND t.done_at >= ${since} ${leaderScope(sql, leaderId)}
+      WHERE t.organization_id = ${organizationId} AND t.deleted_at IS NULL AND t.done_at >= ${since} ${leaderScope(sql, leaderId)}
         ${subjectId ? sql`AND t.assignee_id = ${subjectId}` : sql``}
       GROUP BY t.assignee_id
     ) a
@@ -165,7 +166,7 @@ const queryFastDone = async (sql: QuerySql, organizationId: string, since: Date,
     FROM production.tasks t
     JOIN production.jobs j ON j.organization_id = t.organization_id AND j.id = t.job_id
     JOIN public.app_users ua ON ua.id = t.assignee_id
-    WHERE t.organization_id = ${organizationId} AND t.done_at >= ${since}
+    WHERE t.organization_id = ${organizationId} AND t.deleted_at IS NULL AND t.done_at >= ${since}
       AND t.done_at <= t.assigned_at + make_interval(mins => ${fastDoneMinutes})
       ${leaderScope(sql, leaderId)} ${subjectId ? sql`AND t.id = ${subjectId}` : sql``}
     ORDER BY t.done_at DESC, t.id
@@ -197,7 +198,7 @@ const queryMissingRule = async (sql: QuerySql, organizationId: string, since: Da
     JOIN production.projects p ON p.organization_id = e.organization_id AND p.id = e.project_id
     LEFT JOIN production.processes pr ON pr.organization_id = e.organization_id AND pr.id = e.process_id
     JOIN public.app_users u ON u.id = e.user_id
-    WHERE e.organization_id = ${organizationId} AND e.credit_rule_id IS NULL AND e.adjusts_entry_id IS NULL
+    WHERE e.organization_id = ${organizationId} AND t.deleted_at IS NULL AND e.credit_rule_id IS NULL AND e.adjusts_entry_id IS NULL
       AND e.created_at >= ${since} AND e.kind <> 'FB_WRONG'
       ${leaderScope(sql, leaderId)} ${subjectId ? sql`AND e.id = ${subjectId}` : sql``}
     ORDER BY e.created_at DESC, e.id
@@ -335,7 +336,7 @@ const resolveOwnAnomaly = async (sql: QuerySql, context: AccessContext, kind: An
       SELECT t.done_at, t.kind = 'FB_WRONG' AS fb_wrong, t.qc_fail_count > 0 AS qc_failed
       FROM production.tasks t
       JOIN production.jobs j ON j.organization_id = t.organization_id AND j.id = t.job_id
-      WHERE t.organization_id = ${organizationId} AND t.assignee_id = ${subjectId} AND t.done_at >= ${since} ${leaderScope(sql, leaderId)}
+      WHERE t.organization_id = ${organizationId} AND t.deleted_at IS NULL AND t.assignee_id = ${subjectId} AND t.done_at >= ${since} ${leaderScope(sql, leaderId)}
     `;
     const samples = rows.map((row) => ({ doneAt: row.done_at, fbWrong: row.fb_wrong, qcFailed: row.qc_failed }));
     if (!workerFailRateKeys(subjectId, samples, now, threshold).has(key)) {

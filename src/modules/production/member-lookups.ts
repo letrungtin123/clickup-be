@@ -1,5 +1,7 @@
+import type { JobStatusRef } from "../../contracts/production-jobs.js";
 import type { QuerySql } from "../../lib/db-types.js";
 import { toIso } from "../../lib/db-types.js";
+import { toColor } from "../work/mappers.js";
 
 /**
  * Small read helpers shared by the notification handlers (worker) and the production user administration (API).
@@ -26,8 +28,8 @@ export type LedJob = {
   code: string;
   name: string | null;
   deadline: string;
-  statusCode: string | null;
-  statusName: string | null;
+  /** Manual job status (PD-038). */
+  jobStatus: JobStatusRef;
   taskCount: number;
 };
 
@@ -35,7 +37,7 @@ export type LedJobs = {
   displayName: string;
   /** The person still holds LEADER or ADMIN as an active member (or is superadmin): their jobs are fine. */
   leaderActive: boolean;
-  /** Open jobs (not archived, not in a terminal status) whose `leader_id` is the person, by deadline. */
+  /** Open jobs (not archived, not deleted, manual status not closed — PD-038) whose `leader_id` is the person, by deadline. */
   items: LedJob[];
 };
 
@@ -60,14 +62,25 @@ export const listOpenJobsLedBy = async (sql: QuerySql, organizationId: string, u
     FROM public.app_users au WHERE au.id = ${userId}
   `;
   const rows = await sql<
-    { id: string; code: string; name: string | null; deadline: Date; status_code: string | null; status_name: string | null; task_count: number }[]
+    {
+      id: string;
+      code: string;
+      name: string | null;
+      deadline: Date;
+      job_status_id: string;
+      job_status_name: string;
+      job_status_color: string;
+      job_status_closed: boolean;
+      task_count: number;
+    }[]
   >`
-    SELECT j.id, j.code, j.name, j.deadline, s.code AS status_code, s.name AS status_name,
-      (SELECT count(*)::int FROM production.tasks t WHERE t.organization_id = j.organization_id AND t.job_id = j.id) AS task_count
+    SELECT j.id, j.code, j.name, j.deadline,
+      js.id AS job_status_id, js.name AS job_status_name, js.color AS job_status_color, js.is_closed AS job_status_closed,
+      (SELECT count(*)::int FROM production.tasks t WHERE t.organization_id = j.organization_id AND t.job_id = j.id AND t.deleted_at IS NULL) AS task_count
     FROM production.jobs j
-    LEFT JOIN production.statuses s ON s.organization_id = j.organization_id AND s.id = j.status_id
-    WHERE j.organization_id = ${organizationId} AND j.leader_id = ${userId} AND j.archived_at IS NULL
-      AND (s.id IS NULL OR NOT s.is_terminal)
+    JOIN production.job_statuses js ON js.organization_id = j.organization_id AND js.id = j.job_status_id
+    WHERE j.organization_id = ${organizationId} AND j.leader_id = ${userId} AND j.archived_at IS NULL AND j.deleted_at IS NULL
+      AND NOT js.is_closed
     ORDER BY j.deadline, j.id
     LIMIT 500
   `;
@@ -79,8 +92,7 @@ export const listOpenJobsLedBy = async (sql: QuerySql, organizationId: string, u
       code: row.code,
       name: row.name,
       deadline: toIso(row.deadline),
-      statusCode: row.status_code,
-      statusName: row.status_name,
+      jobStatus: { id: row.job_status_id, name: row.job_status_name, color: toColor(row.job_status_color), isClosed: row.job_status_closed },
       taskCount: row.task_count
     }))
   };

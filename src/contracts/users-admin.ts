@@ -1,6 +1,7 @@
 import { z } from "zod";
 
 import { ProductionMemberSchema, ProductionRoleSchema, UpdateProductionMemberRequestSchema } from "./production-catalog.js";
+import { JobStatusRefSchema } from "./production-jobs.js";
 import { AccountEmailSchema, SafeLineSchema, TemporaryPasswordResponseSchema } from "./schemas.js";
 
 /**
@@ -52,14 +53,13 @@ export const UpdateProductionUserRequestSchema = UpdateProductionMemberRequestSc
 );
 export type UpdateProductionUserRequest = z.infer<typeof UpdateProductionUserRequestSchema>;
 
-/** An open job (not archived, not in a terminal status) whose leader is the person. */
+/** An open job (not archived, not deleted, its manual status not closed — PD-038) whose leader is the person. */
 export const LedJobSchema = z.object({
   id: Id,
   code: z.string(),
   name: z.string().nullable(),
   deadline: IsoDate,
-  statusCode: z.string().nullable(),
-  statusName: z.string().nullable(),
+  jobStatus: JobStatusRefSchema,
   taskCount: z.number().int()
 });
 export type LedJob = z.infer<typeof LedJobSchema>;

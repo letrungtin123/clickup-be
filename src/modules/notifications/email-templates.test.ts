@@ -135,7 +135,7 @@ describe("templates", () => {
     expect(qc.headline).toBe("Task JOB-2026-001 #3 không đạt QC");
     expect(qc.excerpt).toBe("Da chưa mịn");
     expect(qc.facts).toContainEqual({ label: "Số lượng", value: "20 tấm" });
-    expect(qc.facts).toContainEqual({ label: "Deadline", value: "17:00, 10/10/2026" });
+    expect(qc.facts).toContainEqual({ label: "Ngày giao", value: "17:00, 10/10/2026" });
     expect(qc.link).toBe(`${base}/production/tasks/${ids.productionTask}`);
     expect(
       renderNotificationSection(make({ type: "production.qty_changed", actorName: "Leader A", payload: productionPayload }), base).headline

@@ -12,8 +12,12 @@ import {
   CreditMatrixSchema,
   CreditRuleHistorySchema,
   CreditVersionResultSchema,
+  CreateJobStatusRequestSchema,
   CustomFieldCollectionSchema,
   CustomFieldEntitySchema,
+  DeleteJobStatusQuerySchema,
+  DeleteJobStatusResultSchema,
+  JobStatusCollectionSchema,
   NewCreditVersionRequestSchema,
   NotificationPreferencesSchema,
   ProcessCollectionSchema,
@@ -24,6 +28,7 @@ import {
   ProductionProjectCollectionSchema,
   ProductionSettingsSchema,
   ReorderCatalogRequestSchema,
+  ReorderJobStatusesRequestSchema,
   ReorderStatusesRequestSchema,
   ReplaceTransitionsRequestSchema,
   SetCreditRuleRequestSchema,
@@ -31,6 +36,7 @@ import {
   StatusWorkflowSchema,
   TagCollectionSchema,
   TeamCollectionSchema,
+  UpdateJobStatusRequestSchema,
   UpdateNotificationPreferencesRequestSchema,
   UpdateProductionMemberRequestSchema,
   UpdateProductionSettingsRequestSchema,
@@ -50,6 +56,7 @@ import { handle, param } from "./http.js";
 import {
   addAllowedEmails,
   createCreditVersion,
+  deleteProcess,
   getCreditHistory,
   getCreditMatrix,
   getNotificationPreferences,
@@ -84,6 +91,7 @@ import {
   upsertTag,
   upsertTeam
 } from "./catalog.service.js";
+import { createJobStatus, deleteJobStatus, listJobStatuses, reorderJobStatuses, updateJobStatus } from "./job-statuses.service.js";
 
 const DayQuery = z.object({ at: z.string().optional() });
 const HistoryQuery = z.object({ projectId: z.string().uuid(), processId: z.string().uuid() });
@@ -212,6 +220,10 @@ export const createProductionRoutes = (): ExpressRouter => {
       )
     )
   );
+  routes.delete(
+    "/production/processes/:processId",
+    handle(async (context, req) => ProcessCollectionSchema.parse(await deleteProcess(context, param(req, "processId"))))
+  );
   routes.get("/production/shifts", handle(async (context) => ShiftCollectionSchema.parse(await listShifts(context))));
   routes.post(
     "/production/shifts",
@@ -327,6 +339,33 @@ export const createProductionRoutes = (): ExpressRouter => {
     "/production/tags/:tagId",
     handle(async (context, req) =>
       TagCollectionSchema.parse(await upsertTag(context, param(req, "tagId"), patchBody(UpsertTagRequestSchema, byId((await listTags(context)).items, param(req, "tagId")), req.body)))
+    )
+  );
+
+  // Manual job statuses (PD-038): read by every member, edited by ADMIN. "order" before ":statusId".
+  routes.get("/production/job-statuses", handle(async (context) => JobStatusCollectionSchema.parse(await listJobStatuses(context))));
+  routes.post(
+    "/production/job-statuses",
+    handle(async (context, req) => JobStatusCollectionSchema.parse(await createJobStatus(context, CreateJobStatusRequestSchema.parse(req.body))), 201)
+  );
+  routes.put(
+    "/production/job-statuses/order",
+    handle(async (context, req) =>
+      JobStatusCollectionSchema.parse(await reorderJobStatuses(context, ReorderJobStatusesRequestSchema.parse(req.body).ids))
+    )
+  );
+  routes.patch(
+    "/production/job-statuses/:statusId",
+    handle(async (context, req) =>
+      JobStatusCollectionSchema.parse(await updateJobStatus(context, param(req, "statusId"), UpdateJobStatusRequestSchema.parse(req.body)))
+    )
+  );
+  routes.delete(
+    "/production/job-statuses/:statusId",
+    handle(async (context, req) =>
+      DeleteJobStatusResultSchema.parse(
+        await deleteJobStatus(context, param(req, "statusId"), DeleteJobStatusQuerySchema.parse(req.query).replacementId)
+      )
     )
   );
 

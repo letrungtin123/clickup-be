@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   computeAdjustment,
-  computeQcEntry,
+  computeLineEntry,
   computeWorkerEntry,
   countWorkingDays,
   effectiveTarget,
@@ -20,7 +20,7 @@ import {
   rollupKpi,
   rollupKpiPeriod,
   rollupKey,
-  rolesToRecord,
+  lineScoreRole,
   settlePeriod,
   settleUser,
   shouldAutoSettle,
@@ -40,7 +40,7 @@ const prjaNormal: RuleSnapshot = { id: "rule-prja-normal", creditPerImage: 3, mo
 const prjaChecking: RuleSnapshot = { id: "rule-prja-checking", creditPerImage: 0.5, moneyPerImage: null };
 const prjbLight: RuleSnapshot = { id: "rule-prjb-light", creditPerImage: 1, moneyPerImage: null };
 
-describe("computeWorkerEntry / computeQcEntry (SPEC §5.6)", () => {
+describe("computeWorkerEntry / computeLineEntry (SPEC §5.6, PD-037)", () => {
   it("PRJA Normal Retouch 10 images, official shift → WORKER 30.00 credits, 0 money", () => {
     expect(computeWorkerEntry({ rule: prjaNormal, qtyDone: 10, payMode: "POINTS", kind: "NORMAL" })).toEqual({
       role: "WORKER",
@@ -59,8 +59,8 @@ describe("computeWorkerEntry / computeQcEntry (SPEC §5.6)", () => {
     expect(entry).toMatchObject({ role: "WORKER", payMode: "MONEY_IF_KPI", credits: 30, money: 150000, unitMoney: 15000 });
   });
 
-  it("PRJA Checking 10 images → QC 5.00 credits, never money, always POINTS", () => {
-    expect(computeQcEntry({ rule: prjaChecking, qtyDone: 10, kind: "NORMAL" })).toEqual({
+  it("PRJA Checking line of 10 images, official shift → QC 5.00 credits, POINTS (PD-037)", () => {
+    expect(computeLineEntry({ role: "QC", rule: prjaChecking, qtyDone: 10, payMode: "POINTS", kind: "NORMAL" })).toEqual({
       role: "QC",
       payMode: "POINTS",
       creditRuleId: "rule-prja-checking",
@@ -70,8 +70,24 @@ describe("computeWorkerEntry / computeQcEntry (SPEC §5.6)", () => {
       credits: 5,
       money: 0
     });
-    // Even if a QC rule carried a price, QC credit has no money (PD-010).
-    expect(computeQcEntry({ rule: { ...prjaChecking, moneyPerImage: 999 }, qtyDone: 10, kind: "NORMAL" }).money).toBe(0);
+  });
+
+  it("a Checking line follows its shift like a work line: Khoán points on a Khoán shift, money only if priced", () => {
+    expect(computeLineEntry({ role: "QC", rule: prjaChecking, qtyDone: 10, payMode: "MONEY_IF_KPI", kind: "NORMAL" })).toMatchObject({
+      role: "QC",
+      payMode: "MONEY_IF_KPI",
+      credits: 5,
+      money: 0
+    });
+    expect(computeLineEntry({ role: "QC", rule: { ...prjaChecking, moneyPerImage: 1000 }, qtyDone: 10, payMode: "MONEY_IF_KPI", kind: "NORMAL" }).money).toBe(10000);
+    // Khoán Checking credits stay outside the official total, like the Excel.
+    const khoan = computeLineEntry({ role: "QC", rule: prjaChecking, qtyDone: 10, payMode: "MONEY_IF_KPI", kind: "NORMAL" });
+    expect(totals([{ businessDay: "2026-10-12", role: "QC", payMode: khoan.payMode, credits: khoan.credits, money: khoan.money, qty: 10, projectId: "p", projectCode: "PRJA" }])).toMatchObject({
+      pointsOfficial: 0,
+      pointsKhoan: 5,
+      qtyKhoan: 10,
+      qcPoints: 0
+    });
   });
 
   it("PRJB Light Retouch 4 images, Khoán shift, no price → 4.00 credits, 0 money", () => {
@@ -91,7 +107,7 @@ describe("computeWorkerEntry / computeQcEntry (SPEC §5.6)", () => {
       unitMoney: 0,
       creditRuleId: "rule-prja-normal"
     });
-    expect(computeQcEntry({ rule: prjaChecking, qtyDone: 5, kind: "FB_WRONG" })).toMatchObject({ qty: 5, credits: 0, money: 0 });
+    expect(computeLineEntry({ role: "QC", rule: prjaChecking, qtyDone: 5, payMode: "POINTS", kind: "FB_WRONG" })).toMatchObject({ qty: 5, credits: 0, money: 0 });
   });
 
   it("FB_EXTRA is priced like a normal task", () => {
@@ -109,7 +125,7 @@ describe("computeWorkerEntry / computeQcEntry (SPEC §5.6)", () => {
       credits: 0,
       money: 0
     });
-    expect(computeQcEntry({ rule: null, qtyDone: 7, kind: "NORMAL" })).toMatchObject({ creditRuleId: null, credits: 0 });
+    expect(computeLineEntry({ role: "QC", rule: null, qtyDone: 7, payMode: "POINTS", kind: "NORMAL" })).toMatchObject({ creditRuleId: null, credits: 0 });
   });
 
   it("keeps exact 2-decimal credits (no float drift)", () => {
@@ -119,29 +135,17 @@ describe("computeWorkerEntry / computeQcEntry (SPEC §5.6)", () => {
   });
 });
 
-describe("rolesToRecord — first entry only (SPEC §5.2)", () => {
-  it("Done writes WORKER; Checked writes QC when the task has a QC", () => {
-    expect(rolesToRecord({ countsDone: true, countsChecked: false, hasQc: true, recorded: new Set() })).toEqual(["WORKER"]);
-    expect(rolesToRecord({ countsDone: false, countsChecked: true, hasQc: true, recorded: new Set(["WORKER"]) })).toEqual(["QC"]);
-    expect(rolesToRecord({ countsDone: false, countsChecked: true, hasQc: false, recorded: new Set(["WORKER"]) })).toEqual([]);
-    expect(rolesToRecord({ countsDone: false, countsChecked: false, hasQc: true, recorded: new Set() })).toEqual([]);
-  });
-
-  it("QC fail → Done again: no second entry", () => {
-    // Done (WORKER recorded) → Waiting QC → QC fail → Processing → Done again.
-    expect(rolesToRecord({ countsDone: true, countsChecked: false, hasQc: true, recorded: new Set(["WORKER"]) })).toEqual([]);
-    expect(rolesToRecord({ countsDone: false, countsChecked: true, hasQc: true, recorded: new Set(["WORKER", "QC"]) })).toEqual([]);
-  });
-
-  it("a status flagged both done and checked records both once", () => {
-    expect(rolesToRecord({ countsDone: true, countsChecked: true, hasQc: true, recorded: new Set() })).toEqual(["WORKER", "QC"]);
+describe("lineScoreRole — the role of a line's entry (PD-037)", () => {
+  it("a Checking line (QC process) records QC; any other line WORKER", () => {
+    expect(lineScoreRole(true)).toBe("QC");
+    expect(lineScoreRole(false)).toBe("WORKER");
   });
 });
 
 describe("computeAdjustment — Leader edits qty after Done (SPEC §5.2)", () => {
   it("qty 10 → 8: −6.00 WORKER credits, −1.00 QC credits", () => {
     const worker = computeWorkerEntry({ rule: prjaNormal, qtyDone: 10, payMode: "POINTS", kind: "NORMAL" });
-    const qc = computeQcEntry({ rule: prjaChecking, qtyDone: 10, kind: "NORMAL" });
+    const qc = computeLineEntry({ role: "QC", rule: prjaChecking, qtyDone: 10, payMode: "POINTS", kind: "NORMAL" });
     expect(computeAdjustment(worker, 10, 8)).toEqual({ qty: -2, credits: -6, money: 0 });
     expect(computeAdjustment(qc, 10, 8)).toEqual({ qty: -2, credits: -1, money: 0 });
   });
@@ -247,7 +251,8 @@ describe("summarize", () => {
       { day: "2026-10-03", pointsOfficial: -0.7, pointsKhoan: 4 }
     ]);
     expect(summary.byProject).toEqual([
-      { projectId: "p-a", projectCode: "PRJA", pointsOfficial: 29.3, pointsKhoan: 30, qty: 20 },
+      // Every entry is the person's own line since PD-037, so the Checking line's images count too.
+      { projectId: "p-a", projectCode: "PRJA", pointsOfficial: 29.3, pointsKhoan: 30, qty: 30 },
       { projectId: "p-b", projectCode: "PRJB", pointsOfficial: 0, pointsKhoan: 4, qty: 4 }
     ]);
     expect(summary.pointsOfficial).toBe(29.3);
@@ -394,10 +399,12 @@ describe("rankByPoints", () => {
 // Phase 6 — KPI settlement on the close day (SPEC §8, PLAN §6) ------------------------------------------
 
 const base = { prorateLeave: false, workingDays: 25, leaveDays: 0 };
+const ifKpi = { ...base, khoanPolicy: "IF_KPI" as const };
+const always = { ...base, khoanPolicy: "ALWAYS" as const };
 
-describe("settleUser (SPEC §8.6)", () => {
+describe("settleUser — policy IF_KPI: Khoán paid only when the KPI is met (SPEC §8.6)", () => {
   it("target 100, official 120, Khoán 30 credits / 150 000 → met, money paid, nothing converted", () => {
-    expect(settleUser({ ...base, targetBase: 100, pointsOfficial: 120, khoanCredits: 30, khoanMoneyRaw: 150000 })).toEqual({
+    expect(settleUser({ ...ifKpi, targetBase: 100, pointsOfficial: 120, khoanCredits: 30, khoanMoneyRaw: 150000 })).toEqual({
       targetBase: 100,
       target: 100,
       prorateLeave: false,
@@ -407,6 +414,7 @@ describe("settleUser (SPEC §8.6)", () => {
       met: true,
       khoanCredits: 30,
       khoanMoneyRaw: 150000,
+      khoanPolicy: "IF_KPI",
       khoanMoney: 150000,
       khoanPointsConverted: 0,
       totalPoints: 120,
@@ -416,7 +424,7 @@ describe("settleUser (SPEC §8.6)", () => {
   });
 
   it("target 100, official 80, Khoán 30 → not met, money 0, 30 converted, KPI total 110", () => {
-    expect(settleUser({ ...base, targetBase: 100, pointsOfficial: 80, khoanCredits: 30, khoanMoneyRaw: 150000 })).toMatchObject({
+    expect(settleUser({ ...ifKpi, targetBase: 100, pointsOfficial: 80, khoanCredits: 30, khoanMoneyRaw: 150000 })).toMatchObject({
       met: false,
       khoanMoney: 0,
       khoanPointsConverted: 30,
@@ -427,7 +435,7 @@ describe("settleUser (SPEC §8.6)", () => {
   });
 
   it("no target → met (Khoán money paid)", () => {
-    expect(settleUser({ ...base, targetBase: null, pointsOfficial: 0, khoanCredits: 12.5, khoanMoneyRaw: 40000 })).toMatchObject({
+    expect(settleUser({ ...ifKpi, targetBase: null, pointsOfficial: 0, khoanCredits: 12.5, khoanMoneyRaw: 40000 })).toMatchObject({
       target: null,
       met: true,
       khoanMoney: 40000,
@@ -439,17 +447,81 @@ describe("settleUser (SPEC §8.6)", () => {
   });
 
   it("exactly on target is met; official points only decide (Khoán credits never count toward 'met')", () => {
-    expect(settleUser({ ...base, targetBase: 100, pointsOfficial: 100, khoanCredits: 0, khoanMoneyRaw: 0 }).met).toBe(true);
-    expect(settleUser({ ...base, targetBase: 100, pointsOfficial: 99.99, khoanCredits: 50, khoanMoneyRaw: 1 }).met).toBe(false);
+    expect(settleUser({ ...ifKpi, targetBase: 100, pointsOfficial: 100, khoanCredits: 0, khoanMoneyRaw: 0 }).met).toBe(true);
+    expect(settleUser({ ...ifKpi, targetBase: 100, pointsOfficial: 99.99, khoanCredits: 50, khoanMoneyRaw: 1 }).met).toBe(false);
   });
 
   it("leave proration (Mon–Sat working days, half days allowed) only when enabled", () => {
-    const prorated = settleUser({ targetBase: 2600, prorateLeave: true, workingDays: 25, leaveDays: 2.5, pointsOfficial: 2400, khoanCredits: 0, khoanMoneyRaw: 0 });
+    const prorated = settleUser({ ...ifKpi, targetBase: 2600, prorateLeave: true, leaveDays: 2.5, pointsOfficial: 2400, khoanCredits: 0, khoanMoneyRaw: 0 });
     expect(prorated).toMatchObject({ targetBase: 2600, target: 2340, met: true, leaveDays: 2.5 });
-    expect(settleUser({ targetBase: 2600, prorateLeave: false, workingDays: 25, leaveDays: 2.5, pointsOfficial: 2400, khoanCredits: 0, khoanMoneyRaw: 0 })).toMatchObject({
+    expect(settleUser({ ...ifKpi, targetBase: 2600, leaveDays: 2.5, pointsOfficial: 2400, khoanCredits: 0, khoanMoneyRaw: 0 })).toMatchObject({
       target: 2600,
       met: false
     });
+  });
+});
+
+describe("settleUser — policy ALWAYS: Khoán money always paid, like the Excel (PD-033)", () => {
+  it("not met → the money is still paid, nothing is converted, the KPI total is the official points", () => {
+    expect(settleUser({ ...always, targetBase: 100, pointsOfficial: 80, khoanCredits: 30, khoanMoneyRaw: 150000 })).toEqual({
+      targetBase: 100,
+      target: 100,
+      prorateLeave: false,
+      workingDays: 25,
+      leaveDays: 0,
+      pointsOfficial: 80,
+      met: false,
+      khoanCredits: 30,
+      khoanMoneyRaw: 150000,
+      khoanPolicy: "ALWAYS",
+      khoanMoney: 150000,
+      khoanPointsConverted: 0,
+      totalPoints: 80,
+      percent: 80,
+      difference: -20
+    });
+  });
+
+  it("met, or no target → money paid, nothing converted (same as IF_KPI)", () => {
+    const met = { targetBase: 100, pointsOfficial: 120, khoanCredits: 30, khoanMoneyRaw: 150000 };
+    expect(settleUser({ ...always, ...met })).toEqual({ ...settleUser({ ...ifKpi, ...met }), khoanPolicy: "ALWAYS" });
+    expect(settleUser({ ...always, targetBase: null, pointsOfficial: 0, khoanCredits: 12.5, khoanMoneyRaw: 40000 })).toMatchObject({
+      met: true,
+      khoanMoney: 40000,
+      khoanPointsConverted: 0,
+      totalPoints: 0
+    });
+  });
+
+  it("met = official points (Chính thức + OT + QC) ≥ target: Khoán credits never help, even when they would reach it", () => {
+    const result = settleUser({ ...always, targetBase: 100, pointsOfficial: 99.99, khoanCredits: 500, khoanMoneyRaw: 2_500_000 });
+    expect(result).toMatchObject({ met: false, khoanMoney: 2_500_000, khoanPointsConverted: 0, totalPoints: 99.99, percent: 99.99, difference: -0.01 });
+    expect(settleUser({ ...always, targetBase: 100, pointsOfficial: 100, khoanCredits: 0, khoanMoneyRaw: 0 }).met).toBe(true);
+  });
+
+  it("leave proration applies the same way", () => {
+    expect(settleUser({ ...always, targetBase: 2600, prorateLeave: true, leaveDays: 2.5, pointsOfficial: 2300, khoanCredits: 10, khoanMoneyRaw: 50000 })).toMatchObject({
+      target: 2340,
+      met: false,
+      khoanMoney: 50000,
+      khoanPointsConverted: 0,
+      totalPoints: 2300
+    });
+  });
+
+  it("the two policies differ only for people who miss the KPI with Khoán work", () => {
+    const cases = [
+      { targetBase: 100, pointsOfficial: 120, khoanCredits: 30, khoanMoneyRaw: 150000 },
+      { targetBase: null, pointsOfficial: 5, khoanCredits: 30, khoanMoneyRaw: 150000 },
+      { targetBase: 100, pointsOfficial: 40, khoanCredits: 0, khoanMoneyRaw: 0 },
+      { targetBase: 100, pointsOfficial: 40, khoanCredits: 30, khoanMoneyRaw: 150000 }
+    ];
+    const differs = cases.map((input) => {
+      const a = settleUser({ ...always, ...input });
+      const b = settleUser({ ...ifKpi, ...input });
+      return a.met === b.met && (a.khoanMoney !== b.khoanMoney || a.totalPoints !== b.totalPoints);
+    });
+    expect(differs).toEqual([false, false, false, true]);
   });
 });
 
@@ -460,21 +532,30 @@ describe("settlePeriod", () => {
   ];
 
   it("uses the target effective for the period and the period's working days; re-running gives the same result", () => {
-    const first = settlePeriod({ period: "2026-10", closeDay: 25, prorateLeave: false, users });
+    const first = settlePeriod({ period: "2026-10", closeDay: 25, prorateLeave: false, khoanPolicy: "IF_KPI", users });
     expect(first).toMatchObject({ period: "2026-10", from: "2026-09-26", to: "2026-10-25", workingDays: 25 });
     expect(first.items.map((item) => [item.userId, item.target, item.met, item.khoanMoney])).toEqual([
       ["u1", 100, true, 150000],
       // u2's target only starts in 2026-11 → no target for 2026-10 → met.
       ["u2", null, true, 150000]
     ]);
-    expect(settlePeriod({ period: "2026-10", closeDay: 25, prorateLeave: false, users })).toEqual(first);
+    expect(settlePeriod({ period: "2026-10", closeDay: 25, prorateLeave: false, khoanPolicy: "IF_KPI", users })).toEqual(first);
   });
 
   it("prorates per user when the setting is on", () => {
-    const result = settlePeriod({ period: "2026-11", closeDay: 25, prorateLeave: true, users });
+    const result = settlePeriod({ period: "2026-11", closeDay: 25, prorateLeave: true, khoanPolicy: "IF_KPI", users });
     // 2026-11 = 26/10–25/11: 31 days, 4 Sundays (1, 8, 15, 22/11) → 27 working days; 1 leave day → 100 × 26/27.
     expect(result.workingDays).toBe(27);
     expect(result.items[1]).toMatchObject({ targetBase: 100, target: 96.3, met: false, khoanPointsConverted: 30, totalPoints: 110 });
+  });
+
+  it("passes the Khoán pay policy to every person: re-running with the other policy changes only the not-met rows", () => {
+    const ifKpiRun = settlePeriod({ period: "2026-11", closeDay: 25, prorateLeave: true, khoanPolicy: "IF_KPI", users });
+    const alwaysRun = settlePeriod({ period: "2026-11", closeDay: 25, prorateLeave: true, khoanPolicy: "ALWAYS", users });
+    expect(alwaysRun.items.every((item) => item.khoanPolicy === "ALWAYS")).toBe(true);
+    expect(alwaysRun.items[0]).toEqual({ ...ifKpiRun.items[0], khoanPolicy: "ALWAYS" });
+    expect(alwaysRun.items[1]).toMatchObject({ met: false, khoanMoney: 150000, khoanPointsConverted: 0, totalPoints: 80 });
+    expect(ifKpiRun.items[1]).toMatchObject({ met: false, khoanMoney: 0, khoanPointsConverted: 30, totalPoints: 110 });
   });
 });
 
@@ -578,9 +659,115 @@ describe("G15 — changing the close day mid-period: a new close day applies fro
   });
 
   it("settlement and forecast cover the period's own days", () => {
-    expect(settlePeriod({ period: "2026-11", closeDay: versions, prorateLeave: false, users: [] })).toMatchObject({ from: "2026-10-26", to: "2026-11-20" });
+    expect(settlePeriod({ period: "2026-11", closeDay: versions, prorateLeave: false, khoanPolicy: "ALWAYS", users: [] })).toMatchObject({
+      from: "2026-10-26",
+      to: "2026-11-20"
+    });
     const result = forecast({ target: 100, pointsOfficial: 0, period: "2026-11", closeDay: versions, today: "2026-11-20", prorateLeave: false, leaveDays: null });
     expect(result).toMatchObject({ from: "2026-10-26", to: "2026-11-20", daysLeft: 1 });
+  });
+});
+
+describe("PD-032 — close day 31 “Cuối tháng”: a period is the calendar month", () => {
+  it("February in a non-leap and a leap year, 30- and 31-day months, across the year end", () => {
+    expect(periodRange("2026-02", 31)).toEqual({ from: "2026-02-01", to: "2026-02-28" });
+    expect(periodRange("2026-03", 31)).toEqual({ from: "2026-03-01", to: "2026-03-31" });
+    expect(periodRange("2028-02", 31)).toEqual({ from: "2028-02-01", to: "2028-02-29" });
+    expect(periodRange("2028-03", 31)).toEqual({ from: "2028-03-01", to: "2028-03-31" });
+    expect(periodRange("2026-04", 31)).toEqual({ from: "2026-04-01", to: "2026-04-30" });
+    expect(periodRange("2026-05", 31)).toEqual({ from: "2026-05-01", to: "2026-05-31" });
+    expect(periodRange("2026-12", 31)).toEqual({ from: "2026-12-01", to: "2026-12-31" });
+    expect(periodRange("2027-01", 31)).toEqual({ from: "2027-01-01", to: "2027-01-31" });
+  });
+
+  it("every day stays in its own month, last days included", () => {
+    expect(periodOfDay("2026-02-01", 31)).toBe("2026-02");
+    expect(periodOfDay("2026-02-28", 31)).toBe("2026-02");
+    expect(periodOfDay("2028-02-29", 31)).toBe("2028-02");
+    expect(periodOfDay("2026-03-01", 31)).toBe("2026-03");
+    expect(periodOfDay("2026-04-30", 31)).toBe("2026-04");
+    expect(periodOfDay("2026-10-31", 31)).toBe("2026-10");
+    expect(periodOfDay("2026-12-31", 31)).toBe("2026-12");
+    expect(periodMonth(new Date("2026-10-31T23:30:00+07:00"), 31)).toBe("2026-10-01");
+    expect(periodMonth(new Date("2026-11-01T00:10:00+07:00"), 31)).toBe("2026-11-01");
+  });
+
+  it("25 until 09/2026, then 31: 10/2026 = 26/09–31/10, then calendar months", () => {
+    const versions = [
+      { fromPeriod: null, closeDay: 25 },
+      { fromPeriod: "2026-10", closeDay: 31 }
+    ];
+    expect(periodRange("2026-09", versions)).toEqual({ from: "2026-08-26", to: "2026-09-25" });
+    expect(periodRange("2026-10", versions)).toEqual({ from: "2026-09-26", to: "2026-10-31" });
+    expect(periodRange("2026-11", versions)).toEqual({ from: "2026-11-01", to: "2026-11-30" });
+    expect(periodRange("2027-02", versions)).toEqual({ from: "2027-02-01", to: "2027-02-28" });
+    expect(periodOfDay("2026-09-25", versions)).toBe("2026-09");
+    expect(periodOfDay("2026-09-26", versions)).toBe("2026-10");
+    expect(periodOfDay("2026-10-31", versions)).toBe("2026-10");
+    expect(periodOfDay("2026-11-01", versions)).toBe("2026-11");
+  });
+
+  it("31 until 10/2026, then 25: 11/2026 = 01/11–25/11, 12/2026 = 26/11–25/12", () => {
+    const versions = [
+      { fromPeriod: null, closeDay: 31 },
+      { fromPeriod: "2026-11", closeDay: 25 }
+    ];
+    expect(periodRange("2026-10", versions)).toEqual({ from: "2026-10-01", to: "2026-10-31" });
+    expect(periodRange("2026-11", versions)).toEqual({ from: "2026-11-01", to: "2026-11-25" });
+    expect(periodRange("2026-12", versions)).toEqual({ from: "2026-11-26", to: "2026-12-25" });
+    expect(periodOfDay("2026-11-25", versions)).toBe("2026-11");
+    expect(periodOfDay("2026-11-26", versions)).toBe("2026-12");
+  });
+
+  it("no overlap, no gap when 31 alternates with other days (leap February included)", () => {
+    const schedule = [
+      { fromPeriod: null, closeDay: 25 },
+      { fromPeriod: "2026-10", closeDay: 31 },
+      { fromPeriod: "2027-03", closeDay: 20 },
+      { fromPeriod: "2027-06", closeDay: 31 },
+      { fromPeriod: "2028-03", closeDay: 28 }
+    ];
+    let expectedFrom = periodRange("2026-01", schedule).from;
+    for (let period = "2026-01"; period <= "2028-12"; period = `${Number(period.slice(0, 4)) + (period.endsWith("12") ? 1 : 0)}-${String((Number(period.slice(5)) % 12) + 1).padStart(2, "0")}`) {
+      const range = periodRange(period, schedule);
+      expect(range.from).toBe(expectedFrom);
+      expect(range.to <= `${period}-31` && range.to.startsWith(period)).toBe(true);
+      for (const day of [range.from, range.to]) {
+        expect(periodOfDay(day, schedule)).toBe(period);
+      }
+      const next = new Date(`${range.to}T00:00:00Z`);
+      next.setUTCDate(next.getUTCDate() + 1);
+      expectedFrom = next.toISOString().slice(0, 10);
+    }
+    expect(periodRange("2028-02", schedule)).toEqual({ from: "2028-02-01", to: "2028-02-29" });
+    expect(periodRange("2028-03", schedule)).toEqual({ from: "2028-03-01", to: "2028-03-28" });
+  });
+
+  it("the period closes at 23:59 on the month's last day: that is when the scheduler settles it", () => {
+    expect(periodCloseInstant("2026-02", 31).toISOString()).toBe("2026-02-28T16:59:00.000Z");
+    expect(periodCloseInstant("2028-02", 31).toISOString()).toBe("2028-02-29T16:59:00.000Z");
+    expect(periodCloseInstant("2026-04", 31).toISOString()).toBe("2026-04-30T16:59:00.000Z");
+    expect(periodCloseInstant("2026-10", 31).toISOString()).toBe("2026-10-31T16:59:00.000Z");
+    expect(latestClosedPeriod(new Date("2026-04-30T23:58:00+07:00"), 31)).toBe("2026-03");
+    expect(latestClosedPeriod(new Date("2026-04-30T23:59:00+07:00"), 31)).toBe("2026-04");
+    expect(latestClosedPeriod(new Date("2026-05-02T08:00:00+07:00"), 31)).toBe("2026-04");
+    const at = (iso: string, period: string) => shouldAutoSettle({ now: new Date(iso), period, closeDay: 31, hasFinalRun: false });
+    expect(at("2026-02-28T23:58:00+07:00", "2026-02")).toBe(false);
+    expect(at("2026-02-28T23:59:00+07:00", "2026-02")).toBe(true);
+    expect(at("2026-10-31T23:59:00+07:00", "2026-10")).toBe(true);
+    expect(at("2026-10-30T23:59:00+07:00", "2026-10")).toBe(false);
+  });
+
+  it("forecast: days left run to the month's last day", () => {
+    const february = forecast({ target: 100, pointsOfficial: 0, period: "2026-02", closeDay: 31, today: "2026-02-20", prorateLeave: false, leaveDays: null });
+    expect(february).toMatchObject({ from: "2026-02-01", to: "2026-02-28", daysLeft: 9 });
+    const april = forecast({ target: 100, pointsOfficial: 0, period: "2026-04", closeDay: 31, today: "2026-04-30", prorateLeave: false, leaveDays: null });
+    expect(april).toMatchObject({ to: "2026-04-30", daysLeft: 1 });
+    expect(settlePeriod({ period: "2028-02", closeDay: 31, prorateLeave: false, khoanPolicy: "ALWAYS", users: [] })).toMatchObject({
+      from: "2028-02-01",
+      to: "2028-02-29",
+      workingDays: 25
+    });
   });
 });
 
