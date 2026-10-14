@@ -5,7 +5,7 @@ import { AppError } from "../../lib/app-error.js";
 import type { QuerySql } from "../../lib/db-types.js";
 import { publishToRoom } from "../../realtime/publisher.js";
 import type { AccessContext } from "../access/access-context.js";
-import { assertPermission, assertProjectAccess } from "../access/resource-access.js";
+import { assertPermission, assertProjectAccess, hasPermission } from "../access/resource-access.js";
 import { toStatus, type StatusRow } from "./mappers.js";
 import { assertListInProject } from "./projects.service.js";
 
@@ -59,7 +59,10 @@ export const loadEffectiveWorkflow = async (
 };
 
 export const getWorkflow = async (context: AccessContext, projectId: string, listId: string | null) => {
-  assertPermission(context, Permission.StatusView);
+  // PD-042: status.view is no longer shown on the roles page — seeing tasks implies seeing their statuses.
+  if (!hasPermission(context, Permission.TaskView)) {
+    assertPermission(context, Permission.StatusView);
+  }
   const sql = getSql();
   await assertProjectAccess(context, projectId, "view", sql);
   if (listId) {

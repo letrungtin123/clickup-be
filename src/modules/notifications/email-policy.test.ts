@@ -106,6 +106,7 @@ describe("which notification types may be e-mailed (SPEC: chat never e-mails)", 
   it("e-mails every production event of PLAN §8 and the task workspace events", () => {
     for (const type of [
       "production.task_assigned",
+      "production.job_leader_assigned",
       "production.task_waiting_qc",
       "production.qc_failed",
       "production.task_checked",

@@ -3,6 +3,7 @@ import { randomBytes } from "node:crypto";
 import { z } from "zod";
 
 import { env } from "../../config/env.js";
+import type { Department } from "../../contracts/departments.js";
 import { getSql } from "../../db/client.js";
 import { AppError } from "../../lib/app-error.js";
 import { logger } from "../../lib/logger.js";
@@ -26,6 +27,8 @@ import { exchangePkceCode, revokeAuthSession, verifyAccessToken, type AuthSessio
 const defaultMemberRoleKey = "member";
 /** SPEC §2: first Google sign-in gets the lowest production role. */
 const defaultProductionRole = "STAFF";
+/** PD-041: the department that goes with a production role (the invariant: no production role outside it). */
+const defaultDepartment: Department = "PHOTO_RETOUCH";
 
 const hostedDomains = parseHostedDomains(env.GOOGLE_AUTH_HOSTED_DOMAINS);
 
@@ -125,6 +128,12 @@ const provisionMember = async (input: { userId: string; email: string; displayNa
     await tx`
       INSERT INTO production.user_roles (organization_id, user_id, role_code)
       VALUES (${input.organizationId}, ${input.userId}, ${defaultProductionRole})
+      ON CONFLICT DO NOTHING
+    `;
+    // PD-041: production roles only exist inside the Photo Retouch department, so the account joins it too.
+    await tx`
+      INSERT INTO public.user_departments (organization_id, user_id, department)
+      VALUES (${input.organizationId}, ${input.userId}, ${defaultDepartment})
       ON CONFLICT DO NOTHING
     `;
   });

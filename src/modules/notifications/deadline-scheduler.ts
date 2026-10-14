@@ -37,7 +37,7 @@ const scanKind = async (kind: Kind, since: string | null) => {
   const inserted = await sql<(InsertedNotificationRow & { organization_id: string })[]>`
     WITH due AS (
       SELECT t.id, t.organization_id, t.project_id, t.title, t.due_at, p.key || '-' || t.number AS task_key, p.name AS project_name,
-        p.visibility
+        p.visibility, p.department
       FROM public.tasks t
       JOIN public.projects p ON p.id = t.project_id AND p.organization_id = t.organization_id
         AND p.deleted_at IS NULL AND p.archived_at IS NULL
@@ -50,7 +50,8 @@ const scanKind = async (kind: Kind, since: string | null) => {
       LIMIT ${maxRowsPerScan}
     ),
     recipients AS (
-      -- Assignees who can still see the project (visibility, membership, RBAC); people who lost access get nothing.
+      -- Assignees who can still see the project (visibility, department of a public project, membership, RBAC);
+      -- people who lost access get nothing.
       SELECT due.*, ta.assignee_user_id AS user_id
       FROM due
       JOIN public.task_assignees ta ON ta.task_id = due.id AND ta.organization_id = due.organization_id AND ta.removed_at IS NULL
@@ -63,7 +64,11 @@ const scanKind = async (kind: Kind, since: string | null) => {
           EXISTS (SELECT 1 FROM public.role_permissions rp WHERE rp.role_id = r.id AND rp.permission_key = 'task.view')
           AND EXISTS (SELECT 1 FROM public.role_permissions rp WHERE rp.role_id = r.id AND rp.permission_key = 'project.view')
           AND (
-            due.visibility = 'public'
+            -- The superadmin is handled above, so a department row is all it takes (PD-041).
+            (due.visibility = 'public' AND EXISTS (
+              SELECT 1 FROM public.user_departments ud
+              WHERE ud.organization_id = due.organization_id AND ud.user_id = ta.assignee_user_id AND ud.department = due.department
+            ))
             OR EXISTS (
               SELECT 1 FROM public.project_memberships pm
               WHERE pm.organization_id = due.organization_id AND pm.project_id = due.project_id

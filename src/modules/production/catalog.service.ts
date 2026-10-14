@@ -30,6 +30,7 @@ import { AppError } from "../../lib/app-error.js";
 import { toIso, type QuerySql } from "../../lib/db-types.js";
 import { isEmailEnabled } from "../../lib/mailer.js";
 import { invalidateAccessContexts, type AccessContext } from "../access/access-context.js";
+import { departmentMemberSql, effectiveDepartments, productionRolesNotAllowed } from "../access/departments.js";
 import { scheduleGoogleAuthUserProvisioning } from "../auth/google-auth.service.js";
 import { toColor } from "../work/mappers.js";
 import { assertProductionAdmin, assertProductionMember, assertProductionRole, isProductionAdmin, productionRolesOf } from "./access.js";
@@ -227,6 +228,8 @@ type MemberRow = {
   email: string | null;
   avatar_url: string | null;
   roles: string[] | null;
+  superadmin: boolean;
+  departments: string[] | null;
   team_id: string | null;
   status: string;
   custom_values: CustomValues | null;
@@ -236,11 +239,14 @@ type MemberRow = {
 const selectMembers = (sql: QuerySql, organizationId: string, onlyUserId: string | null) => sql<MemberRow[]>`
   SELECT au.id AS user_id, au.display_name, au.email, au.avatar_url, om.status,
     (SELECT array_agg(ur.role_code) FROM production.user_roles ur WHERE ur.organization_id = om.organization_id AND ur.user_id = au.id) AS roles,
+    (r.key = 'superadmin') AS superadmin,
+    (SELECT array_agg(ud.department) FROM public.user_departments ud WHERE ud.organization_id = om.organization_id AND ud.user_id = au.id) AS departments,
     mp.team_id, mp.custom_values,
     (SELECT array_agg(et.tag_id) FROM production.entity_tags et
       WHERE et.organization_id = om.organization_id AND et.entity = 'USER' AND et.entity_id = au.id) AS tag_ids
   FROM public.organization_memberships om
   JOIN public.app_users au ON au.id = om.user_id AND au.deleted_at IS NULL
+  JOIN public.roles r ON r.id = om.role_id AND r.organization_id = om.organization_id
   LEFT JOIN production.member_profiles mp ON mp.organization_id = om.organization_id AND mp.user_id = au.id
   WHERE om.organization_id = ${organizationId} AND om.deleted_at IS NULL
     AND (${onlyUserId}::uuid IS NULL OR au.id = ${onlyUserId}::uuid)
@@ -256,13 +262,18 @@ const toMember = (row: MemberRow) => ({
   roles: (row.roles ?? [])
     .filter((role): role is ProductionRole => (productionRoleCodes as readonly string[]).includes(role))
     .sort((a, b) => productionRoleCodes.indexOf(a) - productionRoleCodes.indexOf(b)),
+  // PD-041: a superadmin implicitly belongs to every department.
+  departments: effectiveDepartments(row.superadmin, row.departments),
   teamId: row.team_id,
   active: row.status === "active",
   customValues: row.custom_values ?? {},
   tagIds: row.tag_ids ?? []
 });
 
-/** Admins manage everyone; Leaders/Accounts need the list to assign work and pick QC. */
+/**
+ * Admins manage everyone (with their departments, PD-041); Leaders/Accounts need the list to assign work and pick QC
+ * — they only get Photo Retouch members holding a production role.
+ */
 export const listMembers = async (context: AccessContext, query: ProductionMemberQuery = { cf: [] }) => {
   assertProductionRole(context, "LEADER", "ACCOUNT", "QC");
   const admin = isProductionAdmin(context);
@@ -277,7 +288,7 @@ export const listMembers = async (context: AccessContext, query: ProductionMembe
   return {
     items: rows
       .map(toMember)
-      .filter((member) => admin || member.roles.length > 0)
+      .filter((member) => admin || (member.roles.length > 0 && member.departments.includes("PHOTO_RETOUCH")))
       .filter((member) => matchesCustomFieldFilters(member.customValues, plans) && (tagIds.length === 0 || member.tagIds.some((id) => tagIds.includes(id))))
       .map((member) => (admin ? member : { ...member, customValues: {}, tagIds: [] }))
   };
@@ -287,7 +298,18 @@ export const listMembers = async (context: AccessContext, query: ProductionMembe
 export const customFieldsForbidden = () =>
   new AppError("CUSTOM_FIELDS_FORBIDDEN", "Chỉ Quản trị lọc theo trường tuỳ biến hoặc tag của nhân viên.", 403);
 
-export const updateMember = async (context: AccessContext, userId: string, input: In<typeof UpdateProductionMemberRequestSchema>) => {
+/**
+ * PATCH /production/members/:userId (and the production users admin): roles, team, custom values, tags in one
+ * transaction. `inTransaction` runs first inside it once the member is found (the users admin's department change,
+ * PD-041). Production roles only exist inside PHOTO_RETOUCH: granting some to anyone else is 400
+ * PRODUCTION_ROLES_NOT_ALLOWED.
+ */
+export const updateMember = async (
+  context: AccessContext,
+  userId: string,
+  input: In<typeof UpdateProductionMemberRequestSchema>,
+  inTransaction?: (tx: QuerySql) => Promise<void>
+) => {
   assertProductionAdmin(context);
   const sql = getSql();
   await sql.begin(async (tx) => {
@@ -295,11 +317,22 @@ export const updateMember = async (context: AccessContext, userId: string, input
     if (!current) {
       throw new AppError("MEMBER_NOT_FOUND", "Không tìm thấy thành viên.", 404);
     }
+    if (inTransaction) {
+      await inTransaction(tx);
+    }
     if (input.roles) {
       const roles = [...new Set(input.roles)];
       // The organization must keep at least one production ADMIN besides superadmins' implicit role.
       if (userId === context.user.id && !roles.includes("ADMIN") && !context.hasFullOrganizationAuthority) {
         throw new AppError("SELF_ADMIN_REMOVAL", "Bạn không thể tự bỏ quyền Quản trị của mình.", 409);
+      }
+      if (roles.length > 0) {
+        const [membership] = await tx<{ member: boolean }[]>`
+          SELECT ${departmentMemberSql(tx, org(context), userId, "PHOTO_RETOUCH")} AS member
+        `;
+        if (!membership?.member) {
+          throw productionRolesNotAllowed();
+        }
       }
       await tx`DELETE FROM production.user_roles WHERE organization_id = ${org(context)} AND user_id = ${userId} AND NOT (role_code = ANY(${roles}::text[]))`;
       if (roles.length > 0) {
@@ -332,7 +365,7 @@ export const updateMember = async (context: AccessContext, userId: string, input
       await setEntityTags(tx, org(context), "USER", userId, input.tagIds);
     }
   });
-  if (input.roles) {
+  if (input.roles || inTransaction) {
     await invalidateAccessContexts();
   }
   return toMember((await selectMembers(sql, org(context), userId))[0]!);

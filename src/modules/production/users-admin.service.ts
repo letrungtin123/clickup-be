@@ -1,5 +1,6 @@
 import type { ProductionMember, ProductionRole } from "../../contracts/production-catalog.js";
 import { productionRoleCodes } from "../../contracts/production-catalog.js";
+import { sortDepartments, type Department } from "../../contracts/departments.js";
 import { Permission } from "../../contracts/permissions.js";
 import type { CreateProductionUserRequest, LedJobs, ProductionUserChangeResult, UpdateProductionUserRequest } from "../../contracts/users-admin.js";
 import { getSql } from "../../db/client.js";
@@ -8,9 +9,28 @@ import type { QuerySql } from "../../lib/db-types.js";
 import { logger } from "../../lib/logger.js";
 import { disconnectUsers } from "../../realtime/publisher.js";
 import { invalidateAccessContexts, type AccessContext } from "../access/access-context.js";
+import {
+  assertDepartmentsChangeAllowed,
+  assertDepartmentsPresent,
+  effectiveDepartments,
+  loadDepartmentRows,
+  productionRolesNotAllowed,
+  productionRolesRequired,
+  replaceUserDepartments,
+  sameDepartments,
+  type MemberDepartmentChange,
+  type MemberDepartmentWriter
+} from "../access/departments.js";
 import { enqueueDomainEvents } from "../events/outbox.js";
-import { afterMembershipStatusChange, issueTemporaryPassword, provisionOrganizationMember } from "../workspace/members.service.js";
-import { assertProductionAdmin, assertProductionRole } from "./access.js";
+import { publishDepartmentAccessRevoked, revokeDepartmentAccessEffects } from "../work/department-access.js";
+import {
+  afterMembershipStatusChange,
+  issueTemporaryPassword,
+  provisionOrganizationMember,
+  writeMemberDepartments
+} from "../workspace/members.service.js";
+import { assertCanGrantProductionRoles } from "../workspace/workspace.service.js";
+import { assertProductionAdmin, assertProductionMember, assertProductionRole } from "./access.js";
 import { updateMember } from "./catalog.service.js";
 import { syncJobChatsForMember } from "./job-chat.service.js";
 import { listOpenJobsLedBy, type LedJob } from "./member-lookups.js";
@@ -24,7 +44,9 @@ import { leaderRemovedEvent } from "./notifications.js";
  *   - never on an organization superadmin; on organization admins (roles holding member.manage or role.*) only
  *     when the caller is a superadmin;
  *   - no organization role is chosen: new accounts get the default "member" role, which must not be an admin role;
- *   - not on yourself for deactivate / reset password; your own ADMIN cannot be removed (catalog `updateMember`).
+ *   - not on yourself for deactivate / reset password; your own ADMIN cannot be removed (catalog `updateMember`);
+ *   - departments (PD-041): only the ones the caller belongs to change (DEPARTMENT_ESCALATION); a superadmin's are
+ *     implicit (never edited here); outside PHOTO_RETOUCH nobody holds a production role (`applyDepartmentChange`).
  */
 
 /** Organization permissions that make a role an "organization admin" role (account / role management). */
@@ -47,17 +69,20 @@ type AccountTarget = {
   superadmin: boolean;
   orgAdmin: boolean;
   roles: ProductionRole[];
+  /** Effective departments (PD-041): every department for a superadmin. */
+  departments: Department[];
 };
 
 const loadAccountTarget = async (sql: QuerySql, organizationId: string, userId: string): Promise<AccountTarget> => {
   const row = (
-    await sql<{ status: AccountTarget["status"]; role_key: string; org_admin: boolean; roles: string[] | null }[]>`
+    await sql<{ status: AccountTarget["status"]; role_key: string; org_admin: boolean; roles: string[] | null; departments: string[] | null }[]>`
       SELECT om.status, r.key AS role_key,
         EXISTS (
           SELECT 1 FROM public.role_permissions rp
           WHERE rp.organization_id = om.organization_id AND rp.role_id = om.role_id AND rp.permission_key = ANY(${[...orgAdminPermissions]}::text[])
         ) AS org_admin,
-        (SELECT array_agg(ur.role_code) FROM production.user_roles ur WHERE ur.organization_id = om.organization_id AND ur.user_id = om.user_id) AS roles
+        (SELECT array_agg(ur.role_code) FROM production.user_roles ur WHERE ur.organization_id = om.organization_id AND ur.user_id = om.user_id) AS roles,
+        (SELECT array_agg(ud.department) FROM public.user_departments ud WHERE ud.organization_id = om.organization_id AND ud.user_id = om.user_id) AS departments
       FROM public.organization_memberships om
       JOIN public.roles r ON r.id = om.role_id AND r.organization_id = om.organization_id
       JOIN public.app_users au ON au.id = om.user_id AND au.deleted_at IS NULL
@@ -73,7 +98,8 @@ const loadAccountTarget = async (sql: QuerySql, organizationId: string, userId: 
     status: row.status,
     superadmin: row.role_key === "superadmin",
     orgAdmin: row.role_key === "superadmin" || row.org_admin,
-    roles: (row.roles ?? []).filter((role): role is ProductionRole => known.has(role))
+    roles: (row.roles ?? []).filter((role): role is ProductionRole => known.has(role)),
+    departments: effectiveDepartments(row.role_key === "superadmin", row.departments)
   };
 };
 
@@ -98,6 +124,8 @@ type MemberRow = {
   avatar_url: string | null;
   status: string;
   roles: string[] | null;
+  superadmin: boolean;
+  departments: string[] | null;
   team_id: string | null;
   custom_values: Record<string, unknown> | null;
   tag_ids: string[] | null;
@@ -109,11 +137,14 @@ const loadProductionMember = async (sql: QuerySql, organizationId: string, userI
     await sql<MemberRow[]>`
       SELECT au.id AS user_id, au.display_name, au.email, au.avatar_url, om.status,
         (SELECT array_agg(ur.role_code) FROM production.user_roles ur WHERE ur.organization_id = om.organization_id AND ur.user_id = au.id) AS roles,
+        (r.key = 'superadmin') AS superadmin,
+        (SELECT array_agg(ud.department) FROM public.user_departments ud WHERE ud.organization_id = om.organization_id AND ud.user_id = au.id) AS departments,
         mp.team_id, mp.custom_values,
         (SELECT array_agg(et.tag_id) FROM production.entity_tags et
           WHERE et.organization_id = om.organization_id AND et.entity = 'USER' AND et.entity_id = au.id) AS tag_ids
       FROM public.organization_memberships om
       JOIN public.app_users au ON au.id = om.user_id AND au.deleted_at IS NULL
+      JOIN public.roles r ON r.id = om.role_id AND r.organization_id = om.organization_id
       LEFT JOIN production.member_profiles mp ON mp.organization_id = om.organization_id AND mp.user_id = au.id
       WHERE om.organization_id = ${organizationId} AND om.user_id = ${userId} AND om.deleted_at IS NULL
     `
@@ -130,6 +161,7 @@ const loadProductionMember = async (sql: QuerySql, organizationId: string, userI
     roles: (row.roles ?? [])
       .filter((role): role is ProductionRole => known.has(role))
       .sort((a, b) => productionRoleCodes.indexOf(a) - productionRoleCodes.indexOf(b)),
+    departments: effectiveDepartments(row.superadmin, row.departments),
     teamId: row.team_id,
     active: row.status === "active",
     customValues: (row.custom_values ?? {}) as ProductionMember["customValues"],
@@ -143,18 +175,39 @@ const orphanedJobsOf = async (sql: QuerySql, organizationId: string, userId: str
   return led.leaderActive ? [] : led.items;
 };
 
-/** GET /production/users/:userId/led-jobs — for Admins and Accounts, who hand jobs to another Leader. */
+/**
+ * GET /production/users/:userId/led-jobs — for Admins and Accounts, who hand jobs to another Leader; anyone may read
+ * their own list ("Job tôi phụ trách" in Việc của tôi).
+ */
 export const getLedJobs = async (context: AccessContext, userId: string): Promise<LedJobs> => {
-  assertProductionRole(context, "ACCOUNT");
+  if (userId === context.user.id) {
+    assertProductionMember(context);
+  } else {
+    assertProductionRole(context, "ACCOUNT");
+  }
   const sql = getSql();
   await loadProductionMember(sql, org(context), userId);
   const led = await listOpenJobsLedBy(sql, org(context), userId);
   return { userId, displayName: led.displayName, leaderActive: led.leaderActive, items: led.items };
 };
 
-/** POST /production/users — account + production roles + team (+ whitelist) in one transaction (PD-005, PD-024). */
+/**
+ * POST /production/users — account + departments + production roles + team (+ whitelist) in one transaction (PD-005,
+ * PD-024, PD-041). Departments: at least one (400 DEPARTMENTS_REQUIRED), only ones the caller belongs to unless
+ * superadmin (403 DEPARTMENT_ESCALATION); production roles with PHOTO_RETOUCH only (the contract checks it too).
+ */
 export const createProductionUser = async (context: AccessContext, input: CreateProductionUserRequest) => {
   assertProductionAdmin(context);
+  const departments = sortDepartments(input.departments);
+  assertDepartmentsPresent(departments, false);
+  assertDepartmentsChangeAllowed(context, [], departments);
+  const roles = departments.includes("PHOTO_RETOUCH") ? input.roles : [];
+  if (roles.length === 0 && departments.includes("PHOTO_RETOUCH")) {
+    throw productionRolesRequired();
+  }
+  if (input.roles.length > 0 && !departments.includes("PHOTO_RETOUCH")) {
+    throw productionRolesNotAllowed();
+  }
   const sql = getSql();
   const organizationId = org(context);
   const role = (
@@ -187,13 +240,8 @@ export const createProductionUser = async (context: AccessContext, input: Create
     context,
     { email: input.email, displayName: input.displayName, jobTitle: input.jobTitle ?? null, roleId: role.id },
     async (tx, userId) => {
-      // A taken-over account (membership removed earlier) starts from the roles chosen now.
-      await tx`DELETE FROM production.user_roles WHERE organization_id = ${organizationId} AND user_id = ${userId}`;
-      await tx`
-        INSERT INTO production.user_roles (organization_id, user_id, role_code, granted_by)
-        SELECT ${organizationId}, ${userId}, role, ${context.user.id} FROM unnest(${input.roles}::text[]) AS role
-        ON CONFLICT DO NOTHING
-      `;
+      // A taken-over account (membership removed earlier) starts from the departments and roles chosen now.
+      await writeMemberDepartments(tx, context, { userId, departments, productionRoles: roles });
       await tx`
         INSERT INTO production.member_profiles (organization_id, user_id, team_id)
         VALUES (${organizationId}, ${userId}, ${input.teamId ?? null})
@@ -208,18 +256,159 @@ export const createProductionUser = async (context: AccessContext, input: Create
       }
     }
   );
-  logger.info({ actorId: context.user.id, userId: created.member.user.id, roles: input.roles }, "Production user created");
+  logger.info({ actorId: context.user.id, userId: created.member.user.id, roles, departments }, "Production user created");
   return { member: await loadProductionMember(sql, organizationId, created.member.user.id), temporaryPassword: created.temporaryPassword };
 };
 
 const leadingRoles: readonly ProductionRole[] = ["LEADER", "ACCOUNT", "ADMIN"];
 
+/** Known production role codes, de-duplicated, in the stable order of `productionRoleCodes`. */
+const sortRoles = (roles: readonly string[]): ProductionRole[] => productionRoleCodes.filter((code) => roles.includes(code));
+
+const loadProductionRoleRows = async (sql: QuerySql, organizationId: string, userId: string) =>
+  sortRoles(
+    (
+      await sql<{ role_code: string }[]>`
+        SELECT role_code FROM production.user_roles WHERE organization_id = ${organizationId} AND user_id = ${userId}
+      `
+    ).map((row) => row.role_code)
+  );
+
 /**
- * PATCH /production/users/:userId — production roles, team, custom fields, tags (same body as PATCH
- * /production/members/:userId, whose rules apply too: SELF_ADMIN_REMOVAL, TEAM_NOT_FOUND, custom field checks).
- * Afterwards: sockets re-authorize with the new roles; losing LEADER / ACCOUNT / ADMIN reconciles the person's job
- * chats (PD-022); losing LEADER while still leading open jobs returns them as `orphanedJobs` and notifies the other
- * production Admins (SEC2-04 follow-up).
+ * PD-024 follow-ups of production roles someone lost (role or department change), after the commit: their job chats
+ * are reconciled when a leading role went (PD-022); open jobs they still lead although they no longer lead come back as
+ * `orphanedJobs` and the other production Admins are notified (SEC2-04 follow-up).
+ */
+const afterProductionRolesRemoved = async (context: AccessContext, userId: string, removed: readonly string[]): Promise<LedJob[]> => {
+  if (removed.some((role) => (leadingRoles as readonly string[]).includes(role))) {
+    await syncJobChatsForMember(context, userId);
+  }
+  if (!removed.includes("LEADER") && !removed.includes("ADMIN")) {
+    return [];
+  }
+  const sql = getSql();
+  const orphanedJobs = await orphanedJobsOf(sql, org(context), userId);
+  if (orphanedJobs.length > 0) {
+    await enqueueDomainEvents(sql, [leaderRemovedEvent(org(context), userId, context.user.id, "role_removed")]);
+  }
+  return orphanedJobs;
+};
+
+/**
+ * PD-041 department change of a member, inside the caller's transaction — the ONE implementation shared by Cài đặt ›
+ * Thành viên (PATCH /organization/members/:id, injected into the workspace member update after the membership row is
+ * updated) and the production users admin (PATCH /production/users/:userId, inside the catalog member update).
+ *   - `departments` replaces the rows: at least one (400 DEPARTMENTS_REQUIRED — also for a demoted superadmin without
+ *     rows); only departments the caller belongs to may change unless superadmin (403 DEPARTMENT_ESCALATION);
+ *   - invariant: outside PHOTO_RETOUCH nobody (but the superadmin) holds a production role — leaving it deletes the
+ *     roles, sending some is 400 PRODUCTION_ROLES_NOT_ALLOWED; joining it without roles needs `productionRoles`
+ *     (400 PRODUCTION_ROLES_REQUIRED) and gets a production profile row;
+ *   - granted roles need a production ADMIN / superadmin caller (403 PRODUCTION_ROLE_ESCALATION); your own ADMIN
+ *     cannot go (409 SELF_ADMIN_REMOVAL);
+ *   - each department the person effectively leaves runs `revokeDepartmentAccessEffects` (task assignments in its
+ *     public workspace projects).
+ * A resulting superadmin belongs to every department implicitly: rows and roles are left untouched. After the commit
+ * call `afterDepartmentChange` (or the equivalent follow-ups, as `updateProductionUser` does).
+ */
+export const applyDepartmentChange: MemberDepartmentWriter = async (tx, context, input) => {
+  const organizationId = org(context);
+  const rows = await loadDepartmentRows(tx, organizationId, input.userId);
+  const before = effectiveDepartments(input.superadminBefore, rows);
+  const rolesBefore = await loadProductionRoleRows(tx, organizationId, input.userId);
+  if (input.superadminAfter) {
+    const departments = effectiveDepartments(true, rows);
+    const added = departments.filter((department) => !before.includes(department));
+    return { departments, added, removed: [], revoked: [], rolesBefore, rolesAfter: rolesBefore, removedRoles: [], changed: added.length > 0 };
+  }
+  const next = input.departments ? sortDepartments(input.departments) : rows;
+  assertDepartmentsPresent(next, false);
+  assertDepartmentsChangeAllowed(context, before, next);
+
+  const inRetouch = next.includes("PHOTO_RETOUCH");
+  const requested = input.productionRoles ? sortRoles(input.productionRoles) : undefined;
+  if (!inRetouch && requested && requested.length > 0) {
+    throw productionRolesNotAllowed();
+  }
+  const rolesAfter = inRetouch ? (requested ?? rolesBefore) : [];
+  if (inRetouch && rolesAfter.length === 0 && !rows.includes("PHOTO_RETOUCH")) {
+    throw productionRolesRequired();
+  }
+  const granted = rolesAfter.filter((role) => !rolesBefore.includes(role));
+  const deleted = rolesBefore.filter((role) => !rolesAfter.includes(role));
+  assertCanGrantProductionRoles(context, granted);
+  // A demoted superadmin also loses the implicit production ADMIN (PD-011).
+  const removedRoles = (input.superadminBefore ? sortRoles([...rolesBefore, "ADMIN"]) : rolesBefore).filter((role) => !rolesAfter.includes(role));
+  if (input.userId === context.user.id && !context.hasFullOrganizationAuthority && removedRoles.includes("ADMIN")) {
+    throw new AppError("SELF_ADMIN_REMOVAL", "Bạn không thể tự bỏ quyền Quản trị của mình.", 409);
+  }
+
+  if (input.departments) {
+    await replaceUserDepartments(tx, { organizationId, userId: input.userId, departments: next, actorUserId: context.user.id });
+  }
+  if (deleted.length > 0) {
+    await tx`
+      DELETE FROM production.user_roles
+      WHERE organization_id = ${organizationId} AND user_id = ${input.userId} AND role_code = ANY(${deleted}::text[])
+    `;
+  }
+  if (granted.length > 0) {
+    await tx`
+      INSERT INTO production.user_roles (organization_id, user_id, role_code, granted_by)
+      SELECT ${organizationId}, ${input.userId}, role, ${context.user.id} FROM unnest(${granted}::text[]) AS role
+      ON CONFLICT DO NOTHING
+    `;
+  }
+  if (inRetouch && !rows.includes("PHOTO_RETOUCH")) {
+    await tx`
+      INSERT INTO production.member_profiles (organization_id, user_id)
+      VALUES (${organizationId}, ${input.userId})
+      ON CONFLICT (organization_id, user_id) DO NOTHING
+    `;
+  }
+  const added = next.filter((department) => !before.includes(department));
+  const removed = before.filter((department) => !next.includes(department));
+  const revoked: MemberDepartmentChange["revoked"] = [];
+  for (const department of removed) {
+    revoked.push({ department, tasks: await revokeDepartmentAccessEffects(tx, context, input.userId, department) });
+  }
+  return {
+    departments: next,
+    added,
+    removed,
+    revoked,
+    rolesBefore,
+    rolesAfter,
+    removedRoles,
+    changed: added.length > 0 || removed.length > 0 || granted.length > 0 || deleted.length > 0
+  };
+};
+
+/**
+ * After the commit of `applyDepartmentChange` (Cài đặt › Thành viên): access contexts are refreshed, the person's
+ * sockets re-authorize, unassigned tasks get live hints, and the PD-024 follow-ups of lost production roles run.
+ * Returns the open jobs they still lead although they no longer lead (the admins are notified).
+ */
+export const afterDepartmentChange = async (context: AccessContext, userId: string, change: MemberDepartmentChange | null): Promise<LedJob[]> => {
+  if (!change?.changed) {
+    return [];
+  }
+  for (const { department, tasks } of change.revoked) {
+    await publishDepartmentAccessRevoked(context, userId, department, tasks);
+  }
+  await invalidateAccessContexts();
+  // The reconnect re-authorizes every room (the production room too when PHOTO_RETOUCH went).
+  disconnectUsers([userId]);
+  return await afterProductionRolesRemoved(context, userId, change.removedRoles);
+};
+
+/**
+ * PATCH /production/users/:userId — departments (PD-041), production roles, team, custom fields, tags (same body as
+ * PATCH /production/members/:userId, whose rules apply too: SELF_ADMIN_REMOVAL, TEAM_NOT_FOUND, custom field checks,
+ * PRODUCTION_ROLES_NOT_ALLOWED). Department and role changes follow `assertAccountManageable` (a superadmin's
+ * departments are implicit: never here); the department change itself is `applyDepartmentChange`, in the same
+ * transaction as the rest. Afterwards: sockets re-authorize with the new roles; losing LEADER / ACCOUNT / ADMIN
+ * reconciles the person's job chats (PD-022); losing LEADER while still leading open jobs returns them as
+ * `orphanedJobs` and notifies the other production Admins (SEC2-04 follow-up).
  */
 export const updateProductionUser = async (
   context: AccessContext,
@@ -232,24 +421,43 @@ export const updateProductionUser = async (
   const target = await loadAccountTarget(sql, organizationId, userId);
   const nextRoles = input.roles ? [...new Set(input.roles)] : null;
   const rolesChange = nextRoles !== null && (nextRoles.length !== target.roles.length || nextRoles.some((role) => !target.roles.includes(role)));
-  if (rolesChange && userId !== context.user.id) {
-    // Your own roles: only "keep your ADMIN" applies (catalog updateMember, SELF_ADMIN_REMOVAL).
+  const departments = input.departments ? sortDepartments(input.departments) : null;
+  const departmentsChange = departments !== null && !sameDepartments(departments, target.departments);
+  if (departmentsChange && target.superadmin) {
+    // Every department implicitly (managed in Cài đặt › Thành viên) — not even on yourself.
     assertAccountManageable(context, target);
   }
-  const member = await updateMember(context, userId, input);
-  if (!rolesChange) {
+  if ((rolesChange || departmentsChange) && userId !== context.user.id) {
+    // Your own roles / departments: only "keep your ADMIN" applies (SELF_ADMIN_REMOVAL).
+    assertAccountManageable(context, target);
+  }
+  const captured: { change: MemberDepartmentChange | null } = { change: null };
+  const member = await updateMember(
+    context,
+    userId,
+    input,
+    departmentsChange && departments
+      ? async (tx) => {
+          captured.change = await applyDepartmentChange(tx, context, {
+            userId,
+            superadminBefore: false,
+            superadminAfter: false,
+            departments,
+            productionRoles: input.roles
+          });
+        }
+      : undefined
+  );
+  if (!rolesChange && !departmentsChange) {
     return { member, orphanedJobs: [] };
   }
-  const removed = target.roles.filter((role) => !member.roles.includes(role));
+  // `updateMember` refreshed the access contexts after its commit.
+  for (const { department, tasks } of captured.change?.revoked ?? []) {
+    await publishDepartmentAccessRevoked(context, userId, department, tasks);
+  }
   disconnectUsers([userId]);
-  if (removed.some((role) => leadingRoles.includes(role))) {
-    await syncJobChatsForMember(context, userId);
-  }
-  const orphanedJobs = removed.includes("LEADER") || removed.includes("ADMIN") ? await orphanedJobsOf(sql, organizationId, userId) : [];
-  if (orphanedJobs.length > 0) {
-    await enqueueDomainEvents(sql, [leaderRemovedEvent(organizationId, userId, context.user.id, "role_removed")]);
-  }
-  return { member, orphanedJobs };
+  const removed = target.roles.filter((role) => !member.roles.includes(role));
+  return { member, orphanedJobs: await afterProductionRolesRemoved(context, userId, removed) };
 };
 
 /**

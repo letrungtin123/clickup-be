@@ -1,5 +1,6 @@
 import { z } from "zod";
 
+import { DepartmentSchema } from "./departments.js";
 import { SafeSearchSchema } from "./schemas.js";
 import { ColorTokenSchema, TaskStatusRefSchema, UserRefSchema } from "./work.js";
 
@@ -20,7 +21,12 @@ export const GlobalSearchQuerySchema = z.object({
       (value) => (typeof value === "string" && value.length > 0 ? value.split(",").map((entry) => entry.trim()) : [...searchGroups]),
       z.array(SearchGroupSchema).min(1).max(searchGroups.length)
     ),
-  limit: z.coerce.number().int().min(1).max(20).default(8)
+  limit: z.coerce.number().int().min(1).max(20).default(8),
+  /**
+   * The caller's current department (PD-041): PHOTO_RETOUCH leaves the workspace groups (tasks, projects, lists) empty;
+   * PRODUCTION / omitted searches them as usual. Shared groups (people, messages, knowledge) are never scoped.
+   */
+  department: DepartmentSchema.optional()
 });
 export type GlobalSearchQuery = z.infer<typeof GlobalSearchQuerySchema>;
 

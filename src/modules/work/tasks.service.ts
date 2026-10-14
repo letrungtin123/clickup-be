@@ -15,6 +15,7 @@ import { rankForPlacement } from "../../lib/rank.js";
 import { inlineImageTypes } from "../../lib/storage.js";
 import { publishToRoom } from "../../realtime/publisher.js";
 import type { AccessContext } from "../access/access-context.js";
+import { departmentMemberSql } from "../access/departments.js";
 import {
   assertPermission,
   assertProjectAccess,
@@ -108,7 +109,11 @@ const publishTaskChanged = (
   publishToRoom({ type: "task", id: task.id }, "task:timeline", { projectId: task.projectId, taskId: task.id, actorId, at });
 };
 
-/** Users who may be assigned in this project (PD-006): active org members, plus project membership when private. */
+/**
+ * Users who may be assigned in this project (PD-006 + PD-041): active org members who are explicit project members,
+ * or — on a public project — members of its department (the superadmin belongs to every department). Same rule as
+ * the database trigger `validate_task_assignee_access`.
+ */
 const assertAssignable = async (sql: QuerySql, context: AccessContext, projectId: string, userIds: string[]) => {
   const unique = [...new Set(userIds)];
   if (unique.length === 0) {
@@ -123,7 +128,7 @@ const assertAssignable = async (sql: QuerySql, context: AccessContext, projectId
       AND om.status = 'active'
       AND om.deleted_at IS NULL
       AND (
-        p.visibility = 'public'
+        (p.visibility = 'public' AND ${departmentMemberSql(sql, sql`om.organization_id`, sql`om.user_id`, sql`p.department`)})
         OR EXISTS (
           SELECT 1 FROM public.project_memberships pm
           WHERE pm.organization_id = om.organization_id AND pm.project_id = p.id
@@ -429,7 +434,7 @@ export const createTask = async (context: AccessContext, projectId: string, inpu
   return created;
 };
 
-/** Mentions are only delivered to people who can see the task. */
+/** Mentions are only delivered to people who can see the task (explicit members, or the department of a public project). */
 const mentionEvent = async (
   sql: QuerySql,
   context: AccessContext,
@@ -446,11 +451,14 @@ const mentionEvent = async (
     JOIN public.projects p ON p.id = ${projectId} AND p.organization_id = om.organization_id
     WHERE om.organization_id = ${context.organization.id} AND om.user_id = ANY(${mentions}::uuid[])
       AND om.status = 'active' AND om.deleted_at IS NULL AND om.user_id <> ${context.user.id}
-      AND (p.visibility = 'public' OR EXISTS (
-        SELECT 1 FROM public.project_memberships pm
-        WHERE pm.organization_id = om.organization_id AND pm.project_id = p.id AND pm.user_id = om.user_id
-          AND pm.status = 'active' AND pm.deleted_at IS NULL
-      ))
+      AND (
+        (p.visibility = 'public' AND ${departmentMemberSql(sql, sql`om.organization_id`, sql`om.user_id`, sql`p.department`)})
+        OR EXISTS (
+          SELECT 1 FROM public.project_memberships pm
+          WHERE pm.organization_id = om.organization_id AND pm.project_id = p.id AND pm.user_id = om.user_id
+            AND pm.status = 'active' AND pm.deleted_at IS NULL
+        )
+      )
   `;
   return {
     organizationId: context.organization.id,

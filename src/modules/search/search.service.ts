@@ -34,7 +34,9 @@ export const globalSearch = async (context: AccessContext, query: GlobalSearchQu
   const like = `%${escapeLike(query.q.toLowerCase())}%`;
   const tsQuery = toPrefixTsQuery(query.q);
   const keyMatch = keyPattern.exec(query.q);
-  const canSeeProjects = hasPermission(context, Permission.ProjectView);
+  // Workspace content (tasks, projects, lists) belongs to Production: browsing Photo Retouch leaves those groups empty
+  // (PD-041). Otherwise they are searched as usual — still limited to the projects the caller can see.
+  const canSeeProjects = hasPermission(context, Permission.ProjectView) && query.department !== "PHOTO_RETOUCH";
 
   const tasks = async () => {
     if (!groups.has("tasks") || !canSeeProjects || !hasPermission(context, Permission.TaskView)) {

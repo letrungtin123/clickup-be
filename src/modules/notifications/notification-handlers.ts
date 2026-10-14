@@ -1,5 +1,6 @@
 import { getSql } from "../../db/client.js";
 import { logger } from "../../lib/logger.js";
+import { departmentMemberSql } from "../access/departments.js";
 import type { DomainEventEnvelope } from "../events/outbox.js";
 import { knowledgeNotificationHandlers } from "../knowledge/notifications.js";
 import { productionNotificationHandlers } from "../production/notifications.js";
@@ -29,7 +30,10 @@ const loadTask = async (organizationId: string, taskId: string) => {
   return rows[0] ?? null;
 };
 
-/** Keeps only users who can currently see the project (visibility, membership, RBAC). */
+/**
+ * Keeps only users who can currently see the project (visibility, membership, RBAC): explicit members, or members of
+ * the department of a public project (PD-041); the superadmin always.
+ */
 export const filterProjectViewers = async (organizationId: string, projectId: string, userIds: string[]) => {
   const unique = [...new Set(userIds)];
   if (unique.length === 0) {
@@ -50,7 +54,7 @@ export const filterProjectViewers = async (organizationId: string, projectId: st
           EXISTS (SELECT 1 FROM public.role_permissions rp WHERE rp.role_id = r.id AND rp.permission_key = 'task.view')
           AND EXISTS (SELECT 1 FROM public.role_permissions rp WHERE rp.role_id = r.id AND rp.permission_key = 'project.view')
           AND (
-            p.visibility = 'public'
+            (p.visibility = 'public' AND ${departmentMemberSql(sql, sql`om.organization_id`, sql`om.user_id`, sql`p.department`)})
             OR EXISTS (
               SELECT 1 FROM public.project_memberships pm
               WHERE pm.organization_id = om.organization_id AND pm.project_id = p.id AND pm.user_id = om.user_id

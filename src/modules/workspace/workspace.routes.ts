@@ -20,6 +20,7 @@ import {
   UpdateRoleRequestSchema,
   WorkspaceSessionSchema
 } from "../../contracts/schemas.js";
+import { SetCurrentDepartmentRequestSchema, SetCurrentDepartmentResponseSchema } from "../../contracts/departments.js";
 import { getSql } from "../../db/client.js";
 import { AppError } from "../../lib/app-error.js";
 import { requireSupabaseUser, type AuthenticatedRequest } from "../../middleware/auth.js";
@@ -28,6 +29,8 @@ import { clearAuthCookies, setAuthCookies } from "../auth/auth.cookies.js";
 import { signInWithPassword } from "../auth/supabase-auth.service.js";
 import { disconnectUsers } from "../../realtime/publisher.js";
 import { assertPasswordCurrent, invalidateAccessContexts, resolveAccessContext } from "../access/access-context.js";
+import { assertDepartment, resolveCurrentDepartment } from "../access/departments.js";
+import { afterDepartmentChange, applyDepartmentChange } from "../production/users-admin.service.js";
 import { afterMembershipStatusChange, changeOwnPassword, createOrganizationMember, resetMemberPassword } from "./members.service.js";
 import {
   archiveRole,
@@ -65,18 +68,33 @@ workspaceRoutes.use(["/workspace", "/permissions", "/roles", "/organization", "/
 workspaceRoutes.get("/workspace/context", async (req, res, next) => {
   try {
     const context = await resolveAccessContext(getAuthenticatedUserId(req));
-    // Personal channels are read fresh (not part of the cached access context): a toggle shows on the next fetch.
+    // Personal channels and the chosen department are read fresh (not part of the cached access context): a toggle
+    // or a department switch shows on the next fetch without invalidating everyone's cached context.
     const preferences = (
-      await getSql()<{ notify_web: boolean; notify_email: boolean }[]>`
-        SELECT notify_web, notify_email FROM public.app_users WHERE id = ${context.user.id}
+      await getSql()<{ notify_web: boolean; notify_email: boolean; current_department: string | null }[]>`
+        SELECT notify_web, notify_email, current_department FROM public.app_users WHERE id = ${context.user.id}
       `
     )[0];
     res.json(
       WorkspaceSessionSchema.parse({
         ...context,
-        notificationPreferences: { notifyWeb: preferences?.notify_web ?? true, notifyEmail: preferences?.notify_email ?? false }
+        notificationPreferences: { notifyWeb: preferences?.notify_web ?? true, notifyEmail: preferences?.notify_email ?? false },
+        currentDepartment: resolveCurrentDepartment(context.departments, preferences?.current_department)
       })
     );
+  } catch (error) {
+    next(error);
+  }
+});
+
+/** PD-041: remembers the department chosen in the header switcher (restored at the next sign-in). */
+workspaceRoutes.put("/workspace/department", async (req, res, next) => {
+  try {
+    const input = SetCurrentDepartmentRequestSchema.parse(req.body);
+    const context = await resolveActiveContext(req);
+    assertDepartment(context, input.department);
+    await getSql()`UPDATE public.app_users SET current_department = ${input.department} WHERE id = ${context.user.id}`;
+    res.json(SetCurrentDepartmentResponseSchema.parse({ currentDepartment: input.department }));
   } catch (error) {
     next(error);
   }
@@ -170,16 +188,21 @@ workspaceRoutes.patch("/organization/members/:membershipId", async (req, res, ne
     const membershipId = OpaqueIdSchema.parse(req.params.membershipId);
     const input = UpdateOrganizationMemberRequestSchema.parse(req.body);
     const context = await resolveActiveContext(req);
-    const payload = await updateOrganizationMember(context, membershipId, input);
+    // PD-041: departments + production roles go through the production users admin's shared writer (same rules and
+    // follow-ups as PATCH /production/users/:userId).
+    const { member, departmentChange } = await updateOrganizationMember(context, membershipId, input, applyDepartmentChange);
     await invalidateAccessContexts();
     if (input.status === "disabled" || input.status === "active") {
-      await afterMembershipStatusChange(payload.user.id, input.status);
+      await afterMembershipStatusChange(member.user.id, input.status);
     }
     if (input.roleId) {
       // Live room subscriptions were authorized with the old role: force a re-authenticated reconnect.
-      disconnectUsers([payload.user.id]);
+      disconnectUsers([member.user.id]);
     }
-    res.json(OrganizationMemberSchema.parse(payload));
+    // Department change: sockets re-authorize, unassigned tasks are published, lost production roles get the PD-024
+    // follow-ups (job chats, orphaned jobs → admins notified).
+    await afterDepartmentChange(context, member.user.id, departmentChange);
+    res.json(OrganizationMemberSchema.parse(member));
   } catch (error) {
     next(error);
   }

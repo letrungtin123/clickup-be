@@ -52,7 +52,7 @@ import {
   type JobRow,
   type TaskRow
 } from "./jobs.repo.js";
-import { enqueueProductionEvents, feedbackEvent } from "./notifications.js";
+import { enqueueProductionEvents, feedbackEvent, jobLeaderAssignedEvent } from "./notifications.js";
 import { publishProductionChange } from "./realtime.js";
 import { insertTasks, loadJobForTasks, moveTasks, releaseParkedTasks, settleJob, softDeleteTasks, syncJobTotalImages } from "./tasks.service.js";
 import { allowedTransitions, statusByCode, statusById, systemOnlyTargetCodes, type Workflow } from "./workflow.js";
@@ -378,6 +378,10 @@ export const createJob = async (context: AccessContext, input: CreateJobRequest)
     if (input.tagIds?.length) {
       await setEntityTags(tx, organizationId, "JOB", created.id, input.tagIds);
     }
+    // The Leader is told the job is theirs (never when they created it themselves: the actor is never notified).
+    if (leaderId) {
+      await enqueueProductionEvents(tx, [jobLeaderAssignedEvent(organizationId, created.id, context.user.id, leaderId)]);
+    }
     return created.id;
   });
   publishProductionChange(organizationId, jobId, [], "job", context.user.id);
@@ -477,6 +481,9 @@ export const updateJob = async (context: AccessContext, jobId: string, input: Up
         INSERT INTO production.task_logs (organization_id, task_id, job_id, user_id, action, from_value, to_value)
         VALUES (${organizationId}, NULL, ${jobId}, ${context.user.id}, 'JOB', ${tx.json(change.from as never)}, ${tx.json(change.to as never)})
       `;
+    }
+    if (after.leader_id && after.leader_id !== job.leader_id) {
+      await enqueueProductionEvents(tx, [jobLeaderAssignedEvent(organizationId, jobId, context.user.id, after.leader_id)]);
     }
     return job.leader_id;
   });

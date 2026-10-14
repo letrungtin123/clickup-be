@@ -1,4 +1,5 @@
 import { getSql } from "../../db/client.js";
+import { DepartmentSchema, type Department } from "../../contracts/departments.js";
 import type {
   Notification,
   NotificationPage,
@@ -28,7 +29,27 @@ type NotificationRow = {
   payload: Record<string, unknown>;
   created_at: Date;
   read_at: Date | null;
+  /** Department of the project the entry is about (`projectDepartmentSql`), null without one. */
+  project_department: string | null;
 };
+
+/**
+ * Department of an inbox entry (PD-041): production module entries belong to Photo Retouch, workspace project /
+ * task entries to their project's department; shared content (chat, knowledge, system) to none.
+ */
+const notificationDepartment = (row: Pick<NotificationRow, "type" | "project_id" | "project_department">): Department | null => {
+  if (row.type.startsWith("production.")) {
+    return "PHOTO_RETOUCH";
+  }
+  if (row.project_id) {
+    return DepartmentSchema.safeParse(row.project_department).data ?? null;
+  }
+  return null;
+};
+
+/** `project_department` column of a notification row (alias `n`). */
+const projectDepartmentSql = (sql: QuerySql) =>
+  sql`(SELECT dp.department FROM public.projects dp WHERE dp.id = n.project_id AND dp.organization_id = n.organization_id) AS project_department`;
 
 const toNotification = (row: NotificationRow): Notification => ({
   id: row.id,
@@ -49,22 +70,28 @@ const toNotification = (row: NotificationRow): Notification => ({
     knowledgeItemId: typeof row.payload.knowledgeItemId === "string" ? row.payload.knowledgeItemId : null
   },
   payload: row.payload,
+  department: notificationDepartment(row),
   createdAt: toIso(row.created_at),
   readAt: row.read_at ? toIso(row.read_at) : null
 });
 
 const notificationColumns = (sql: QuerySql) => sql`
   n.id, n.type, n.title, n.body, n.project_id, n.task_id, n.comment_id, n.channel_id, n.message_id, n.payload, n.created_at, n.read_at,
-  (SELECT ${userJsonSql(sql)} FROM public.app_users au WHERE au.id = n.actor_user_id) AS actor
+  (SELECT ${userJsonSql(sql)} FROM public.app_users au WHERE au.id = n.actor_user_id) AS actor,
+  ${projectDepartmentSql(sql)}
 `;
 
 /**
  * Defense in depth (BUG-WK-04): an inbox entry about a project or channel is only shown while its recipient
  * can still see that project / channel — even if a purge on an access change was missed. Evaluated in SQL
  * from the recipient (alias `n`), so the API and the worker's unread pushes agree.
+ * Departments (PD-041): a public project counts only for members of its department (explicit project members and
+ * the superadmin always), and production module entries only while the recipient is in Photo Retouch — they come
+ * back if the department is given back.
  */
 const recipientCanSeeSql = (sql: QuerySql) => sql`
-  (n.project_id IS NULL OR EXISTS (
+  (n.type NOT LIKE 'production.%' OR public.is_department_member(n.organization_id, n.recipient_user_id, 'PHOTO_RETOUCH'))
+  AND (n.project_id IS NULL OR EXISTS (
     SELECT 1
     FROM public.projects vp
     JOIN public.organization_memberships vom
@@ -78,7 +105,11 @@ const recipientCanSeeSql = (sql: QuerySql) => sql`
         OR (
           EXISTS (SELECT 1 FROM public.role_permissions vrp WHERE vrp.role_id = vr.id AND vrp.permission_key = 'project.view')
           AND (
-            vp.visibility = 'public'
+            -- The superadmin is handled above, so a department row is all it takes (cheaper than is_department_member).
+            (vp.visibility = 'public' AND EXISTS (
+              SELECT 1 FROM public.user_departments vud
+              WHERE vud.organization_id = vp.organization_id AND vud.user_id = n.recipient_user_id AND vud.department = vp.department
+            ))
             OR EXISTS (
               SELECT 1 FROM public.project_memberships vpm
               WHERE vpm.organization_id = vp.organization_id AND vpm.project_id = vp.id AND vpm.user_id = n.recipient_user_id
@@ -257,6 +288,8 @@ export const deliverNotifications = async (draft: NotificationDraft) => {
         AND om.user_id = ANY(${recipients}::uuid[])
         AND om.status = 'active'
         AND om.deleted_at IS NULL
+        -- Production module entries only reach members of Photo Retouch (PD-041): no inbox row, pop-up or e-mail.
+        AND (${draft.type}::text NOT LIKE 'production.%' OR public.is_department_member(om.organization_id, om.user_id, 'PHOTO_RETOUCH'))
     ), inserted AS (
       INSERT INTO public.notifications (
         organization_id, recipient_user_id, type, actor_user_id, project_id, task_id, comment_id, channel_id, message_id,
@@ -270,9 +303,7 @@ export const deliverNotifications = async (draft: NotificationDraft) => {
       ON CONFLICT (organization_id, recipient_user_id, dedupe_key) DO NOTHING
       RETURNING *
     )
-    SELECT n.id, n.recipient_user_id, n.type, n.title, n.body, n.project_id, n.task_id, n.comment_id, n.channel_id,
-      n.message_id, n.payload, n.created_at, n.read_at,
-      (SELECT ${userJsonSql(sql)} FROM public.app_users au WHERE au.id = n.actor_user_id) AS actor
+    SELECT ${insertedNotificationColumns(sql)}
     FROM inserted n
   `;
 
@@ -338,7 +369,8 @@ export const afterNotificationsInserted = async (organizationId: string, inserte
 export const insertedNotificationColumns = (sql: QuerySql) => sql`
   n.id, n.recipient_user_id, n.type, n.title, n.body, n.project_id, n.task_id, n.comment_id, n.channel_id,
   n.message_id, n.payload, n.created_at, n.read_at,
-  (SELECT ${userJsonSql(sql)} FROM public.app_users au WHERE au.id = n.actor_user_id) AS actor
+  (SELECT ${userJsonSql(sql)} FROM public.app_users au WHERE au.id = n.actor_user_id) AS actor,
+  ${projectDepartmentSql(sql)}
 `;
 
 /**

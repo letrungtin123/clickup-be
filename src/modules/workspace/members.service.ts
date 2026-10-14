@@ -1,3 +1,4 @@
+import type { Department } from "../../contracts/departments.js";
 import { Permission } from "../../contracts/permissions.js";
 import type { ChangePasswordRequest, CreateOrganizationMemberRequest, WorkspaceContext } from "../../contracts/schemas.js";
 import { getSql } from "../../db/client.js";
@@ -7,10 +8,22 @@ import { logger } from "../../lib/logger.js";
 import { getOptionalRedis } from "../../lib/redis.js";
 import { disconnectUsers } from "../../realtime/publisher.js";
 import { invalidateAccessContexts } from "../access/access-context.js";
+import {
+  assertDepartmentsChangeAllowed,
+  assertDepartmentsPresent,
+  productionRolesNotAllowed,
+  productionRolesRequired,
+  replaceUserDepartments
+} from "../access/departments.js";
 import { assertPermission } from "../access/resource-access.js";
 import { createAuthUser, generateTemporaryPassword, setAuthUserBanned, setAuthUserPassword } from "../auth/supabase-admin.service.js";
 import { revokeTokensIssuedBefore, signInWithPassword } from "../auth/supabase-auth.service.js";
-import { assertCanAssignRole, assertProductionRolesCovered, getOrganizationMemberByUserId } from "./workspace.service.js";
+import {
+  assertCanAssignRole,
+  assertCanGrantProductionRoles,
+  assertProductionRolesCovered,
+  getOrganizationMemberByUserId
+} from "./workspace.service.js";
 
 const accessTokenTtlSeconds = 3600;
 /**
@@ -77,16 +90,64 @@ const changePasswordAndRevoke = async (userId: string, password: string, keepSes
   await revokeUserSessions(userId, keepSessionId, before);
 };
 
-/** PD-005: admins create accounts with a one-time temporary password the user must replace. */
+/**
+ * PD-005: admins create accounts with a one-time temporary password the user must replace.
+ * PD-041: departments are required (400 DEPARTMENTS_REQUIRED) unless the role is superadmin (implicitly in every
+ * department: no rows, no production roles written); a caller who is not the superadmin may only hand out departments
+ * they belong to (403 DEPARTMENT_ESCALATION). With PHOTO_RETOUCH the production roles are required (400
+ * PRODUCTION_ROLES_REQUIRED) and may only be granted by a production ADMIN or the superadmin (403
+ * PRODUCTION_ROLE_ESCALATION); without it none are allowed (400 PRODUCTION_ROLES_NOT_ALLOWED).
+ */
 export const createOrganizationMember = async (context: WorkspaceContext, input: CreateOrganizationMemberRequest) => {
   assertPermission(context, Permission.MemberManage);
-  await assertCanAssignRole(getSql(), context, input.roleId);
-  return await provisionOrganizationMember(context, {
-    email: input.email,
-    displayName: input.displayName,
-    jobTitle: input.jobTitle ?? null,
-    roleId: input.roleId
-  });
+  const role = await assertCanAssignRole(getSql(), context, input.roleId);
+  const superadmin = role.key === "superadmin";
+  assertDepartmentsPresent(input.departments, superadmin);
+  const departments = superadmin ? [] : input.departments;
+  assertDepartmentsChangeAllowed(context, [], departments);
+  const requestedRoles = input.productionRoles ?? [];
+  if (!superadmin && departments.includes("PHOTO_RETOUCH") && requestedRoles.length === 0) {
+    throw productionRolesRequired();
+  }
+  if (!superadmin && !departments.includes("PHOTO_RETOUCH") && requestedRoles.length > 0) {
+    throw productionRolesNotAllowed();
+  }
+  const productionRoles = superadmin ? [] : requestedRoles;
+  assertCanGrantProductionRoles(context, productionRoles);
+  return await provisionOrganizationMember(
+    context,
+    { email: input.email, displayName: input.displayName, jobTitle: input.jobTitle ?? null, roleId: input.roleId },
+    superadmin ? undefined : (tx, userId) => writeMemberDepartments(tx, context, { userId, departments, productionRoles })
+  );
+};
+
+/**
+ * PD-041: departments and production roles of a new (or taken-over) account, inside the provisioning transaction. The
+ * account starts from what was chosen now (other department rows and leftover production roles are removed, so nobody
+ * outside PHOTO_RETOUCH keeps a production role); a Photo Retouch member gets their production profile row (the
+ * production users admin sets its team afterwards). The caller has authorized departments and roles.
+ */
+export const writeMemberDepartments = async (
+  tx: QuerySql,
+  context: WorkspaceContext,
+  input: { userId: string; departments: readonly Department[]; productionRoles: readonly string[] }
+) => {
+  const organizationId = context.organization.id;
+  await replaceUserDepartments(tx, { organizationId, userId: input.userId, departments: input.departments, actorUserId: context.user.id });
+  const roles = input.departments.includes("PHOTO_RETOUCH") ? [...new Set(input.productionRoles)] : [];
+  await tx`DELETE FROM production.user_roles WHERE organization_id = ${organizationId} AND user_id = ${input.userId}`;
+  if (roles.length > 0) {
+    await tx`
+      INSERT INTO production.user_roles (organization_id, user_id, role_code, granted_by)
+      SELECT ${organizationId}, ${input.userId}, role, ${context.user.id} FROM unnest(${roles}::text[]) AS role
+      ON CONFLICT DO NOTHING
+    `;
+    await tx`
+      INSERT INTO production.member_profiles (organization_id, user_id)
+      VALUES (${organizationId}, ${input.userId})
+      ON CONFLICT (organization_id, user_id) DO NOTHING
+    `;
+  }
 };
 
 /**

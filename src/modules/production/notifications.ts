@@ -33,6 +33,10 @@ export const enqueueProductionEvents = (tx: QuerySql, events: DomainEventInput[]
 export const taskAssignedEvent = (organizationId: string, taskId: string, actorId: string | null) =>
   event(organizationId, "production.task.assigned", taskId, actorId, { taskId });
 
+/** `leaderId`: the Leader the job was given to (the handler skips it when the job has had another Leader since). */
+export const jobLeaderAssignedEvent = (organizationId: string, jobId: string, actorId: string, leaderId: string) =>
+  ({ ...event(organizationId, "production.job.leader_assigned", jobId, actorId, { jobId, leaderId }), aggregateType: "production_job" });
+
 export const taskStatusEvent = (
   organizationId: string,
   taskId: string,
@@ -106,6 +110,8 @@ const distinct = (ids: readonly (string | null | undefined)[], exclude: readonly
 export const productionRecipients = {
   /** TASK_ASSIGNED → assignee. */
   taskAssigned: (task: TaskPeople) => distinct([task.assigneeId]),
+  /** JOB_LEADER_ASSIGNED → the job's (still active) Leader. */
+  jobLeaderAssigned: (leaderId: string | null) => distinct([leaderId]),
   /** TASK_WAITING_QC → QC. */
   waitingQc: (task: TaskPeople) => distinct([task.qcId]),
   /** QC_FAILED → assignee. */
@@ -258,6 +264,46 @@ export const productionNotificationHandlers: Record<string, (event: DomainEventE
     if (task) {
       await notifyTask(envelope, task, "production.task_assigned", productionRecipients.taskAssigned(peopleOf(task)));
     }
+  },
+
+  /** The job's Leader learns the job is theirs (created with them as Leader, or the Leader changed to them). */
+  "production.job.leader_assigned": async (envelope) => {
+    const jobId = str(envelope.payload.jobId);
+    const leaderId = str(envelope.payload.leaderId);
+    if (!jobId || !leaderId) {
+      return;
+    }
+    const sql = getSql();
+    const job = (
+      await sql<{ code: string; name: string | null; project_code: string; deadline: Date; leader_id: string | null; leader_active: boolean; task_count: number }[]>`
+        SELECT j.code, j.name, p.code AS project_code, j.deadline, j.leader_id, ${leaderActiveSql(sql)} AS leader_active,
+          (SELECT count(*)::int FROM production.tasks t WHERE t.organization_id = j.organization_id AND t.job_id = j.id AND t.deleted_at IS NULL) AS task_count
+        FROM production.jobs j
+        JOIN production.projects p ON p.organization_id = j.organization_id AND p.id = j.project_id
+        WHERE j.organization_id = ${envelope.organizationId} AND j.id = ${jobId} AND j.deleted_at IS NULL
+      `
+    )[0];
+    // Another Leader since the change (or none, or no longer a Leader): nothing to tell this person.
+    if (!job || job.leader_id !== leaderId || !job.leader_active) {
+      return;
+    }
+    await deliverNotifications({
+      organizationId: envelope.organizationId,
+      recipientIds: productionRecipients.jobLeaderAssigned(job.leader_id),
+      type: "production.job_leader_assigned",
+      actorUserId: envelope.actorUserId,
+      title: job.code,
+      body: job.name,
+      payload: {
+        jobId,
+        jobCode: job.code,
+        jobName: job.name,
+        projectCode: job.project_code,
+        deadline: job.deadline.toISOString(),
+        taskCount: job.task_count
+      },
+      dedupeKey: `evt:${envelope.id}`
+    });
   },
 
   "production.task.status_changed": async (envelope) => {

@@ -1,5 +1,6 @@
 import { z } from "zod";
 
+import { DepartmentSchema } from "./departments.js";
 import { createCursorPageSchema } from "./pagination.js";
 import { RichTextDocSchema } from "./rich-text.js";
 import { FileNameSchema, IsoDateInputSchema, MimeTypeSchema, SafeLineSchema, SafeMultilineSchema, SafeSearchSchema } from "./schemas.js";
@@ -103,6 +104,11 @@ export const ProjectSchema = z.object({
   name: z.string(),
   description: z.string().nullable(),
   visibility: ProjectVisibilitySchema,
+  /**
+   * Owning department (PD-041; every workspace project is PRODUCTION today). A public project is visible to that
+   * department's members, explicit project members and the superadmin; a private one to its members and the superadmin.
+   */
+  department: DepartmentSchema.default("PRODUCTION"),
   color: ColorTokenSchema,
   icon: z.string().nullable(),
   rank: z.string(),

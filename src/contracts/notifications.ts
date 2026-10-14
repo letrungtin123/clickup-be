@@ -1,5 +1,6 @@
 import { z } from "zod";
 
+import { DepartmentSchema } from "./departments.js";
 import { createCursorPageSchema } from "./pagination.js";
 import { UserRefSchema } from "./work.js";
 
@@ -22,6 +23,11 @@ export const notificationTypes = [
   "channel.member_added",
   // Production (Photo Retouch) module — PLAN §8. Target: productionTaskId / jobId.
   "production.task_assigned",
+  /**
+   * To the job's new Leader when a job is created with them as Leader or the Leader changes to them (2026-10-13).
+   * Payload: { jobId, jobCode, jobName, projectCode, deadline, taskCount }. Target: jobId.
+   */
+  "production.job_leader_assigned",
   "production.task_waiting_qc",
   "production.qc_failed",
   "production.task_checked",
@@ -90,6 +96,11 @@ export const NotificationSchema = z.object({
   target: NotificationTargetSchema,
   /** Type-specific extras, e.g. { statusName, dueAt, projectName }. */
   payload: z.record(z.string(), z.unknown()),
+  /**
+   * Department the notification belongs to (PD-041) for the inbox badge: `production.*` → PHOTO_RETOUCH, a workspace
+   * project / task → the project's department; null for shared content (chat, knowledge, system).
+   */
+  department: DepartmentSchema.nullable().default(null),
   createdAt: IsoDate,
   readAt: IsoDate.nullable()
 });

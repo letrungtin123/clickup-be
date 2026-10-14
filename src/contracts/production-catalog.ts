@@ -1,5 +1,6 @@
 import { z } from "zod";
 
+import { DepartmentSchema } from "./departments.js";
 import { colorTokens, UserRefSchema } from "./work.js";
 
 /**
@@ -210,6 +211,8 @@ export const ProductionMemberSchema = z.object({
   email: z.string().nullable(),
   avatarUrl: z.string().nullable(),
   roles: z.array(ProductionRoleSchema),
+  /** Departments (PD-041), stable order; an organization superadmin belongs to all. */
+  departments: z.array(DepartmentSchema).default([]),
   teamId: Id.nullable(),
   active: z.boolean(),
   customValues: CustomValuesSchema,

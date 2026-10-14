@@ -914,7 +914,9 @@ const systemActorContext = async (sql: QuerySql, organizationId: string, actorId
     role: { id: actorId, organizationId, key: "system", name: "system", permissions: [] },
     hasFullOrganizationAuthority: false,
     mustChangePassword: false,
-    productionRoles: []
+    productionRoles: [],
+    departments: [],
+    canSwitchDepartment: false
   };
 };
 

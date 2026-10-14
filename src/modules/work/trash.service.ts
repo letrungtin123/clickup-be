@@ -1,3 +1,4 @@
+import type { Department } from "../../contracts/departments.js";
 import { Permission } from "../../contracts/permissions.js";
 import type { TrashedTask } from "../../contracts/search.js";
 import { getSql } from "../../db/client.js";
@@ -7,6 +8,7 @@ import { logger } from "../../lib/logger.js";
 import { removeObjects } from "../../lib/storage.js";
 import { publishToRoom } from "../../realtime/publisher.js";
 import type { AccessContext } from "../access/access-context.js";
+import { hasDepartment } from "../access/departments.js";
 import { assertPermission, assertProjectAccess, hasPermission, projectLevelAtLeast, visibleProjectsPredicate } from "../access/resource-access.js";
 import { toUserRef, type UserRefJson } from "./mappers.js";
 import { loadEffectiveWorkflow } from "./statuses.service.js";
@@ -25,6 +27,7 @@ type TrashRow = {
   deleted_by: UserRefJson | null;
   access_level: "view" | "submit" | "manage" | null;
   visibility: "public" | "private";
+  department: Department;
 };
 
 /**
@@ -47,7 +50,7 @@ export const listTrash = async (
   }
   const rows = await sql<(TrashRow & { cursor_at: string })[]>`
     SELECT t.id, p.key || '-' || t.number AS task_key, t.title, t.project_id, p.name AS project_name, t.list_id, l.name AS list_name,
-      t.deleted_at, ${timestampTextSql(sql, () => sql`t.deleted_at`)} AS cursor_at, p.visibility, pm.access_level,
+      t.deleted_at, ${timestampTextSql(sql, () => sql`t.deleted_at`)} AS cursor_at, p.visibility, p.department, pm.access_level,
       (SELECT count(*)::int FROM public.tasks d
         WHERE d.organization_id = t.organization_id AND d.parent_task_id = t.id AND d.deleted_at = t.deleted_at) AS subtask_count,
       (SELECT ${userJsonSql(sql)} FROM public.app_users au WHERE au.id = t.deleted_by) AS deleted_by
@@ -72,7 +75,10 @@ export const listTrash = async (
   const page = rows.slice(0, input.limit);
   const last = page[page.length - 1];
   const items: TrashedTask[] = page.map((row) => {
-    const level = context.hasFullOrganizationAuthority ? "manage" : (row.access_level ?? (row.visibility === "public" ? "submit" : null));
+    // Same rule as getProjectAccess: explicit membership, or implicit submit on a public project of my department (PD-041).
+    const level = context.hasFullOrganizationAuthority
+      ? "manage"
+      : (row.access_level ?? (row.visibility === "public" && hasDepartment(context, row.department) ? "submit" : null));
     return {
       id: row.id,
       key: row.task_key,

@@ -1,8 +1,10 @@
+import type { Department } from "../../contracts/departments.js";
 import { Permission, type PermissionKey } from "../../contracts/permissions.js";
 import { getSql } from "../../db/client.js";
 import { AppError } from "../../lib/app-error.js";
 import type { QuerySql } from "../../lib/db-types.js";
 import type { AccessContext } from "./access-context.js";
+import { hasDepartment } from "./departments.js";
 
 export type ProjectAccessLevel = "view" | "submit" | "manage";
 
@@ -21,13 +23,15 @@ export type ProjectAccess = {
   level: ProjectAccessLevel;
   isMember: boolean;
   visibility: "public" | "private";
+  /** Owning department (PD-041): a public project is open to that department's members. */
+  department: Department;
   projectKey: string;
 };
 
 /**
- * Effective project access (PD-006): organization boundary + `project.view` +
- * explicit membership, or implicit `submit` on public projects. Superadmins manage everything.
- * Returns null when the project is missing or invisible — callers answer 404 either way.
+ * Effective project access (PD-006 + PD-041): organization boundary + `project.view` + explicit (invited)
+ * membership, or implicit `submit` on public projects of a department the caller belongs to. Superadmins manage
+ * everything. Returns null when the project is missing or invisible — callers answer 404 either way.
  */
 export const getProjectAccess = async (
   context: AccessContext,
@@ -38,8 +42,10 @@ export const getProjectAccess = async (
     return null;
   }
 
-  const rows = await sql<{ key: string; visibility: "public" | "private"; access_level: ProjectAccessLevel | null }[]>`
-    SELECT p.key, p.visibility, pm.access_level
+  const rows = await sql<
+    { key: string; visibility: "public" | "private"; department: Department; access_level: ProjectAccessLevel | null }[]
+  >`
+    SELECT p.key, p.visibility, p.department, pm.access_level
     FROM public.projects p
     LEFT JOIN public.project_memberships pm
       ON pm.organization_id = p.organization_id
@@ -60,14 +66,16 @@ export const getProjectAccess = async (
   }
 
   const isMember = row.access_level !== null;
+  const base = { isMember, visibility: row.visibility, department: row.department, projectKey: row.key };
   if (context.hasFullOrganizationAuthority) {
-    return { level: "manage", isMember, visibility: row.visibility, projectKey: row.key };
+    return { ...base, level: "manage" };
   }
   if (row.access_level) {
-    return { level: row.access_level, isMember, visibility: row.visibility, projectKey: row.key };
+    return { ...base, level: row.access_level };
   }
-  if (row.visibility === "public") {
-    return { level: "submit", isMember: false, visibility: row.visibility, projectKey: row.key };
+  // A public project is open to its department only (PD-041); anyone else needs an invitation.
+  if (row.visibility === "public" && hasDepartment(context, row.department)) {
+    return { ...base, level: "submit" };
   }
   return null;
 };
@@ -94,13 +102,17 @@ export const assertProjectAccess = async (
   return access;
 };
 
-/** SQL predicate selecting projects visible to the caller (alias `p`). */
+/**
+ * SQL predicate selecting projects visible to the caller (alias `p`): explicit (invited) membership, or a public
+ * project of one of the caller's departments (PD-041). Superadmins see everything.
+ */
 export const visibleProjectsPredicate = (sql: QuerySql, context: AccessContext) => {
   if (context.hasFullOrganizationAuthority) {
     return sql`TRUE`;
   }
+  const departments: string[] = [...context.departments];
   return sql`(
-    p.visibility = 'public'
+    (p.visibility = 'public' AND p.department = ANY(${departments}::text[]))
     OR EXISTS (
       SELECT 1 FROM public.project_memberships vpm
       WHERE vpm.organization_id = p.organization_id

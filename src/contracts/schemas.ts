@@ -1,5 +1,6 @@
 import { z } from "zod";
 
+import { DepartmentListSchema, DepartmentSchema, departmentRolesProblem, MemberProductionRolesSchema } from "./departments.js";
 import { PageInfoSchema } from "./pagination.js";
 import { permissionValues } from "./permissions.js";
 export const OpaqueIdSchema = z.string().uuid();
@@ -197,15 +198,22 @@ export const OrganizationMemberSchema = z.object({
   user: AppUserSchema,
   role: RoleSchema,
   status: MembershipStatusSchema,
+  /**
+   * Departments (PD-041), stable order. A superadmin gets every department (implicit membership, no rows): show it as
+   * "Tất cả" by the role key.
+   */
+  departments: z.array(DepartmentSchema).default([]),
   joinedAt: IsoDateTimeSchema.nullable(),
   createdAt: IsoDateTimeSchema,
   updatedAt: IsoDateTimeSchema
 });
 
-/** GET /organization/members: optional search / status filter, keyset paging (status, name, id). */
+/** GET /organization/members: optional search / status / department filter, keyset paging (status, name, id). */
 export const OrganizationMemberQuerySchema = z.object({
   q: SafeSearchSchema(120).optional(),
   status: MembershipStatusSchema.optional(),
+  /** Members of this department (superadmins included: they belong to every department). */
+  department: DepartmentSchema.optional(),
   cursor: z.string().max(1000).optional(),
   limit: z.coerce.number().int().min(1).max(500).default(500)
 });
@@ -219,7 +227,17 @@ export const OrganizationMemberCollectionSchema = z.object({
 export const UpdateOrganizationMemberRequestSchema = z
   .object({
     roleId: OpaqueIdSchema.optional(),
-    status: EditableMembershipStatusSchema.optional()
+    status: EditableMembershipStatusSchema.optional(),
+    /**
+     * Replaces the member's departments (PD-041). At least one unless the resulting role is superadmin. Removing
+     * PHOTO_RETOUCH also removes the person's production roles (follow-ups as in PD-024).
+     */
+    departments: DepartmentListSchema.optional(),
+    /**
+     * Production roles to set together with the departments: required (non-empty) when PHOTO_RETOUCH is added to
+     * someone without production roles; only allowed while the resulting departments include PHOTO_RETOUCH.
+     */
+    productionRoles: MemberProductionRolesSchema.optional()
   })
   .refine((value) => Object.values(value).some((entry) => entry !== undefined), {
     message: "At least one organization member field is required."
@@ -232,8 +250,15 @@ export const WorkspaceContextSchema = z.object({
   hasFullOrganizationAuthority: z.boolean(),
   /** Set for admin-created accounts until the user replaces the temporary password (PD-005). */
   mustChangePassword: z.boolean().default(false),
-  /** Production (retouch) roles: ADMIN | ACCOUNT | LEADER | QC | STAFF (PD-011). */
-  productionRoles: z.array(z.string().min(1).max(20)).default([])
+  /**
+   * Effective production (Photo Retouch) roles: ADMIN | ACCOUNT | LEADER | QC | STAFF (PD-011). Empty when the user is
+   * not in the PHOTO_RETOUCH department (PD-041) — the module is then closed to them like to anyone without a role.
+   */
+  productionRoles: z.array(z.string().min(1).max(20)).default([]),
+  /** Departments the user belongs to (PD-041), stable order; a superadmin implicitly belongs to all. */
+  departments: z.array(DepartmentSchema).default([]),
+  /** More than one department: the header shows the department switcher. */
+  canSwitchDepartment: z.boolean().default(false)
 });
 
 /**
@@ -245,7 +270,12 @@ export const NotificationChannelsSchema = z.object({ notifyWeb: z.boolean(), not
 
 /** GET /workspace/context response: the access context plus `notificationPreferences` (read fresh, not cached). */
 export const WorkspaceSessionSchema = WorkspaceContextSchema.extend({
-  notificationPreferences: NotificationChannelsSchema.default({ notifyWeb: true, notifyEmail: false })
+  notificationPreferences: NotificationChannelsSchema.default({ notifyWeb: true, notifyEmail: false }),
+  /**
+   * The department shown (PD-041), remembered per user (PUT /workspace/department) and read fresh: the saved choice when
+   * the user still belongs to it, otherwise the first of `departments`; null without any department.
+   */
+  currentDepartment: DepartmentSchema.nullable().default(null)
 });
 
 /** bcrypt (GoTrue) only uses the first 72 bytes of a password; GoTrue rejects longer ones. */
@@ -279,9 +309,19 @@ export const CreateOrganizationMemberRequestSchema = z
     email: AccountEmailSchema,
     displayName: SafeLineSchema(160),
     roleId: OpaqueIdSchema,
-    jobTitle: SafeLineSchema(120, 0).nullable().optional()
+    jobTitle: SafeLineSchema(120, 0).nullable().optional(),
+    /** Required (PD-041): at least one, unless the chosen role is superadmin (checked by the API). */
+    departments: DepartmentListSchema,
+    /** Production roles: required with PHOTO_RETOUCH, not allowed without it. */
+    productionRoles: MemberProductionRolesSchema.optional()
   })
-  .strict();
+  .strict()
+  .superRefine((value, ctx) => {
+    const problem = departmentRolesProblem(value.departments, value.productionRoles);
+    if (problem) {
+      ctx.addIssue({ code: "custom", path: ["productionRoles"], message: problem });
+    }
+  });
 
 export const TemporaryPasswordResponseSchema = z.object({
   /** Shown to the admin exactly once; never stored in plain text. */

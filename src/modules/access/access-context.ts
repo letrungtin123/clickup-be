@@ -8,7 +8,8 @@ import { getWorkspaceContext } from "../workspace/workspace.service.js";
 export type AccessContext = WorkspaceContext;
 
 const versionKey = "authz:ver";
-const contextKey = (version: string, userId: string) => `authz:ctx:${version}:${userId}`;
+/** `v2`: the context shape changed (departments, PD-041): entries cached by an older build are never read. */
+const contextKey = (version: string, userId: string) => `authz:ctx:v2:${version}:${userId}`;
 
 /**
  * Resolves the caller's organization, role, and permissions from PostgreSQL, cached in Redis
@@ -58,7 +59,7 @@ export const assertPasswordCurrent = (context: AccessContext) => {
   return context;
 };
 
-/** Call after any change to roles, role permissions, or organization memberships. */
+/** Call after any change to roles, role permissions, organization memberships, production roles or departments. */
 export const invalidateAccessContexts = async () => {
   const redis = getOptionalRedis();
   if (!redis) {

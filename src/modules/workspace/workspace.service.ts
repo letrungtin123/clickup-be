@@ -6,6 +6,7 @@ import type {
   CreateRoleRequest,
   EditableMembershipStatus,
   ManagedRole,
+  OrganizationMember,
   OrganizationMemberCollection,
   OrganizationMemberQuery,
   PermissionCollection,
@@ -19,6 +20,7 @@ import type {
 import { getSql } from "../../db/client.js";
 import { AppError } from "../../lib/app-error.js";
 import { decodeCursor, encodeCursor, escapeLike, invalidCursor, isUuid } from "../../lib/db-types.js";
+import { effectiveDepartments, type MemberDepartmentChange, type MemberDepartmentWriter } from "../access/departments.js";
 
 type QuerySql = postgres.Sql | postgres.TransactionSql;
 
@@ -28,6 +30,7 @@ type WorkspaceContextRow = {
   display_name: string;
   must_change_password: boolean;
   production_roles: string[] | null;
+  departments: string[] | null;
   organization_id: string;
   organization_slug: string;
   organization_name: string;
@@ -65,6 +68,7 @@ type OrganizationMemberRow = {
   role_key: string;
   role_name: string;
   role_permissions: string[] | null;
+  departments: string[] | null;
   status: "invited" | "active" | "disabled";
   joined_at: Date | string | null;
   created_at: Date | string;
@@ -137,6 +141,8 @@ const toOrganizationMember = (row: OrganizationMemberRow) => ({
     permissions: toPermissionKeys(row.role_permissions)
   },
   status: row.status,
+  // PD-041: a superadmin implicitly belongs to every department (no rows).
+  departments: effectiveDepartments(row.role_key === "superadmin", row.departments),
   joinedAt: toNullableIso(row.joined_at),
   createdAt: toIso(row.created_at),
   updatedAt: toIso(row.updated_at)
@@ -285,11 +291,24 @@ export const assertProductionRolesCovered = async (sql: QuerySql, context: Works
     throw new AppError(
       "PRODUCTION_ROLE_ESCALATION",
       targetRoles.includes("ADMIN")
-        ? "Chỉ Quản trị sản xuất hoặc superadmin mới thao tác được trên tài khoản Quản trị sản xuất."
-        : "Bạn không thể thao tác trên tài khoản có vai trò sản xuất mà bạn không có.",
+        ? "Chỉ Quản trị Photo Retouch hoặc superadmin mới thao tác được trên tài khoản Quản trị Photo Retouch."
+        : "Bạn không thể thao tác trên tài khoản có vai trò Photo Retouch mà bạn không có.",
       403
     );
   }
+};
+
+/**
+ * PD-041: production (Photo Retouch) roles granted from outside the production module (Cài đặt › Thành viên) need a
+ * production ADMIN or the organization superadmin — the people who manage production roles in the module (PD-024).
+ * Holding the granted role yourself is not enough (stricter than `assertProductionRolesCovered`). Removing roles
+ * stays covered by `assertProductionRolesCovered` on the target.
+ */
+export const assertCanGrantProductionRoles = (context: WorkspaceContext, roles: readonly string[]) => {
+  if (roles.length === 0 || context.hasFullOrganizationAuthority || context.productionRoles.includes("ADMIN")) {
+    return;
+  }
+  throw new AppError("PRODUCTION_ROLE_ESCALATION", "Chỉ Quản trị Photo Retouch hoặc superadmin mới gán được vai trò Photo Retouch.", 403);
 };
 
 /** Role edits and deletions need every capability of the role (and never the caller's own role, WK-40). */
@@ -316,6 +335,11 @@ export const getWorkspaceContext = async (userId: string): Promise<WorkspaceCont
         FROM production.user_roles pur
         WHERE pur.organization_id = o.id AND pur.user_id = au.id
       ) AS production_roles,
+      (
+        SELECT array_agg(ud.department ORDER BY ud.department)
+        FROM public.user_departments ud
+        WHERE ud.organization_id = o.id AND ud.user_id = au.id
+      ) AS departments,
       o.id AS organization_id,
       o.slug AS organization_slug,
       o.name AS organization_name,
@@ -365,6 +389,8 @@ export const getWorkspaceContext = async (userId: string): Promise<WorkspaceCont
     permissions
   };
 
+  const superadmin = row.role_key === "superadmin";
+  const departments = effectiveDepartments(superadmin, row.departments);
   return {
     user,
     organization: {
@@ -373,9 +399,13 @@ export const getWorkspaceContext = async (userId: string): Promise<WorkspaceCont
       name: row.organization_name
     },
     role,
-    hasFullOrganizationAuthority: row.role_key === "superadmin",
+    hasFullOrganizationAuthority: superadmin,
     mustChangePassword: row.must_change_password,
-    productionRoles: row.production_roles ?? []
+    // PD-041: production roles only take effect inside the PHOTO_RETOUCH department (superadmins belong to all), so the
+    // module, its menus, endpoints and live room are closed to someone outside it exactly as to someone without a role.
+    productionRoles: departments.includes("PHOTO_RETOUCH") ? (row.production_roles ?? []) : [],
+    departments,
+    canSwitchDepartment: departments.length > 1
   };
 };
 
@@ -607,6 +637,11 @@ const selectOrganizationMembers = (
     r.key AS role_key,
     r.name AS role_name,
     array_remove(array_agg(rp.permission_key ORDER BY rp.permission_key), NULL) AS role_permissions,
+    (
+      SELECT array_agg(ud.department ORDER BY ud.department)
+      FROM public.user_departments ud
+      WHERE ud.organization_id = om.organization_id AND ud.user_id = om.user_id
+    ) AS departments,
     om.status,
     om.joined_at,
     om.created_at,
@@ -660,6 +695,16 @@ export const listOrganizationMembers = async (
   if (query.status) {
     filter = sql`${filter} AND om.status = ${query.status}`;
   }
+  if (query.department) {
+    // PD-041: the superadmin belongs to every department (no rows).
+    filter = sql`${filter} AND (
+      r.key = 'superadmin'
+      OR EXISTS (
+        SELECT 1 FROM public.user_departments ud
+        WHERE ud.organization_id = om.organization_id AND ud.user_id = om.user_id AND ud.department = ${query.department}
+      )
+    )`;
+  }
   if (query.cursor) {
     filter = sql`${filter} AND (${memberStatusRank(sql)}, au.display_name, au.id) > (${Number(rank)}::int, ${String(name)}::text, ${String(id)}::uuid)`;
   }
@@ -686,11 +731,19 @@ export const getOrganizationMemberByUserId = async (context: WorkspaceContext, u
   return toOrganizationMember(row);
 };
 
+/**
+ * PATCH /organization/members/:membershipId — role, status, and (PD-041) departments + production roles, in one
+ * transaction. `writeDepartments` is the shared department writer of the production users admin
+ * (`applyDepartmentChange`, injected by the route); it enforces DEPARTMENTS_REQUIRED (also for a superadmin demoted
+ * without departments), DEPARTMENT_ESCALATION, PRODUCTION_ROLES_REQUIRED / _NOT_ALLOWED and the production role grant
+ * guard. `departmentChange` (null when untouched) drives the follow-ups after the commit (`afterDepartmentChange`).
+ */
 export const updateOrganizationMember = async (
   context: WorkspaceContext,
   membershipId: string,
-  input: UpdateOrganizationMemberRequest
-) => {
+  input: UpdateOrganizationMemberRequest,
+  writeDepartments: MemberDepartmentWriter
+): Promise<{ member: OrganizationMember; departmentChange: MemberDepartmentChange | null }> => {
   assertPermission(context, Permission.MemberManage);
   const sql = getSql();
 
@@ -715,9 +768,10 @@ export const updateOrganizationMember = async (
     throw new AppError("SELF_MEMBERSHIP_UPDATE_FORBIDDEN", "You cannot change your own organization membership.", 409);
   }
 
+  let nextRoleKey = current.role_key;
   if (input.roleId) {
     await assertRoleExists(sql, context, input.roleId);
-    await assertCanAssignRole(sql, context, input.roleId);
+    nextRoleKey = (await assertCanAssignRole(sql, context, input.roleId)).key;
   }
 
   if (current.role_key === "superadmin" && !context.hasFullOrganizationAuthority) {
@@ -738,26 +792,44 @@ export const updateOrganizationMember = async (
 
   const hasRole = input.roleId !== undefined;
   const hasStatus = input.status !== undefined;
+  const superadminBefore = current.role_key === "superadmin";
+  const superadminAfter = nextRoleKey === "superadmin";
+  // A demoted superadmin leaves the implicit "every department": their departments are checked (and the lost ones
+  // revoked) even when the request carries none.
+  const departmentsTouched =
+    input.departments !== undefined || input.productionRoles !== undefined || (superadminBefore && !superadminAfter);
 
-  await sql`
-    UPDATE public.organization_memberships
-    SET role_id = CASE WHEN ${hasRole} THEN ${input.roleId ?? "00000000-0000-4000-8000-000000000000"}::uuid ELSE role_id END,
-        status = CASE WHEN ${hasStatus} THEN ${input.status ?? "active"} ELSE status END,
-        joined_at = CASE
-          WHEN ${hasStatus} AND ${input.status ?? "active"} = 'active' THEN COALESCE(joined_at, now())
-          ELSE joined_at
-        END,
-        updated_at = now()
-    WHERE id = ${membershipId}
-      AND organization_id = ${context.organization.id}
-      AND deleted_at IS NULL
-  `;
+  const departmentChange = await sql.begin(async (tx) => {
+    await tx`
+      UPDATE public.organization_memberships
+      SET role_id = CASE WHEN ${hasRole} THEN ${input.roleId ?? "00000000-0000-4000-8000-000000000000"}::uuid ELSE role_id END,
+          status = CASE WHEN ${hasStatus} THEN ${input.status ?? "active"} ELSE status END,
+          joined_at = CASE
+            WHEN ${hasStatus} AND ${input.status ?? "active"} = 'active' THEN COALESCE(joined_at, now())
+            ELSE joined_at
+          END,
+          updated_at = now()
+      WHERE id = ${membershipId}
+        AND organization_id = ${context.organization.id}
+        AND deleted_at IS NULL
+    `;
+    if (!departmentsTouched) {
+      return null;
+    }
+    return await writeDepartments(tx, context, {
+      userId: current.user_id,
+      superadminBefore,
+      superadminAfter,
+      departments: input.departments,
+      productionRoles: input.productionRoles
+    });
+  });
 
   const updated = (await selectOrganizationMembers(sql, context, sql`om.id = ${membershipId}`, 1))[0];
   if (!updated) {
     throw new AppError("ORG_MEMBER_NOT_FOUND", "Organization member was not found.", 404);
   }
 
-  return toOrganizationMember(updated);
+  return { member: toOrganizationMember(updated), departmentChange };
 };
 

@@ -3,6 +3,7 @@ import { getSql } from "../../db/client.js";
 import { AppError } from "../../lib/app-error.js";
 import { escapeLike } from "../../lib/db-types.js";
 import type { AccessContext } from "../access/access-context.js";
+import { departmentMemberSql } from "../access/departments.js";
 import { getProjectAccess, hasPermission } from "../access/resource-access.js";
 import { loadChannel } from "../chat/chat-access.js";
 import { toUserRef, type UserRefJson } from "./mappers.js";
@@ -39,13 +40,16 @@ export const searchDirectory = async (
     if (!access) {
       throw new AppError("PROJECT_NOT_FOUND", "Project was not found.", 404);
     }
-    if (access.visibility === "private") {
-      projectFilter = sql`EXISTS (
-        SELECT 1 FROM public.project_memberships pm
-        WHERE pm.organization_id = om.organization_id AND pm.project_id = ${input.projectId}
-          AND pm.user_id = om.user_id AND pm.status = 'active' AND pm.deleted_at IS NULL
-      )`;
-    }
+    // Explicit project members; on a public project also the members of its department (PD-041, superadmin included).
+    const explicitMember = sql`EXISTS (
+      SELECT 1 FROM public.project_memberships pm
+      WHERE pm.organization_id = om.organization_id AND pm.project_id = ${input.projectId}
+        AND pm.user_id = om.user_id AND pm.status = 'active' AND pm.deleted_at IS NULL
+    )`;
+    projectFilter =
+      access.visibility === "private"
+        ? explicitMember
+        : sql`(${explicitMember} OR ${departmentMemberSql(sql, sql`om.organization_id`, sql`om.user_id`, access.department)})`;
   } else if (!canViewMembers) {
     throw new AppError("FORBIDDEN", "You do not have permission to browse members.", 403);
   }

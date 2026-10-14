@@ -1,15 +1,20 @@
 import { describe, expect, it } from "vitest";
 
 import { ChannelNameSchema, normalizeReactionEmoji, ReactionEmojiSchema } from "./chat.js";
+import { memberProductionRoleCodes } from "./departments.js";
+import { productionRoleCodes } from "./production-catalog.js";
 import {
   AccountEmailSchema,
   ChangePasswordRequestSchema,
+  CreateOrganizationMemberRequestSchema,
   IsoDateInputSchema,
   MimeTypeSchema,
   NewPasswordSchema,
+  OrganizationMemberQuerySchema,
   SafeLineSchema,
   SafeMultilineSchema,
   SafeSearchSchema,
+  UpdateOrganizationMemberRequestSchema,
   WorkspaceSessionSchema
 } from "./schemas.js";
 import { CreateTaskRequestSchema, TaskQuerySchema, UpdateListRequestSchema, UpdateProjectRequestSchema } from "./work.js";
@@ -119,5 +124,35 @@ describe("WorkspaceSessionSchema (GET /workspace/context, PD-021)", () => {
   });
   it("defaults to web on, e-mail off", () => {
     expect(WorkspaceSessionSchema.parse(context).notificationPreferences).toEqual({ notifyWeb: true, notifyEmail: false });
+  });
+});
+
+describe("departments in member contracts (PD-041)", () => {
+  const roleId = "00000000-0000-4000-8000-000000000003";
+  const base = { email: "x@example.test", displayName: "X", roleId };
+
+  it("keeps the member production role codes identical to the production module's", () => {
+    expect([...memberProductionRoleCodes]).toEqual([...productionRoleCodes]);
+  });
+
+  it("create: departments required (stable order, de-duplicated), production roles iff PHOTO_RETOUCH", () => {
+    expect(CreateOrganizationMemberRequestSchema.safeParse(base).success).toBe(false);
+    expect(CreateOrganizationMemberRequestSchema.safeParse({ ...base, departments: ["OFFICE"] }).success).toBe(false);
+    expect(CreateOrganizationMemberRequestSchema.safeParse({ ...base, departments: ["PHOTO_RETOUCH"] }).success).toBe(false);
+    expect(CreateOrganizationMemberRequestSchema.safeParse({ ...base, departments: ["PRODUCTION"], productionRoles: ["QC"] }).success).toBe(false);
+    expect(CreateOrganizationMemberRequestSchema.safeParse({ ...base, departments: ["PHOTO_RETOUCH"], productionRoles: ["OWNER"] }).success).toBe(false);
+    expect(
+      CreateOrganizationMemberRequestSchema.parse({ ...base, departments: ["PRODUCTION", "PHOTO_RETOUCH", "PRODUCTION"], productionRoles: ["QC", "QC"] })
+    ).toMatchObject({ departments: ["PHOTO_RETOUCH", "PRODUCTION"], productionRoles: ["QC"] });
+    // An empty list passes the contract: the API allows it only for the superadmin role (DEPARTMENTS_REQUIRED).
+    expect(CreateOrganizationMemberRequestSchema.safeParse({ ...base, departments: [] }).success).toBe(true);
+  });
+
+  it("update: departments and production roles are optional fields; filters take a department", () => {
+    expect(UpdateOrganizationMemberRequestSchema.parse({ departments: ["PRODUCTION"] })).toEqual({ departments: ["PRODUCTION"] });
+    expect(UpdateOrganizationMemberRequestSchema.parse({ productionRoles: ["STAFF"] })).toEqual({ productionRoles: ["STAFF"] });
+    expect(UpdateOrganizationMemberRequestSchema.safeParse({}).success).toBe(false);
+    expect(OrganizationMemberQuerySchema.parse({ department: "PHOTO_RETOUCH" })).toMatchObject({ department: "PHOTO_RETOUCH", limit: 500 });
+    expect(OrganizationMemberQuerySchema.safeParse({ department: "OFFICE" }).success).toBe(false);
   });
 });

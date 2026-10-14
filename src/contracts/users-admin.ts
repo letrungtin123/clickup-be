@@ -1,5 +1,6 @@
 import { z } from "zod";
 
+import { DepartmentListSchema, departmentRolesProblem } from "./departments.js";
 import { ProductionMemberSchema, ProductionRoleSchema, UpdateProductionMemberRequestSchema } from "./production-catalog.js";
 import { JobStatusRefSchema } from "./production-jobs.js";
 import { AccountEmailSchema, SafeLineSchema, TemporaryPasswordResponseSchema } from "./schemas.js";
@@ -19,7 +20,7 @@ import { AccountEmailSchema, SafeLineSchema, TemporaryPasswordResponseSchema } f
  *   POST  /production/users/:userId/deactivate        → ProductionUserChangeResult (sessions revoked, sign-in blocked)
  *   POST  /production/users/:userId/activate          → ProductionUserChangeResult
  *   POST  /production/users/:userId/reset-password    → TemporaryPasswordResponse (shown once; no-store)
- *   GET   /production/users/:userId/led-jobs          → LedJobs (ADMIN or ACCOUNT)
+ *   GET   /production/users/:userId/led-jobs          → LedJobs (ADMIN or ACCOUNT; anyone for themselves)
  */
 
 const Id = z.string().uuid();
@@ -30,24 +31,40 @@ export const CreateProductionUserRequestSchema = z
     email: AccountEmailSchema,
     displayName: SafeLineSchema(160),
     jobTitle: SafeLineSchema(120, 0).nullable().optional(),
-    /** Production roles of the new account (at least one; several allowed, PD-011). */
+    /** Departments of the new account (PD-041): at least one (no organization role is chosen here, never superadmin). */
+    departments: DepartmentListSchema.refine((departments) => departments.length > 0, "Chọn ít nhất một phòng ban."),
+    /**
+     * Production roles (several allowed, PD-011): at least one with PHOTO_RETOUCH, none without it (a Production-only
+     * account has no production role).
+     */
     roles: z
       .array(ProductionRoleSchema)
-      .min(1, "Chọn ít nhất một vai trò sản xuất.")
       .max(5)
+      .default([])
       .transform((roles) => [...new Set(roles)]),
     teamId: Id.nullable().optional(),
     /** Also add the address to the sign-in whitelist (allowed_emails) so Google sign-in works once enabled. */
     allowGoogleSignIn: z.boolean().default(true)
   })
-  .strict();
+  .strict()
+  .superRefine((value, ctx) => {
+    const problem = departmentRolesProblem(value.departments, value.roles);
+    if (problem) {
+      ctx.addIssue({ code: "custom", path: ["roles"], message: problem });
+    }
+  });
 export type CreateProductionUserRequest = z.infer<typeof CreateProductionUserRequestSchema>;
 
 export const CreatedProductionUserSchema = TemporaryPasswordResponseSchema.extend({ member: ProductionMemberSchema });
 export type CreatedProductionUser = z.infer<typeof CreatedProductionUserSchema>;
 
-/** Same fields as PATCH /production/members/:userId (roles, team, custom values, tags); at least one. */
-export const UpdateProductionUserRequestSchema = UpdateProductionMemberRequestSchema.refine(
+/**
+ * Same fields as PATCH /production/members/:userId (roles, team, custom values, tags) plus `departments` (PD-041,
+ * replaces them; at least one; removing PHOTO_RETOUCH also removes the production roles); at least one field.
+ */
+export const UpdateProductionUserRequestSchema = UpdateProductionMemberRequestSchema.extend({
+  departments: DepartmentListSchema.refine((departments) => departments.length > 0, "Chọn ít nhất một phòng ban.").optional()
+}).refine(
   (value) => Object.values(value).some((entry) => entry !== undefined),
   { message: "Gửi ít nhất một trường cần sửa." }
 );

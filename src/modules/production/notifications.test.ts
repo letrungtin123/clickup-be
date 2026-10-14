@@ -120,6 +120,11 @@ describe("productionRecipients (SPEC Phase 4 / PLAN §8)", () => {
     expect(productionRecipients.qtyChanged(people)).toEqual([assignee]);
   });
 
+  it("a job given to a Leader notifies that Leader only; no Leader notifies nobody", () => {
+    expect(productionRecipients.jobLeaderAssigned(leader)).toEqual([leader]);
+    expect(productionRecipients.jobLeaderAssigned(null)).toEqual([]);
+  });
+
   it("late / due soon → assignee + leader; no QC → waiting QC notifies nobody", () => {
     expect(sorted(productionRecipients.deadline(people))).toEqual(sorted([assignee, leader]));
     expect(productionRecipients.waitingQc({ ...people, qcId: null })).toEqual([]);

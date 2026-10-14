@@ -251,6 +251,15 @@ const templates = {
 
   // Production (PLAN §8) ------------------------------------------------------------------------
   "production.task_assigned": (_n, c) => ({ headline: `Bạn được giao task ${c.taskRef}`, facts: c.productionFacts }),
+  "production.job_leader_assigned": (n, c) => ({
+    headline: `${c.actor} đã giao bạn làm Leader job ${c.jobCode}`,
+    facts: [
+      ["Gói công việc", c.jobCode],
+      ["Tên job", text(n.payload.jobName)],
+      ["Dự án", text(n.payload.projectCode)],
+      ["Deadline", formatDateTime(n.payload.deadline)]
+    ]
+  }),
   "production.task_waiting_qc": (_n, c) => ({ headline: `Task ${c.taskRef} đang chờ bạn QC`, facts: c.productionFacts }),
   "production.qc_failed": (_n, c) => ({
     headline: `Task ${c.taskRef} không đạt QC`,

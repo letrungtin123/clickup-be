@@ -1,3 +1,4 @@
+import type { Department } from "../../contracts/departments.js";
 import { Permission } from "../../contracts/permissions.js";
 import type {
   CreateProjectRequest,
@@ -13,10 +14,10 @@ import { getSql } from "../../db/client.js";
 import { AppError } from "../../lib/app-error.js";
 import { nullableText, toIso, type QuerySql } from "../../lib/db-types.js";
 import { rankAtEnd, rankForPlacement } from "../../lib/rank.js";
-import { orgRoom } from "../../contracts/realtime.js";
 import { logger } from "../../lib/logger.js";
-import { evictUsersFromRoom, publishToRoom, publishToRooms, publishToUsers, resetRoom } from "../../realtime/publisher.js";
+import { evictUsersFromRoom, publishToRoom, publishToUsers, resetRoom } from "../../realtime/publisher.js";
 import type { AccessContext } from "../access/access-context.js";
+import { assertDepartment, departmentMemberSql } from "../access/departments.js";
 import {
   assertPermission,
   assertProjectAccess,
@@ -33,6 +34,7 @@ type ProjectRow = {
   name: string;
   description: string | null;
   visibility: "public" | "private";
+  department: Department;
   color: string;
   icon: string | null;
   rank: string;
@@ -53,6 +55,7 @@ const toProject = (context: AccessContext, row: ProjectRow): Project => {
     name: row.name,
     description: row.description,
     visibility: row.visibility,
+    department: row.department,
     color: toColor(row.color, "indigo"),
     icon: row.icon,
     rank: row.rank,
@@ -76,7 +79,7 @@ const toProject = (context: AccessContext, row: ProjectRow): Project => {
 
 const selectProjects = (sql: QuerySql, context: AccessContext, onlyProjectId: string | null) => sql<ProjectRow[]>`
   SELECT
-    p.id, p.key, p.name, p.description, p.visibility, p.color, p.icon, p.rank, p.created_at, p.updated_at,
+    p.id, p.key, p.name, p.description, p.visibility, p.department, p.color, p.icon, p.rank, p.created_at, p.updated_at,
     pm.access_level,
     EXISTS (
       SELECT 1 FROM public.task_statuses ts
@@ -122,8 +125,8 @@ const publishStructure = (projectId: string, kind: "lists" | "statuses" | "membe
 };
 
 /**
- * Sidebar refresh hint after commit. Public projects (or a visibility change) hint the whole
- * organization; private projects only their members, superadmins, and explicitly affected users.
+ * Sidebar refresh hint after commit. Members, superadmins and explicitly affected users are always hinted; a public
+ * project (or a visibility change) also hints the members of its department (PD-041) — nobody else can see it.
  */
 const publishSidebar = async (
   context: AccessContext,
@@ -135,14 +138,11 @@ const publishSidebar = async (
   try {
     const sql = getSql();
     const project = (
-      await sql<{ visibility: "public" | "private" }[]>`
-        SELECT visibility FROM public.projects WHERE id = ${projectId} AND organization_id = ${context.organization.id}
+      await sql<{ visibility: "public" | "private"; department: Department }[]>`
+        SELECT visibility, department FROM public.projects WHERE id = ${projectId} AND organization_id = ${context.organization.id}
       `
     )[0];
-    if (options.broadcast || project?.visibility === "public") {
-      publishToRooms([orgRoom(context.organization.id)], "workspace:sidebar", event);
-      return;
-    }
+    const department = project && (options.broadcast || project.visibility === "public") ? project.department : null;
     const recipients = await sql<{ user_id: string }[]>`
       SELECT pm.user_id FROM public.project_memberships pm
       WHERE pm.organization_id = ${context.organization.id} AND pm.project_id = ${projectId}
@@ -151,7 +151,10 @@ const publishSidebar = async (
       SELECT om.user_id FROM public.organization_memberships om
       JOIN public.roles r ON r.id = om.role_id AND r.organization_id = om.organization_id AND r.key = 'superadmin'
       WHERE om.organization_id = ${context.organization.id} AND om.status = 'active' AND om.deleted_at IS NULL
-      LIMIT 5000
+      UNION
+      SELECT ud.user_id FROM public.user_departments ud
+      WHERE ${department}::text IS NOT NULL AND ud.organization_id = ${context.organization.id} AND ud.department = ${department}::text
+      LIMIT 10000
     `;
     publishToUsers([...recipients.map((row) => row.user_id), ...(options.extraUserIds ?? [])], "workspace:sidebar", event);
   } catch (error) {
@@ -287,8 +290,13 @@ const publishUnassigned = (projectId: string, tasks: ChangedTask[], actorId: str
   }
 };
 
+/** Department of every new workspace project (PD-041): workspace projects belong to Production. */
+const newProjectDepartment: Department = "PRODUCTION";
+
 export const createProject = async (context: AccessContext, input: CreateProjectRequest): Promise<Project> => {
   assertPermission(context, Permission.ProjectCreate);
+  // Only members of the owning department (or the superadmin) create its projects (403 DEPARTMENT_FORBIDDEN).
+  assertDepartment(context, newProjectDepartment);
   const sql = getSql();
 
   const projectId = await sql.begin(async (tx) => {
@@ -300,10 +308,10 @@ export const createProject = async (context: AccessContext, input: CreateProject
     const rank = await rankAtEnd(tx, { table: "public.projects", where: { organization_id: context.organization.id } });
     const created = (
       await tx<{ id: string }[]>`
-        INSERT INTO public.projects (organization_id, key, name, description, visibility, color, icon, rank, created_by)
+        INSERT INTO public.projects (organization_id, key, name, description, visibility, department, color, icon, rank, created_by)
         VALUES (
           ${context.organization.id}, ${input.key}, ${input.name}, ${nullableText(input.description) ?? null},
-          ${input.visibility}, ${input.color}, ${input.icon ?? null}, ${rank}, ${context.user.id}
+          ${input.visibility}, ${newProjectDepartment}, ${input.color}, ${input.icon ?? null}, ${rank}, ${context.user.id}
         )
         RETURNING id
       `
@@ -631,13 +639,21 @@ export const removeProjectMember = async (context: AccessContext, projectId: str
       SET status = 'disabled', deleted_at = now(), deleted_by = ${context.user.id}
       WHERE organization_id = ${context.organization.id} AND project_id = ${projectId} AND user_id = ${userId} AND deleted_at IS NULL
     `;
-    // Leaving a private project ends assignments there and its inbox entries (PD-006, BUG-WK-13 / BUG-WK-04).
-    const unassignedTasks = access.visibility === "private" ? await revokeProjectAccessEffects(tx, context, projectId, [userId]) : [];
-    return { visibility: access.visibility, unassignedTasks };
+    // Leaving a project one can no longer see — a private one, or a public one outside one's departments (PD-041) —
+    // ends assignments there and its inbox entries (PD-006, BUG-WK-13 / BUG-WK-04).
+    const losesAccess =
+      access.visibility === "private" ||
+      !(
+        await tx<{ ok: boolean }[]>`
+          SELECT ${departmentMemberSql(tx, context.organization.id, userId, access.department)} AS ok
+        `
+      )[0]?.ok;
+    const unassignedTasks = losesAccess ? await revokeProjectAccessEffects(tx, context, projectId, [userId]) : [];
+    return { losesAccess, unassignedTasks };
   });
 
-  // Losing membership of a private project revokes live access immediately.
-  if (outcome.visibility === "private") {
+  // Losing access to the project revokes live access immediately.
+  if (outcome.losesAccess) {
     evictUsersFromRoom([userId], { type: "project", id: projectId });
     publishUnassigned(projectId, outcome.unassignedTasks, context.user.id);
   }
