@@ -1,4 +1,4 @@
-import type { ProductionComment, ProductionTimelinePage } from "../../contracts/production-jobs.js";
+import type { ProductionComment, ProductionTimelinePage, TaskLog } from "../../contracts/production-jobs.js";
 import { getSql } from "../../db/client.js";
 import { AppError } from "../../lib/app-error.js";
 import { toIso, toNullableIso, type QuerySql } from "../../lib/db-types.js";
@@ -11,6 +11,7 @@ import { leadsForView, loadJobScopes } from "./job-permissions.js";
 import { assertTaskVisible, jobArchivedError, loadMemberRoles, loadTask } from "./jobs.repo.js";
 import { commentCreatedEvent, enqueueProductionEvents } from "./notifications.js";
 import { publishProductionChange } from "./realtime.js";
+import { parentNumberSql, taskCode } from "./task-codes.js";
 
 /** Job/Task comment boxes with the task history interleaved by time (PLAN §8, §10). */
 
@@ -86,8 +87,11 @@ type LogRow = {
   /** Null for job-level history (action JOB: job edits). */
   task_id: string | null;
   task_number: string | number | null;
+  /** PD-045 display code parts: a subtask's letter index and its line's number (null otherwise). */
+  task_sub_seq: number | null;
+  task_parent_number: string | number | null;
   user: UserRefJson | null;
-  action: "CREATE" | "STATUS" | "QTY" | "ASSIGN" | "NOTE" | "FIELD" | "JOB";
+  action: TaskLog["action"];
   from_value: Record<string, unknown> | null;
   to_value: Record<string, unknown> | null;
   note: string | null;
@@ -99,12 +103,15 @@ type LogRow = {
  * a task's timeline holds only that task's. Keyset (created_at, id) at the database's microsecond precision:
  * both sources are compared, merged and paged on the same full-precision key, so rows sharing a timestamp
  * (one transaction writes several logs) are neither dropped nor repeated (BUG-PR-05).
+ *
+ * PD-044 "Nhật ký" of the job page: `only` "logs" leaves the comments out; `taskId` (job timeline) narrows it to one
+ * line — its history (SUBTASK / QTY_REQUEST rows are on the line already) and, without `only` "logs", its comments.
  */
 export const listProductionTimeline = async (
   context: AccessContext,
   entity: "JOB" | "TASK",
   id: string,
-  query: { cursor?: string | undefined; limit: number }
+  query: { only?: "all" | "logs" | undefined; taskId?: string | undefined; cursor?: string | undefined; limit: number }
 ): Promise<ProductionTimelinePage> => {
   const sql = getSql();
   const target = await resolveTarget(sql, context, entity, id);
@@ -112,26 +119,39 @@ export const listProductionTimeline = async (
   const cursor = decodeTimeCursor(query.cursor);
   const before = (alias: string) =>
     cursor ? sql`AND (${sql(alias)}.created_at, ${sql(alias)}.id) < (${cursorInstantSql(sql, cursor.at)}, ${cursor.id}::uuid)` : sql``;
+  // One line of the job (job timeline only; a task timeline is that task's already).
+  const lineId = entity === "JOB" ? (query.taskId ?? null) : null;
   const [comments, logs] = await Promise.all([
-    sql<CommentRow[]>`
-      SELECT c.id, c.entity, c.entity_id, c.job_id, c.user_id, c.body, c.mentioned_user_ids, c.created_at, c.edited_at,
-        ${cursorTextSql(sql, "c.created_at")} AS cursor_at,
-        (SELECT ${userJsonSql(sql)} FROM public.app_users au WHERE au.id = c.user_id) AS author
-      FROM production.comments c
-      WHERE c.organization_id = ${organizationId} AND c.deleted_at IS NULL
-        AND ${entity === "JOB" ? sql`c.job_id = ${target.jobId}` : sql`c.entity = 'TASK' AND c.entity_id = ${id}`}
-        ${before("c")}
-      ORDER BY c.created_at DESC, c.id DESC
-      LIMIT ${query.limit + 1}
-    `,
+    query.only === "logs"
+      ? Promise.resolve([] as CommentRow[])
+      : sql<CommentRow[]>`
+          SELECT c.id, c.entity, c.entity_id, c.job_id, c.user_id, c.body, c.mentioned_user_ids, c.created_at, c.edited_at,
+            ${cursorTextSql(sql, "c.created_at")} AS cursor_at,
+            (SELECT ${userJsonSql(sql)} FROM public.app_users au WHERE au.id = c.user_id) AS author
+          FROM production.comments c
+          WHERE c.organization_id = ${organizationId} AND c.deleted_at IS NULL
+            AND ${
+              entity === "JOB"
+                ? lineId
+                  ? sql`c.job_id = ${target.jobId} AND c.entity = 'TASK' AND c.entity_id = ${lineId}`
+                  : sql`c.job_id = ${target.jobId}`
+                : sql`c.entity = 'TASK' AND c.entity_id = ${id}`
+            }
+            ${before("c")}
+          ORDER BY c.created_at DESC, c.id DESC
+          LIMIT ${query.limit + 1}
+        `,
     sql<LogRow[]>`
-      SELECT l.id, l.task_id, t.number AS task_number, l.action, l.from_value, l.to_value, l.note, l.created_at,
+      SELECT l.id, l.task_id, t.number AS task_number, t.sub_seq AS task_sub_seq, ${parentNumberSql(sql)} AS task_parent_number,
+        l.action, l.from_value, l.to_value, l.note, l.created_at,
         ${cursorTextSql(sql, "l.created_at")} AS cursor_at,
         (SELECT ${userJsonSql(sql)} FROM public.app_users au WHERE au.id = l.user_id) AS user
       FROM production.task_logs l
       LEFT JOIN production.tasks t ON t.organization_id = l.organization_id AND t.id = l.task_id
       WHERE l.organization_id = ${organizationId}
-        AND ${entity === "JOB" ? sql`l.job_id = ${target.jobId}` : sql`l.task_id = ${id}`}
+        AND ${
+          entity === "JOB" ? (lineId ? sql`l.job_id = ${target.jobId} AND l.task_id = ${lineId}` : sql`l.job_id = ${target.jobId}`) : sql`l.task_id = ${id}`
+        }
         ${before("l")}
       ORDER BY l.created_at DESC, l.id DESC
       LIMIT ${query.limit + 1}
@@ -148,6 +168,9 @@ export const listProductionTimeline = async (
           id: row.id,
           taskId: row.task_id,
           taskNumber: row.task_number === null ? null : Number(row.task_number),
+          // PD-045: "1216" for a line, "1216a" for a subtask's own rows.
+          taskCode:
+            row.task_number === null ? null : taskCode({ number: row.task_number, subSeq: row.task_sub_seq, parentNumber: row.task_parent_number }),
           user: toUserRef(row.user),
           action: row.action,
           fromValue: row.from_value,

@@ -305,7 +305,8 @@ const main = async () => {
             otHours: item.row.ot,
             ...(item.row.note ? { note: item.row.note } : {})
           })),
-          { kind: "NORMAL", feedbackId: null, defaultParentId: null }
+          // History without QC (PD-047 requires QC on new lines; importers replay old rows).
+          { kind: "NORMAL", feedbackId: null, defaultParentId: null, historicQcOptional: true }
         );
         for (const [position, id] of ids.entries()) inserted.push({ task: await loadTask(tx, organizationId, id), item: batch[position]! });
       }

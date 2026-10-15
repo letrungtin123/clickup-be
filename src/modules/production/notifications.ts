@@ -9,7 +9,8 @@ import { deliverNotifications } from "../notifications/notifications.service.js"
 import { loadSettings } from "./catalog.service.js";
 import { rolesWithAll } from "./job-permissions.js";
 import { kpiSettlementNotificationHandlers } from "./kpi-settlement-notifications.js";
-import { listOpenJobsLedBy, loadProductionAdminIds } from "./member-lookups.js";
+import { listOpenJobsLedBy, loadProductionAdminIds, loadProductionRoleHolderIds } from "./member-lookups.js";
+import { parentNumberSql, taskCode } from "./task-codes.js";
 
 /**
  * Production notifications (SPEC §6 Phase 4 §1, PLAN §8): events are written to the outbox inside the task
@@ -37,6 +38,22 @@ export const taskAssignedEvent = (organizationId: string, taskId: string, actorI
 export const jobLeaderAssignedEvent = (organizationId: string, jobId: string, actorId: string, leaderId: string) =>
   ({ ...event(organizationId, "production.job.leader_assigned", jobId, actorId, { jobId, leaderId }), aggregateType: "production_job" });
 
+/** A job status as the PD-045 status notification carries it (by value: a later rename or delete keeps the story). */
+export type JobStatusValue = { id: string; name: string; color: string };
+
+/**
+ * PD-045: someone changed the job's status (the manual chip). Enqueued in the change's transaction, only when the status
+ * really changed; the handler reads the job's Leader and the Account / Admin people itself.
+ */
+export const jobStatusChangedEvent = (organizationId: string, jobId: string, actorId: string, from: JobStatusValue, to: JobStatusValue) => ({
+  ...event(organizationId, "production.job.status_changed", jobId, actorId, {
+    jobId,
+    from: { id: from.id, name: from.name, color: from.color },
+    to: { id: to.id, name: to.name, color: to.color }
+  }),
+  aggregateType: "production_job"
+});
+
 export const taskStatusEvent = (
   organizationId: string,
   taskId: string,
@@ -46,6 +63,13 @@ export const taskStatusEvent = (
 
 export const taskQtyEvent = (organizationId: string, taskId: string, actorId: string, from: number, to: number, note: string | null) =>
   event(organizationId, "production.task.qty_changed", taskId, actorId, { taskId, from, to, note });
+
+/**
+ * PD-044 "Số lượng giao": a worker asked to change it (`requested`, → the job's Leader) or the request was decided
+ * (`decided`, → the worker). The handler reads the request itself, so the payload only names it.
+ */
+export const qtyRequestEvent = (organizationId: string, kind: "requested" | "decided", taskId: string, requestId: string, actorId: string) =>
+  event(organizationId, `production.task.qty_change_${kind}`, taskId, actorId, { taskId, requestId });
 
 /** `taskIds`: the delivering tasks the feedback parked (their workers are "NV cũ" when no source task is named). */
 export const feedbackEvent = (
@@ -122,6 +146,20 @@ export const productionRecipients = {
   deadline: (task: TaskPeople) => distinct([task.assigneeId, task.leaderId]),
   /** QTY_CHANGED_BY_LEADER → assignee. */
   qtyChanged: (task: TaskPeople) => distinct([task.assigneeId]),
+  /**
+   * QTY_CHANGE_REQUESTED (PD-044) → the job's (still active) Leader; without one — or when the Leader asked themselves —
+   * the production Admins. Never the requester.
+   */
+  qtyChangeRequested: (task: TaskPeople, adminIds: readonly string[], requesterId: string) =>
+    task.leaderId && task.leaderId !== requesterId ? [task.leaderId] : distinct(adminIds, [requesterId]),
+  /** QTY_CHANGE_DECIDED (PD-044) → the worker who asked. */
+  qtyChangeDecided: (requesterId: string) => distinct([requesterId]),
+  /**
+   * JOB_STATUS_CHANGED (PD-045) → the job's (still active) Leader and every production Account / Admin (organization
+   * superadmins included in `accountAdminIds`), never the person who changed it.
+   */
+  jobStatusChanged: (leaderId: string | null, accountAdminIds: readonly string[], actorId: string | null) =>
+    distinct([leaderId, ...accountAdminIds], [actorId]),
   /** FEEDBACK_CREATED → leader + the previous workers ("NV cũ"). */
   feedback: (leaderId: string | null, previousWorkerIds: readonly string[]) => distinct([leaderId, ...previousWorkerIds]),
   /** @mentions in a comment → the mentioned people (never the writer). */
@@ -199,6 +237,9 @@ type TaskInfo = {
   qty_assigned: number;
   qty_done: number | null;
   deadline: Date;
+  /** PD-045 subtask letter index and its line's number (null for lines): the task's display code. */
+  sub_seq: number | null;
+  parent_number: string | number | null;
 };
 
 const loadTaskInfos = async (organizationId: string, taskIds: string[]) => {
@@ -208,7 +249,8 @@ const loadTaskInfos = async (organizationId: string, taskIds: string[]) => {
   const sql = getSql();
   return await sql<TaskInfo[]>`
     SELECT t.id, t.number, t.job_id, j.code AS job_code, j.leader_id, ${leaderActiveSql(sql)} AS leader_active,
-      t.assignee_id, t.qc_id, pr.name AS process_name, t.qty_assigned, t.qty_done, t.deadline
+      t.assignee_id, t.qc_id, pr.name AS process_name, t.qty_assigned, t.qty_done, t.deadline,
+      t.sub_seq, ${parentNumberSql(sql)} AS parent_number
     FROM production.tasks t
     JOIN production.jobs j ON j.organization_id = t.organization_id AND j.id = t.job_id
     JOIN production.processes pr ON pr.organization_id = t.organization_id AND pr.id = t.process_id
@@ -224,11 +266,16 @@ const peopleOf = (task: TaskInfo): TaskPeople => ({
   leaderId: task.leader_active ? task.leader_id : null
 });
 
+/** "1216" for a line, "1216a" for a subtask (PD-045). */
+const codeOf = (task: TaskInfo) => taskCode({ number: task.number, subSeq: task.sub_seq, parentNumber: task.parent_number });
+
 const taskPayload = (task: TaskInfo, extra: Record<string, unknown> = {}) => ({
   productionTaskId: task.id,
   jobId: task.job_id,
   jobCode: task.job_code,
   taskNumber: Number(task.number),
+  /** PD-045 display code ("#" + code): the inbox and the e-mails show it instead of the number. */
+  taskCode: codeOf(task),
   processName: task.process_name,
   qty: task.qty_done ?? task.qty_assigned,
   deadline: task.deadline.toISOString(),
@@ -249,7 +296,7 @@ const notifyTask = async (
     type,
     actorUserId: envelope.actorUserId,
     title: task.job_code,
-    body: body ?? `#${Number(task.number)} · ${task.process_name} · ${task.qty_done ?? task.qty_assigned} tấm`,
+    body: body ?? `#${codeOf(task)} · ${task.process_name} · ${task.qty_done ?? task.qty_assigned} tấm`,
     payload: taskPayload(task, extra),
     dedupeKey: `evt:${envelope.id}:${type}`
   });
@@ -257,6 +304,54 @@ const notifyTask = async (
 
 const str = (value: unknown) => (typeof value === "string" ? value : null);
 const strArray = (value: unknown) => (Array.isArray(value) ? value.filter((entry): entry is string => typeof entry === "string") : []);
+
+/** A { id, name, color } job status of an event payload (PD-045); null when malformed. */
+const jobStatusValue = (value: unknown): JobStatusValue | null => {
+  if (typeof value !== "object" || value === null) {
+    return null;
+  }
+  const record = value as Record<string, unknown>;
+  const id = str(record.id);
+  const name = str(record.name);
+  return id && name ? { id, name, color: str(record.color) ?? "slate" } : null;
+};
+
+type QtyRequestInfo = {
+  id: string;
+  from_qty: number;
+  to_qty: number;
+  reason: string;
+  status: "PENDING" | "APPROVED" | "REJECTED" | "CANCELLED";
+  requested_by: string;
+  decision_note: string | null;
+};
+
+/** The task and the quantity request named by a qty_change_* event (PD-044); null when either is gone. */
+const loadQtyRequest = async (envelope: DomainEventEnvelope) => {
+  const taskId = str(envelope.payload.taskId);
+  const requestId = str(envelope.payload.requestId);
+  if (!taskId || !requestId) {
+    return null;
+  }
+  const [task, request] = await Promise.all([
+    loadTaskInfo(envelope.organizationId, taskId),
+    getSql()<QtyRequestInfo[]>`
+      SELECT id, from_qty, to_qty, reason, status, requested_by, decision_note FROM production.task_qty_requests
+      WHERE organization_id = ${envelope.organizationId} AND id = ${requestId} AND task_id = ${taskId}
+    `
+  ]);
+  return task && request[0] ? { task, request: request[0] } : null;
+};
+
+/** Payload extras of the qty_change_* notifications: { requestId, fromQty, toQty, reason, approved, decisionNote }. */
+const qtyRequestPayload = (request: QtyRequestInfo) => ({
+  requestId: request.id,
+  fromQty: request.from_qty,
+  toQty: request.to_qty,
+  reason: request.reason,
+  approved: request.status === "PENDING" ? null : request.status === "APPROVED",
+  decisionNote: request.decision_note
+});
 
 export const productionNotificationHandlers: Record<string, (event: DomainEventEnvelope) => Promise<void>> = {
   "production.task.assigned": async (envelope) => {
@@ -277,7 +372,10 @@ export const productionNotificationHandlers: Record<string, (event: DomainEventE
     const job = (
       await sql<{ code: string; name: string | null; project_code: string; deadline: Date; leader_id: string | null; leader_active: boolean; task_count: number }[]>`
         SELECT j.code, j.name, p.code AS project_code, j.deadline, j.leader_id, ${leaderActiveSql(sql)} AS leader_active,
-          (SELECT count(*)::int FROM production.tasks t WHERE t.organization_id = j.organization_id AND t.job_id = j.id AND t.deleted_at IS NULL) AS task_count
+          -- Lines only: a subtask (PD-044) is part of its line.
+          (SELECT count(*)::int FROM production.tasks t
+            WHERE t.organization_id = j.organization_id AND t.job_id = j.id AND t.deleted_at IS NULL
+              AND NOT (t.kind = 'NORMAL' AND t.parent_task_id IS NOT NULL)) AS task_count
         FROM production.jobs j
         JOIN production.projects p ON p.organization_id = j.organization_id AND p.id = j.project_id
         WHERE j.organization_id = ${envelope.organizationId} AND j.id = ${jobId} AND j.deleted_at IS NULL
@@ -302,6 +400,42 @@ export const productionNotificationHandlers: Record<string, (event: DomainEventE
         deadline: job.deadline.toISOString(),
         taskCount: job.task_count
       },
+      dedupeKey: `evt:${envelope.id}`
+    });
+  },
+
+  /**
+   * PD-045: the job's status (the manual chip) changed → its active Leader (leaderActiveSql) and every active production
+   * Account / Admin (organization superadmins included), never the person who changed it. Title: the job's code; body
+   * "Đang làm → Đã xong" from the statuses as they were at the change (event payload). A deleted job tells nobody.
+   */
+  "production.job.status_changed": async (envelope) => {
+    const jobId = str(envelope.payload.jobId);
+    const from = jobStatusValue(envelope.payload.from);
+    const to = jobStatusValue(envelope.payload.to);
+    if (!jobId || !from || !to) {
+      return;
+    }
+    const sql = getSql();
+    const job = (
+      await sql<{ code: string; name: string | null; leader_id: string | null; leader_active: boolean }[]>`
+        SELECT j.code, j.name, j.leader_id, ${leaderActiveSql(sql)} AS leader_active
+        FROM production.jobs j
+        WHERE j.organization_id = ${envelope.organizationId} AND j.id = ${jobId} AND j.deleted_at IS NULL
+      `
+    )[0];
+    if (!job) {
+      return;
+    }
+    const accountAdminIds = await loadProductionRoleHolderIds(sql, envelope.organizationId, ["ACCOUNT", "ADMIN"]);
+    await deliverNotifications({
+      organizationId: envelope.organizationId,
+      recipientIds: productionRecipients.jobStatusChanged(job.leader_active ? job.leader_id : null, accountAdminIds, envelope.actorUserId),
+      type: "production.job_status_changed",
+      actorUserId: envelope.actorUserId,
+      title: job.code,
+      body: `${from.name} → ${to.name}`,
+      payload: { jobId, jobCode: job.code, jobName: job.name, from, to },
       dedupeKey: `evt:${envelope.id}`
     });
   },
@@ -336,7 +470,48 @@ export const productionNotificationHandlers: Record<string, (event: DomainEventE
       "production.qty_changed",
       productionRecipients.qtyChanged(peopleOf(task)),
       { from: envelope.payload.from ?? null, to: envelope.payload.to ?? null, note },
-      `#${Number(task.number)}: ${String(envelope.payload.from)} → ${String(envelope.payload.to)} tấm${note ? ` — ${note}` : ""}`
+      `#${codeOf(task)}: ${String(envelope.payload.from)} → ${String(envelope.payload.to)} tấm${note ? ` — ${note}` : ""}`
+    );
+  },
+
+  /**
+   * PD-044: a worker's request to change "Số lượng giao" → the job's active Leader (else the production Admins), while it
+   * is still open (a request cancelled or decided before the worker ran tells nobody).
+   */
+  "production.task.qty_change_requested": async (envelope) => {
+    const loaded = await loadQtyRequest(envelope);
+    if (!loaded || loaded.request.status !== "PENDING") {
+      return;
+    }
+    const { task, request } = loaded;
+    const people = peopleOf(task);
+    const leaderNeeded = !people.leaderId || people.leaderId === request.requested_by;
+    const adminIds = leaderNeeded ? await loadProductionAdminIds(getSql(), envelope.organizationId) : [];
+    await notifyTask(
+      envelope,
+      task,
+      "production.qty_change_requested",
+      productionRecipients.qtyChangeRequested(people, adminIds, request.requested_by),
+      qtyRequestPayload(request),
+      `#${codeOf(task)}: ${request.from_qty} → ${request.to_qty} tấm — ${request.reason}`
+    );
+  },
+
+  /** PD-044: the request was approved or rejected → the worker who asked (the decider never: they are the actor). */
+  "production.task.qty_change_decided": async (envelope) => {
+    const loaded = await loadQtyRequest(envelope);
+    if (!loaded || (loaded.request.status !== "APPROVED" && loaded.request.status !== "REJECTED")) {
+      return;
+    }
+    const { task, request } = loaded;
+    const approved = request.status === "APPROVED";
+    await notifyTask(
+      envelope,
+      task,
+      "production.qty_change_decided",
+      productionRecipients.qtyChangeDecided(request.requested_by),
+      qtyRequestPayload(request),
+      `#${codeOf(task)}: ${request.from_qty} → ${request.to_qty} tấm ${approved ? "đã được duyệt" : "bị từ chối"}${request.decision_note ? ` — ${request.decision_note}` : ""}`
     );
   },
 
@@ -573,7 +748,7 @@ const deliverDeadline = (kind: "production.task_late" | "production.task_due_soo
     type: kind,
     actorUserId: null,
     title: task.job_code,
-    body: `#${Number(task.number)} · ${task.process_name} · ${task.qty_assigned} tấm`,
+    body: `#${codeOf(task)} · ${task.process_name} · ${task.qty_assigned} tấm`,
     payload: taskPayload(task),
     dedupeKey: `${kind}:${task.id}:${task.deadline.toISOString()}`
   });

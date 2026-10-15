@@ -198,9 +198,13 @@ export const onTaskQtyChanged = async (
 /**
  * Called when a line is deleted (PD-036): every original entry of the task (worker and QC) is brought to zero with an
  * adjustment row at its original price, dated at `at` — the ledger stays append-only and the line's points and money
- * drop to zero in every total. Returns how many adjustment rows were written (0 when nothing was recorded).
+ * drop to zero in every total. Returns how many adjustment rows were written (0 when nothing was recorded). The note names
+ * the task by its display code when given (PD-045: "Xoá task #1216a"), else by its number.
  */
-export const onTaskDeleted = async (sql: QuerySql, input: { organizationId: string; taskId: string; taskNumber: number; at: Date }): Promise<number> => {
+export const onTaskDeleted = async (
+  sql: QuerySql,
+  input: { organizationId: string; taskId: string; taskNumber: number; taskCode?: string; at: Date }
+): Promise<number> => {
   const originals = await loadOriginals(sql, input.organizationId, input.taskId);
   if (originals.length === 0) {
     return 0;
@@ -208,7 +212,7 @@ export const onTaskDeleted = async (sql: QuerySql, input: { organizationId: stri
   const time = await eventTime(sql, input.organizationId, input.at);
   let written = 0;
   for (const original of originals) {
-    if (await adjustTo(sql, input.organizationId, input.taskId, original, 0, time, `Xoá task #${input.taskNumber}`)) {
+    if (await adjustTo(sql, input.organizationId, input.taskId, original, 0, time, `Xoá task #${input.taskCode ?? input.taskNumber}`)) {
       written += 1;
     }
   }

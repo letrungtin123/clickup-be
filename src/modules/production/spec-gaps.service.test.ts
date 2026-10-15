@@ -81,7 +81,7 @@ vi.mock("./jobs.repo.js", async (importOriginal) => ({
   loadWorkflowModel: vi.fn(() => Promise.resolve(fixtures.workflow as Workflow))
 }));
 
-const { createProductionTasks, updateProductionTask } = await import("./tasks.service.js");
+const { createProductionTasks, insertTasks, updateProductionTask } = await import("./tasks.service.js");
 const { jobEditChanges, reassignFeedback, updateJob } = await import("./jobs.service.js");
 const { updateSettings } = await import("./catalog.service.js");
 const { clearProductionConfigCache } = await import("./catalog-cache.js");
@@ -180,6 +180,12 @@ const taskRow = (overrides: Partial<TaskRow> = {}): TaskRow => ({
   deadline_cursor: "2099-01-01 00:00:00.000000+00",
   job_archived: false,
   job_open_feedback: false,
+  split_reason: null,
+  created_by: null,
+  sub_seq: null,
+  parent_number: null,
+  subtasks: null,
+  pending_qty_request: null,
   ...overrides
 });
 
@@ -240,8 +246,8 @@ describe("G3 — Chia task validates required TASK fields and tags per line, bef
     db.state.handler = splitQueries();
     const result = await failure(createProductionTasks(contextWith(["LEADER"]), jobId, [line({ customValues: { do_kho: "de" } }), line()]));
     expect(result).toMatchObject({ code: "CUSTOM_FIELDS_INVALID", status: 400 });
-    expect(result?.message).toContain("Dòng 2:");
-    expect(result?.message).not.toContain("Dòng 1:");
+    expect(result?.message).toContain("Task 2:");
+    expect(result?.message).not.toContain("Task 1:");
     expect(callsLike(/^INSERT INTO production\.tasks/)).toHaveLength(0);
   });
 
@@ -251,7 +257,7 @@ describe("G3 — Chia task validates required TASK fields and tags per line, bef
       createProductionTasks(contextWith(["LEADER"]), jobId, [line({ customValues: { do_kho: "de" }, tagIds: [tagA] }), line({ customValues: { do_kho: "kho" }, tagIds: [tagB] })])
     );
     expect(result).toMatchObject({ code: "TAG_NOT_FOUND", status: 400 });
-    expect(result?.message).toContain("Dòng 2:");
+    expect(result?.message).toBe("Task 2: tag không tồn tại.");
     expect(callsLike(/^INSERT INTO production\.tasks/)).toHaveLength(0);
   });
 
@@ -262,14 +268,40 @@ describe("G3 — Chia task validates required TASK fields and tags per line, bef
     expect(JSON.stringify(insert?.values)).toContain('"customValues":{"do_kho":"kho"}');
     expect(JSON.stringify(callsLike(/^INSERT INTO production\.entity_tags/)[0]?.values)).toContain(tagA);
   });
+
+  it("PD-047: a NORMAL work line without QC is refused unless an importer replays history (historicQcOptional)", async () => {
+    db.state.handler = splitQueries();
+    const job = {
+      id: jobId,
+      leader_id: me,
+      received_at: new Date("2026-10-01T00:00:00Z"),
+      deadline: new Date("2099-01-01T00:00:00Z"),
+      total_images: 0,
+      total_images_manual: false,
+      qc_buffer_hours: 2
+    };
+    const lines = [line({ customValues: { do_kho: "de" } }), line({ qcId: null, customValues: { do_kho: "de" } })];
+    const normal = { kind: "NORMAL" as const, feedbackId: null, defaultParentId: null };
+    const refused = await failure(insertTasks(db.sql as never, contextWith(["LEADER"]), fixtures.workflow as Workflow, job, lines, normal));
+    expect(refused).toEqual({ code: "TASK_LINES_INVALID", status: 400, message: "Task 2: Chọn QC cho task." });
+    expect(callsLike(/^INSERT INTO production\.tasks/)).toHaveLength(0);
+
+    await insertTasks(db.sql as never, contextWith(["LEADER"]), fixtures.workflow as Workflow, job, lines, { ...normal, historicQcOptional: true });
+    const rows = callsLike(/^INSERT INTO production\.tasks/)[0]!.values.find((value) => Array.isArray(value)) as Record<string, unknown>[];
+    expect(rows.map((row) => row.qcId)).toEqual([checker, null]);
+  });
 });
 
 describe("G3 — Giao lại: FB redo tasks inherit the source task's custom values and tags", () => {
-  it("a line without values passes the required-field check with the source task's values", async () => {
+  it("PD-045: Giao lại itself is retired — 409 FEEDBACK_RETIRED before anything is read", async () => {
+    db.state.handler = splitQueries();
+    const error = await reassignFeedback(contextWith(["LEADER"]), feedbackId, { tasks: [line()] }).catch((caught: unknown) => caught);
+    expect(error).toMatchObject({ code: "FEEDBACK_RETIRED", statusCode: 409 });
+    expect(db.state.calls).toHaveLength(0);
+  });
+
+  it("a line without values passes the required-field check with the source task's values (insertTasks, FB kinds)", async () => {
     db.state.handler = splitQueries((call) => {
-      if (call.text.startsWith("SELECT job_id, type, status, source_task_id FROM production.feedbacks")) {
-        return [{ job_id: jobId, type: "WRONG", status: "OPEN", source_task_id: taskId }];
-      }
       if (call.text.includes("t.assigned_at, t.deadline, t.custom_values")) {
         return [{ id: taskId, assigned_at: new Date("2026-10-01T02:00:00Z"), deadline: new Date("2026-10-03T02:00:00Z"), custom_values: { do_kho: "kho", da_bo: "x" }, tag_ids: [tagA] }];
       }
@@ -278,7 +310,20 @@ describe("G3 — Giao lại: FB redo tasks inherit the source task's custom valu
       }
       return undefined;
     });
-    await reassignFeedback(contextWith(["LEADER"]), feedbackId, { tasks: [line()] });
+    const job = {
+      id: jobId,
+      leader_id: me,
+      received_at: new Date("2026-10-01T00:00:00Z"),
+      deadline: new Date("2099-01-01T00:00:00Z"),
+      total_images: 100,
+      total_images_manual: true,
+      qc_buffer_hours: 2
+    };
+    await insertTasks(db.sql as never, contextWith(["LEADER"]), fixtures.workflow as Workflow, job, [line()], {
+      kind: "FB_WRONG",
+      feedbackId,
+      defaultParentId: taskId
+    });
     const insert = callsLike(/^INSERT INTO production\.tasks/)[0];
     expect(JSON.stringify(insert?.values)).toContain('"customValues":{"do_kho":"kho"}');
     expect(JSON.stringify(insert?.values)).not.toContain("da_bo");

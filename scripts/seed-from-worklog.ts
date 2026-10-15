@@ -421,7 +421,7 @@ const main = async () => {
               deadline: deadline.toISOString()
             }
           ],
-          { kind: "NORMAL", feedbackId: null, defaultParentId: null, assignedAt: vn(assignedDay, "09:00") }
+          { kind: "NORMAL", feedbackId: null, defaultParentId: null, assignedAt: vn(assignedDay, "09:00"), historicQcOptional: true }
         );
         created.push({ task: await loadTask(tx, organizationId, taskIds[0]!), row });
       }

@@ -98,7 +98,8 @@ export type KpiPeriodType = z.infer<typeof KpiPeriodTypeSchema>;
 export const ScoreEntrySchema = z.object({
   id: Id,
   role: ScoreRoleSchema,
-  task: z.object({ id: Id, number: z.number().int(), jobId: Id, jobCode: z.string() }),
+  /** `code`: the task's display code ("1216" / subtask "1216a", PD-045). */
+  task: z.object({ id: Id, number: z.number().int(), code: z.string(), jobId: Id, jobCode: z.string() }),
   project: z.object({ id: Id, code: z.string() }),
   /** Process whose price applied: the task's process (WORKER) or the QC process "Checking" (QC). */
   process: z.object({ id: Id, name: z.string() }).nullable(),
@@ -368,10 +369,27 @@ export type TaskScoreEntry = z.infer<typeof TaskScoreEntrySchema>;
 export const TaskScoresSchema = z.object({
   taskId: Id,
   moneyVisible: z.boolean(),
-  /** Oldest first: originals, then adjustments. */
+  /**
+   * Oldest first: originals, then adjustments. PD-048: a task's page also lists the rows of its subtasks (each scored by
+   * its own process and quantity) — `item.task.code` tells which.
+   */
   items: z.array(TaskScoreEntrySchema),
-  /** Current value per role (original + adjustments). */
-  totals: z.array(z.object({ role: ScoreRoleSchema, user: UserRefSchema, qty: z.number().int(), credits: z.number(), money: z.number().int().nullable() }))
+  /** Current value per role (original + adjustments), the task and its subtasks together. */
+  totals: z.array(z.object({ role: ScoreRoleSchema, user: UserRefSchema, qty: z.number().int(), credits: z.number(), money: z.number().int().nullable() })),
+  /**
+   * PD-048: the same visible rows grouped by process ("Công đoạn") — the task's own process and each subtask's — in
+   * workflow order of first appearance: images, credits, the unit price of the originals (null when they differ) and
+   * whether a price was missing (recorded with 0 credits).
+   */
+  byProcess: z.array(
+    z.object({
+      process: z.object({ id: Id, name: z.string() }).nullable(),
+      qty: z.number().int(),
+      credits: z.number(),
+      unitCredits: z.number().nullable(),
+      missingRule: z.boolean()
+    })
+  )
 });
 export type TaskScores = z.infer<typeof TaskScoresSchema>;
 

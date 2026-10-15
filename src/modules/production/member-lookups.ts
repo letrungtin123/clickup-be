@@ -23,6 +23,24 @@ export const loadProductionAdminIds = async (sql: QuerySql, organizationId: stri
     `
   ).map((row) => row.user_id);
 
+/**
+ * Active members holding any of the production `roles`, plus organization superadmins (implicitly ADMIN, PD-011) —
+ * e.g. ACCOUNT / ADMIN for the job status notification (PD-045).
+ */
+export const loadProductionRoleHolderIds = async (sql: QuerySql, organizationId: string, roles: readonly string[]) =>
+  (
+    await sql<{ user_id: string }[]>`
+      SELECT ur.user_id FROM production.user_roles ur
+      JOIN public.organization_memberships om
+        ON om.organization_id = ur.organization_id AND om.user_id = ur.user_id AND om.deleted_at IS NULL AND om.status = 'active'
+      WHERE ur.organization_id = ${organizationId} AND ur.role_code = ANY(${[...roles]}::text[])
+      UNION
+      SELECT om.user_id FROM public.organization_memberships om
+      JOIN public.roles r ON r.id = om.role_id AND r.organization_id = om.organization_id AND r.key = 'superadmin'
+      WHERE om.organization_id = ${organizationId} AND om.deleted_at IS NULL AND om.status = 'active'
+    `
+  ).map((row) => row.user_id);
+
 export type LedJob = {
   id: string;
   code: string;
@@ -71,12 +89,17 @@ export const listOpenJobsLedBy = async (sql: QuerySql, organizationId: string, u
       job_status_name: string;
       job_status_color: string;
       job_status_closed: boolean;
+      job_status_requires_all_checked: boolean;
       task_count: number;
     }[]
   >`
     SELECT j.id, j.code, j.name, j.deadline,
       js.id AS job_status_id, js.name AS job_status_name, js.color AS job_status_color, js.is_closed AS job_status_closed,
-      (SELECT count(*)::int FROM production.tasks t WHERE t.organization_id = j.organization_id AND t.job_id = j.id AND t.deleted_at IS NULL) AS task_count
+      js.requires_all_checked AS job_status_requires_all_checked,
+      -- Lines only: a subtask (PD-044) is part of its line.
+      (SELECT count(*)::int FROM production.tasks t
+        WHERE t.organization_id = j.organization_id AND t.job_id = j.id AND t.deleted_at IS NULL
+          AND NOT (t.kind = 'NORMAL' AND t.parent_task_id IS NOT NULL)) AS task_count
     FROM production.jobs j
     JOIN production.job_statuses js ON js.organization_id = j.organization_id AND js.id = j.job_status_id
     WHERE j.organization_id = ${organizationId} AND j.leader_id = ${userId} AND j.archived_at IS NULL AND j.deleted_at IS NULL
@@ -92,7 +115,13 @@ export const listOpenJobsLedBy = async (sql: QuerySql, organizationId: string, u
       code: row.code,
       name: row.name,
       deadline: toIso(row.deadline),
-      jobStatus: { id: row.job_status_id, name: row.job_status_name, color: toColor(row.job_status_color), isClosed: row.job_status_closed },
+      jobStatus: {
+        id: row.job_status_id,
+        name: row.job_status_name,
+        color: toColor(row.job_status_color),
+        isClosed: row.job_status_closed,
+        requiresAllChecked: row.job_status_requires_all_checked
+      },
       taskCount: row.task_count
     }))
   };

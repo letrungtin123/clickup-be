@@ -100,9 +100,9 @@ const contextWith = (roles: string[]) =>
   ({ user: { id: me }, organization: { id: org }, hasFullOrganizationAuthority: false, productionRoles: roles, role: { permissions: [] } }) as unknown as AccessContext;
 
 const catalog = [
-  { id: statusNew, name: "Mới nhận", color: "slate", is_closed: false },
-  { id: statusDoing, name: "Đang làm", color: "blue", is_closed: false },
-  { id: statusDelivered, name: "Đã giao khách", color: "green", is_closed: true }
+  { id: statusNew, name: "Mới nhận", color: "slate", is_closed: false, requires_all_checked: false },
+  { id: statusDoing, name: "Đang làm", color: "blue", is_closed: false, requires_all_checked: false },
+  { id: statusDelivered, name: "Đã giao khách", color: "green", is_closed: true, requires_all_checked: false }
 ];
 const userJson = (id: string) => ({ id, display_name: `User ${id.slice(0, 4)}`, email: null, avatar_url: null });
 
@@ -127,6 +127,7 @@ const jobRow = (overrides: Partial<JobRow> = {}): JobRow => ({
   job_status_name: "Mới nhận",
   job_status_color: "slate",
   job_status_closed: false,
+  job_status_requires_all_checked: false,
   status_id: null,
   status_code: null,
   status_name: null,
@@ -136,9 +137,11 @@ const jobRow = (overrides: Partial<JobRow> = {}): JobRow => ({
   qty_checked: 0,
   task_count: 0,
   late_task_count: 0,
+  unchecked_task_count: 0,
   open_feedback_count: 0,
   workers: null,
   qc_people: null,
+  process_totals: null,
   person_share: null,
   custom_values: {},
   tag_ids: null,
@@ -195,7 +198,13 @@ const taskRow = (assigneeId: string): TaskRow => ({
   closed_at: null,
   deadline_cursor: "2099-01-01 00:00:00.000000+00",
   job_archived: false,
-  job_open_feedback: false
+  job_open_feedback: false,
+  split_reason: null,
+  created_by: null,
+  sub_seq: null,
+  parent_number: null,
+  subtasks: null,
+  pending_qty_request: null
 });
 
 /** The job (locked for a status change), its lines, the catalog and the detail read afterwards. */
@@ -209,7 +218,7 @@ const jobQueries = (options: { mine?: boolean; leaderId?: string | null; archive
     // "own" view: the caller works on / checks a line of the job.
     return options.mine ? [{ "?column?": 1 }] : [];
   }
-  if (call.text.startsWith("SELECT id, name, color, is_closed FROM production.job_statuses WHERE organization_id = $ AND id = $")) {
+  if (call.text.startsWith("SELECT id, name, color, is_closed, requires_all_checked FROM production.job_statuses WHERE organization_id = $ AND id = $")) {
     return catalog.filter((row) => row.id === call.values[1]);
   }
   if (call.text.includes("AS created_cursor")) {
@@ -312,7 +321,13 @@ describe("manual job status — who may change it (PD-038)", () => {
       call.text.includes("AS job_leader_id") ? [{ ...taskRow(worker), qc_id: me, qc: userJson(me) }] : jobQueries({ assignee: worker })(call);
     const detail = await getJobDetail(contextWith(["QC"]), jobId);
     expect(detail.capabilities.canChangeStatus).toBe(false);
-    expect(detail.jobStatus).toEqual({ id: statusNew, name: "Mới nhận", color: "slate", isClosed: false });
+    expect(detail.jobStatus).toEqual({ id: statusNew, name: "Mới nhận", color: "slate", isClosed: false, requiresAllChecked: false });
+    // PD-045: no job-level line moves, the feedback feature retired; uncheckedTaskCount from the job aggregate.
+    expect(detail.capabilities).toMatchObject({ bulkActions: [], canFeedback: false, canCloseFeedback: false });
+    expect(detail.uncheckedTaskCount).toBe(0);
+    const jobQuery = callsLike(/AS created_cursor/)[0]!;
+    expect(jobQuery.text).toContain("js.requires_all_checked AS job_status_requires_all_checked");
+    expect(jobQuery.text).toContain("AS unchecked_task_count");
   });
 });
 
@@ -355,10 +370,12 @@ describe("job list, create job and the work-entry picker (PD-038)", () => {
       job_status_id: statusDelivered,
       job_status_name: "Đã giao khách",
       job_status_color: "green",
-      job_status_closed: true
+      job_status_closed: true,
+      job_status_requires_all_checked: false
     }));
     db.state.handler = (call) => (call.text.includes("FROM production.jobs j JOIN production.job_statuses js") ? rows : undefined);
-    const result = await listJobOptions(contextWith(["STAFF"]), JobOptionsQuerySchema.parse({ projectId, q: "Bátch", statusIds: statusDelivered, limit: "2" }));
+    // QC keeps "create: own" by default (PD-047 took it from STAFF).
+    const result = await listJobOptions(contextWith(["QC"]), JobOptionsQuerySchema.parse({ projectId, q: "Bátch", statusIds: statusDelivered, limit: "2" }));
     const query = callsLike(/FROM production\.jobs j JOIN production\.job_statuses js/)[0]!;
     expect(query.text).toContain("j.deleted_at IS NULL AND j.archived_at IS NULL");
     expect(query.text).toContain("ORDER BY js.is_closed, j.deadline DESC, j.id DESC");
@@ -370,7 +387,7 @@ describe("job list, create job and the work-entry picker (PD-038)", () => {
     expect(result.items).toHaveLength(2);
     expect(result.truncated).toBe(true);
     expect(Object.keys(result.items[0]!).sort()).toEqual(["code", "deadline", "id", "jobStatus", "projectId"]);
-    expect(result.items[0]!.jobStatus).toEqual({ id: statusDelivered, name: "Đã giao khách", color: "green", isClosed: true });
+    expect(result.items[0]!.jobStatus).toEqual({ id: statusDelivered, name: "Đã giao khách", color: "green", isClosed: true, requiresAllChecked: false });
   });
 
   it("options: create none is refused (403) even with view all", async () => {
@@ -389,6 +406,11 @@ describe("job list, create job and the work-entry picker (PD-038)", () => {
           ]
         : undefined;
     expect(await failure(listJobOptions(contextWith(["ACCOUNT"]), JobOptionsQuerySchema.parse({ projectId })))).toMatchObject({ code: "FORBIDDEN", status: 403 });
+  });
+
+  it("options: STAFF has create none by default (PD-047) — refused", async () => {
+    expect(await failure(listJobOptions(contextWith(["STAFF"]), JobOptionsQuerySchema.parse({ projectId })))).toMatchObject({ code: "FORBIDDEN", status: 403 });
+    expect(callsLike(/FROM production\.jobs j JOIN production\.job_statuses js/)).toHaveLength(0);
   });
 });
 
@@ -413,10 +435,21 @@ describe("Cấu hình → Trạng thái job (PD-038)", () => {
     await createJobStatus(contextWith(["ADMIN"]), CreateJobStatusRequestSchema.parse({ name: "  Chờ duyệt ", color: "teal", isClosed: false }));
     const insert = callsLike(/^INSERT INTO production\.job_statuses/)[0]!;
     expect(insert.text).toContain("coalesce(max(position), 0) + 1");
-    expect(insert.values).toEqual([org, "Chờ duyệt", "teal", false, me, me, org]);
+    // requiresAllChecked defaults to false (PD-045).
+    expect(insert.values).toEqual([org, "Chờ duyệt", "teal", false, false, me, me, org]);
+    db.state.calls = [];
+    await createJobStatus(contextWith(["ADMIN"]), CreateJobStatusRequestSchema.parse({ name: "Xong hết", requiresAllChecked: true }));
+    expect(callsLike(/^INSERT INTO production\.job_statuses/)[0]!.text).toContain("requires_all_checked");
+    expect(callsLike(/^INSERT INTO production\.job_statuses/)[0]!.values).toEqual([org, "Xong hết", "slate", false, true, me, me, org]);
     db.state.handler = (call) => (call.text.startsWith("UPDATE production.job_statuses") ? [{ id: statusNew }] : undefined);
     await updateJobStatus(contextWith(["ADMIN"]), statusNew, UpdateCatalogStatusSchema.parse({ isClosed: true }));
     expect(callsLike(/^UPDATE production\.job_statuses/)[0]!.values).toContain(me);
+    // PD-045: turning "cần check hết dòng" on / off is an update of its own (null = unchanged).
+    db.state.calls = [];
+    await updateJobStatus(contextWith(["ADMIN"]), statusNew, UpdateCatalogStatusSchema.parse({ requiresAllChecked: true }));
+    const update = callsLike(/^UPDATE production\.job_statuses/)[0]!;
+    expect(update.text).toContain("requires_all_checked = coalesce($::boolean, requires_all_checked)");
+    expect(update.values.slice(0, 4)).toEqual([null, null, null, true]);
     expect(UpdateCatalogStatusSchema.safeParse({}).success).toBe(false);
     expect(CreateJobStatusRequestSchema.safeParse({ name: "   " }).success).toBe(false);
   });

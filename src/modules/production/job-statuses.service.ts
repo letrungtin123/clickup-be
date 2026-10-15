@@ -21,6 +21,10 @@ import { assertProductionAdmin, assertProductionMember, isProductionAdmin } from
  * per organization, case-insensitive (production_job_statuses_name_uidx → 409 JOB_STATUS_NAME_TAKEN). The last status
  * cannot be deleted; deleting a status that jobs use moves all of them to a replacement in one statement, with a JOB
  * history row per job. Migration 20261013_0200 seeds the six defaults (production.ensure_job_statuses).
+ *
+ * PD-045 `requires_all_checked` ("Đã xong" by default): a status a job can take only when every live line of it is
+ * "Đã check" (a Checking line: Done) — enforced by changeJobStatus / createJob (409 JOB_NOT_READY). Job statuses are
+ * read straight from the table (no catalog cache), so a change applies to the next request.
  */
 
 const org = (context: AccessContext) => context.organization.id;
@@ -31,6 +35,7 @@ type JobStatusRow = {
   color: string;
   position: number;
   is_closed: boolean;
+  requires_all_checked: boolean;
   job_count: number | null;
   updated_at: Date;
   updated_by: UserRefJson | null;
@@ -41,14 +46,14 @@ const statusNotFound = () => new AppError("JOB_STATUS_NOT_FOUND", "Không tìm t
 /** One status of the organization as a job ref; 400 when it is not one of them (a request named it). */
 export const loadJobStatus = async (sql: QuerySql, organizationId: string, id: string): Promise<JobStatusRef> => {
   const row = (
-    await sql<{ id: string; name: string; color: string; is_closed: boolean }[]>`
-      SELECT id, name, color, is_closed FROM production.job_statuses WHERE organization_id = ${organizationId} AND id = ${id}
+    await sql<{ id: string; name: string; color: string; is_closed: boolean; requires_all_checked: boolean }[]>`
+      SELECT id, name, color, is_closed, requires_all_checked FROM production.job_statuses WHERE organization_id = ${organizationId} AND id = ${id}
     `
   )[0];
   if (!row) {
     throw new AppError("JOB_STATUS_NOT_FOUND", "Trạng thái job không tồn tại.", 400);
   }
-  return { id: row.id, name: row.name, color: toColor(row.color), isClosed: row.is_closed };
+  return { id: row.id, name: row.name, color: toColor(row.color), isClosed: row.is_closed, requiresAllChecked: row.requires_all_checked };
 };
 
 /** A status in a job history row (task_logs action JOB): kept by value, so a later rename or delete keeps the story. */
@@ -59,7 +64,7 @@ export const jobStatusLogValue = (status: Pick<JobStatusRef, "id" | "name" | "co
 });
 
 const selectStatuses = (sql: QuerySql, organizationId: string, withCounts: boolean) => sql<JobStatusRow[]>`
-  SELECT s.id, s.name, s.color, s.position, s.is_closed, s.updated_at,
+  SELECT s.id, s.name, s.color, s.position, s.is_closed, s.requires_all_checked, s.updated_at,
     ${
       withCounts
         ? sql`(SELECT count(*)::int FROM production.jobs j
@@ -90,6 +95,7 @@ export const listJobStatuses = async (context: AccessContext): Promise<JobStatus
       color: toColor(row.color),
       position: row.position,
       isClosed: row.is_closed,
+      requiresAllChecked: row.requires_all_checked,
       jobCount: row.job_count,
       updatedAt: toIso(row.updated_at),
       updatedBy: toUserRef(row.updated_by)
@@ -109,27 +115,33 @@ export const createJobStatus = async (context: AccessContext, input: CreateJobSt
       throw new AppError("JOB_STATUS_LIMIT", `Tối đa ${jobStatusLimit} trạng thái job.`, 409);
     }
     await tx`
-      INSERT INTO production.job_statuses (organization_id, name, color, position, is_closed, created_by, updated_by)
-      SELECT ${org(context)}, ${input.name}, ${input.color}, coalesce(max(position), 0) + 1, ${input.isClosed}, ${context.user.id}, ${context.user.id}
+      INSERT INTO production.job_statuses (organization_id, name, color, position, is_closed, requires_all_checked, created_by, updated_by)
+      SELECT ${org(context)}, ${input.name}, ${input.color}, coalesce(max(position), 0) + 1, ${input.isClosed}, ${input.requiresAllChecked},
+        ${context.user.id}, ${context.user.id}
       FROM production.job_statuses WHERE organization_id = ${org(context)}
     `;
   });
   return await listJobStatuses(context);
 };
 
-/** PATCH /production/job-statuses/:id (ADMIN): rename, colour, "đóng". Jobs keep the status (they hold its id). */
+/**
+ * PATCH /production/job-statuses/:id (ADMIN): rename, colour, "đóng", "cần check hết task" (requiresAllChecked, PD-045 —
+ * turning it on moves no job: jobs already in the status keep it). Jobs keep the status (they hold its id).
+ */
 export const updateJobStatus = async (context: AccessContext, id: string, input: UpdateJobStatusRequest) => {
   assertProductionAdmin(context);
   const sql = getSql();
   const name = input.name ?? null;
   const color = input.color ?? null;
   const closed = input.isClosed ?? null;
+  const allChecked = input.requiresAllChecked ?? null;
   const rows = await sql<{ id: string }[]>`
     UPDATE production.job_statuses
     SET name = coalesce(${name}, name), color = coalesce(${color}, color), is_closed = coalesce(${closed}::boolean, is_closed),
-      updated_by = ${context.user.id}
+      requires_all_checked = coalesce(${allChecked}::boolean, requires_all_checked), updated_by = ${context.user.id}
     WHERE organization_id = ${org(context)} AND id = ${id}
-      AND (name, color, is_closed) IS DISTINCT FROM (coalesce(${name}, name), coalesce(${color}, color), coalesce(${closed}::boolean, is_closed))
+      AND (name, color, is_closed, requires_all_checked) IS DISTINCT FROM
+        (coalesce(${name}, name), coalesce(${color}, color), coalesce(${closed}::boolean, is_closed), coalesce(${allChecked}::boolean, requires_all_checked))
     RETURNING id
   `;
   if (rows.length === 0) {

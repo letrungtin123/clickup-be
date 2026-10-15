@@ -24,8 +24,23 @@ export type WorkflowTransition = { fromStatusId: string; toStatusId: string; act
 
 export type Workflow = { statuses: WorkflowStatus[]; transitions: WorkflowTransition[] };
 
-/** Codes the engine relies on; admins may rename them but not change or deactivate them. */
-export const systemStatusCodes = ["ASSIGNED", "PROCESSING", "DONE", "WAITING_QC", "CHECKED", "COMPLETE", "DELIVERING", "FEEDBACK", "DELIVERED"] as const;
+/**
+ * Codes the engine relies on; admins may rename them but not change or deactivate them. PD-044 added REWORK ("Cần sửa
+ * lại", where QC sends a line back) and QC_CHECKING ("Đang check").
+ */
+export const systemStatusCodes = [
+  "ASSIGNED",
+  "REWORK",
+  "PROCESSING",
+  "DONE",
+  "WAITING_QC",
+  "QC_CHECKING",
+  "CHECKED",
+  "COMPLETE",
+  "DELIVERING",
+  "FEEDBACK",
+  "DELIVERED"
+] as const;
 export type SystemStatusCode = (typeof systemStatusCodes)[number];
 
 /**
@@ -43,10 +58,31 @@ export type TaskRelation = {
 };
 
 /**
- * Statuses only the system enters (BUG-PR-01): a task is parked in FEEDBACK by "Ghi feedback", which also
- * writes the feedback record — never by a status move, not even an ADMIN override.
+ * Statuses only the system enters (BUG-PR-01): a task was parked in FEEDBACK by "Ghi feedback" (retired, PD-045) —
+ * never by a status move, not even an ADMIN override. Client feedback is now the job status "Feedback" (PD-045).
  */
 export const systemOnlyTargetCodes: ReadonlySet<string> = new Set(["FEEDBACK"]);
+
+/**
+ * Why nobody moves a line into a system-only status (PD-045 wording: client feedback is the job status "Feedback"; PD-047:
+ * "task", not "dòng").
+ */
+export const systemOnlyTargetMessage = (statusName: string) =>
+  `Không chuyển task sang "${statusName}" — feedback của khách: đổi trạng thái job sang "Feedback" và Chia task cho phần sửa.`;
+
+/**
+ * People never move a single line to Complete (PD-044); per line it is offered only as an ADMIN override. PD-045: the
+ * line workflow stops at "Đã check" (its transitions to Complete and later are deleted) and the job's status is the
+ * manual chip, so this only guards an organization that adds such a transition back. System paths (feedback released
+ * back to Complete, importers) call `moveTasks` directly and are not affected.
+ */
+export const jobLevelOnlyTargetCodes: ReadonlySet<string> = new Set(["COMPLETE"]);
+
+/** Where a move is asked from: one line ("Chuyển", POST …/tasks/:id/transition) or the whole job (POST …/jobs/:id/transition). */
+export type TransitionScope = "task" | "job";
+
+/** PD-044: a subtask is a NORMAL row with a parent line; it has no moves of its own (it follows its line). */
+export const isSubtask = (row: { kind: string; parentTaskId: string | null }) => row.kind === "NORMAL" && row.parentTaskId !== null;
 
 export const statusById = (workflow: Workflow, id: string) => workflow.statuses.find((status) => status.id === id);
 
@@ -86,9 +122,15 @@ export type TransitionOption = { toStatusId: string; requiresNote: boolean; over
  * whose target status the caller's roles may set. ADMIN may additionally force any move (override,
  * reason required). SYSTEM-only transitions are never offered to people, nor are moves into a
  * system-only status (FEEDBACK), moves out of FEEDBACK while the job's feedback is open (closing it
- * releases the tasks), or any move of an archived job's task.
+ * releases the tasks), or any move of an archived job's task. For one line (`scope` "task", the default) a job-level
+ * target (Complete, PD-044) is offered only as an ADMIN override; the job's own action (`scope` "job") offers it as listed.
  */
-export const allowedTransitions = (workflow: Workflow, fromStatusId: string, relation: TaskRelation): TransitionOption[] => {
+export const allowedTransitions = (
+  workflow: Workflow,
+  fromStatusId: string,
+  relation: TaskRelation,
+  scope: TransitionScope = "task"
+): TransitionOption[] => {
   const from = statusById(workflow, fromStatusId);
   if (relation.jobArchived || (from?.code === "FEEDBACK" && relation.jobHasOpenFeedback)) {
     return [];
@@ -101,7 +143,7 @@ export const allowedTransitions = (workflow: Workflow, fromStatusId: string, rel
       continue;
     }
     const target = statusById(workflow, transition.toStatusId);
-    if (!peopleMayEnter(target)) {
+    if (!peopleMayEnter(target) || (scope === "task" && jobLevelOnlyTargetCodes.has(target.code))) {
       continue;
     }
     if (transition.actors.some((actor) => actorMatches(actor, relation)) && holdsSetByRole(target, relation)) {
@@ -136,7 +178,14 @@ export const assertTransition = (
     const fromStatus = statusById(workflow, fromStatusId);
     const toStatus = statusById(workflow, toStatusId);
     if (toStatus && systemOnlyTargetCodes.has(toStatus.code)) {
-      throw new AppError("TRANSITION_NOT_ALLOWED", `Chỉ hệ thống chuyển task sang "${toStatus.name}" — dùng "Ghi feedback" trên job.`, 400);
+      throw new AppError("TRANSITION_NOT_ALLOWED", systemOnlyTargetMessage(toStatus.name), 400);
+    }
+    if (toStatus && jobLevelOnlyTargetCodes.has(toStatus.code) && !(fromStatus?.code === "FEEDBACK" && relation.jobHasOpenFeedback)) {
+      throw new AppError(
+        "TRANSITION_NOT_ALLOWED",
+        `Task dừng ở "Đã check" — không chuyển sang "${toStatus.name}"; trạng thái của cả job đổi ở chip "Trạng thái job".`,
+        400
+      );
     }
     if (fromStatus?.code === "FEEDBACK" && relation.jobHasOpenFeedback) {
       throw new AppError(
@@ -186,23 +235,86 @@ export const deriveJobStatus = (workflow: Workflow, taskStatusIds: string[], has
   return least?.id ?? null;
 };
 
+/** QC is looking at the line: "Chờ QC" and "Đang check" (PD-044) — the QC queue, and where a QC fail starts from. */
+export const qcStageCodes: ReadonlySet<string> = new Set(["WAITING_QC", "QC_CHECKING"]);
+
 /**
- * A move back out of Waiting QC is a QC fail only when the caller moved as the task's QC (BUG-PR-07): an
- * ADMIN override (e.g. reopening work) neither counts towards qc_fail_count nor notifies a QC fail.
+ * A move back out of Chờ QC / Đang check (PD-044: into "Cần sửa lại") is a QC fail only when the caller moved as the
+ * task's QC (BUG-PR-07): an ADMIN override (e.g. reopening work) neither counts towards qc_fail_count nor notifies a
+ * QC fail.
  */
 export const isQcFail = (from: Pick<WorkflowStatus, "code" | "sortOrder">, to: Pick<WorkflowStatus, "sortOrder">, override: boolean) =>
-  !override && from.code === "WAITING_QC" && to.sortOrder < from.sortOrder;
+  !override && qcStageCodes.has(from.code) && to.sortOrder < from.sortOrder;
 
-/** Finished statuses: from COMPLETE onwards (by sort order) and terminal ones — the task left the work pipeline. */
-export const finishedStatusIds = (workflow: Workflow) => {
-  const complete = workflow.statuses.find((status) => status.code === "COMPLETE");
-  const threshold = complete?.sortOrder ?? Number.POSITIVE_INFINITY;
-  return workflow.statuses.filter((status) => status.sortOrder >= threshold || status.isTerminal).map((status) => status.id);
+// Finished lines (PD-045) -----------------------------------------------------------------------------
+
+/**
+ * Statuses that finish a line (PD-045: the line workflow stops at "Đã check"). `checked`: "Đã check" and every status
+ * after it by sort order, plus terminal ones — they finish any line (historic lines in Complete / Đã giao khách too).
+ * `checkingDone`: Done and every status after it, plus terminal ones — they finish a Checking line (QC process, PD-037:
+ * it has no QC of its own) once it was Done (done_at set). A code missing from the workflow finishes nothing (terminal
+ * statuses aside). The SQL filters (personal lists, job aggregates) use these ids with the same rule as `isLineFinished`.
+ */
+export type LineFinishStatusIds = { checked: string[]; checkingDone: string[] };
+
+export const lineFinishStatusIds = (workflow: Workflow): LineFinishStatusIds => {
+  const from = (code: SystemStatusCode) => {
+    const threshold = workflow.statuses.find((status) => status.code === code)?.sortOrder ?? Number.POSITIVE_INFINITY;
+    return workflow.statuses.filter((status) => status.sortOrder >= threshold || status.isTerminal).map((status) => status.id);
+  };
+  return { checked: from("CHECKED"), checkingDone: from("DONE") };
+};
+
+/** A line as the finished rule sees it (subtasks follow their line and are never asked about on their own). */
+export type FinishLine = { statusId: string; isChecking: boolean; doneAt: Date | string | null };
+
+/**
+ * PD-045: the line is finished work — out of "Việc của tôi" (unless finished work is asked for), closed (closed_at: no
+ * lateness, no due-soon reminder), and ready for a job status with `requiresAllChecked` — once it is "Đã check" or later,
+ * or, for a Checking line, once it is Done (done_at set) and still in Done or later.
+ */
+export const isLineFinished = (workflow: Workflow, line: FinishLine, ids: LineFinishStatusIds = lineFinishStatusIds(workflow)) =>
+  ids.checked.includes(line.statusId) || (line.isChecking && line.doneAt !== null && ids.checkingDone.includes(line.statusId));
+
+/** One live line of a job (not a subtask: subtasks follow their line) as the readiness rule sees it. */
+export type ReadinessLine = FinishLine & { id: string; number: number };
+
+export type JobReadiness = { ready: boolean; lineCount: number; uncheckedTaskIds: string[]; uncheckedNumbers: number[] };
+
+/**
+ * PD-045 "Đã xong" (a job status with `requiresAllChecked`): ready when the job has at least one live line and every one
+ * is finished (`isLineFinished`: "Đã check" or later; a Checking line: Done). The unchecked lines come back by number.
+ */
+export const jobLinesReady = (workflow: Workflow, lines: readonly ReadinessLine[]): JobReadiness => {
+  const ids = lineFinishStatusIds(workflow);
+  const unchecked = lines.filter((line) => !isLineFinished(workflow, line, ids)).sort((a, b) => a.number - b.number);
+  return {
+    ready: lines.length > 0 && unchecked.length === 0,
+    lineCount: lines.length,
+    uncheckedTaskIds: unchecked.map((line) => line.id),
+    uncheckedNumbers: unchecked.map((line) => line.number)
+  };
+};
+
+/**
+ * Why a `requiresAllChecked` job status cannot be chosen (409 JOB_NOT_READY): "Job chưa có task nào." or
+ * "Còn 2 task chưa check: #1216, #1217." (at most 10 numbers, then "…"); null when the job is ready.
+ */
+export const jobNotReadyMessage = (readiness: JobReadiness) => {
+  if (readiness.ready) {
+    return null;
+  }
+  if (readiness.lineCount === 0) {
+    return "Job chưa có task nào.";
+  }
+  const shown = readiness.uncheckedNumbers.slice(0, 10).map((number) => `#${number}`);
+  const more = readiness.uncheckedNumbers.length > shown.length ? ", …" : "";
+  return `Còn ${readiness.uncheckedNumbers.length} task chưa check: ${shown.join(", ")}${more}.`;
 };
 
 /**
  * Lateness (PLAN §9, PD-014; BUG-PR-08): late = not Done by the deadline. A task closed without Done (an
- * ADMIN override to Complete or later) is no longer open work and is not late; a Done task is late when
+ * ADMIN override to "Đã check" or later, PD-045) is no longer open work and is not late; a Done task is late when
  * its first Done came after the deadline.
  */
 export const computeIsLate = (input: { doneAt: Date | null; closed: boolean; deadline: Date; now: Date }) =>
@@ -246,25 +358,37 @@ export type TaskLineContext = {
   shifts: ReadonlyMap<string, { active: boolean }>;
 };
 
+/** What a line must have besides its people and catalog rows (taskLineErrors). */
+export type TaskLineRules = {
+  /**
+   * PD-047: a new work line (not a Checking line) must name a QC ("Chọn QC cho task."). Set when lines are created
+   * ("Chia task", "Nhập công việc"); not when an existing line is re-validated (its people or process change) — lines
+   * created without QC before PD-047 are left as they are.
+   */
+  requireQc?: boolean;
+};
+
+/** PD-047: the problem of a new work line without QC. */
+export const qcMissingMessage = "Chọn QC cho task.";
+
 /**
- * SPEC Phase 2 §2 + PLAN §10: returns the problems of one task line (empty = valid). QC is optional on every line,
- * also when someone enters a line for themselves (PD-035: staff enter their own work-log rows).
+ * SPEC Phase 2 §2 + PLAN §10: returns the problems of one task line (empty = valid).
  *
  * A Checking line (its process is the QC process, PD-037) is a work line of the QC person: its assignee holds QC (or
- * LEADER / ADMIN) and it has no QC of its own — its flow goes Done → Complete. Any other line is done by a STAFF or
- * LEADER and may name a QC (another person holding QC).
+ * LEADER / ADMIN) and it has no QC of its own — its flow ends at Done (PD-045). Any other line is done by a STAFF or
+ * LEADER and names a QC (another person holding QC) — required for new lines (`rules.requireQc`, PD-047).
  */
-export const taskLineErrors = (line: TaskLineInput, context: TaskLineContext): string[] => {
+export const taskLineErrors = (line: TaskLineInput, context: TaskLineContext, rules: TaskLineRules = {}): string[] => {
   const errors: string[] = [];
   const process = context.processes.get(line.processId);
   const checking = process?.isQc === true;
   const assigneeRoles = context.memberRoles.get(line.assigneeId);
   if (checking) {
     if (!assigneeRoles || !(assigneeRoles.has("QC") || assigneeRoles.has("LEADER") || assigneeRoles.has("ADMIN"))) {
-      errors.push("Người làm dòng Checking phải có vai trò QC (hoặc Leader).");
+      errors.push("Người làm task Checking phải có vai trò QC (hoặc Leader).");
     }
     if (line.qcId) {
-      errors.push("Dòng Checking không có QC riêng — người làm chính là người kiểm.");
+      errors.push("Task Checking không có QC riêng — người làm chính là người kiểm.");
     }
   } else {
     if (!assigneeRoles || !(assigneeRoles.has("STAFF") || assigneeRoles.has("LEADER"))) {
@@ -278,6 +402,8 @@ export const taskLineErrors = (line: TaskLineInput, context: TaskLineContext): s
       if (line.qcId === line.assigneeId) {
         errors.push("QC phải khác người làm.");
       }
+    } else if (rules.requireQc) {
+      errors.push(qcMissingMessage);
     }
   }
   if (!process?.active) {
@@ -306,6 +432,40 @@ export const assertDeclaredDoneQty = (qtyAssigned: number, qtyDone: number) => {
       400
     );
   }
+};
+
+/**
+ * PD-044 subtask process: active, not the QC process ("Checking" is its own line, PD-037) and not its line's own.
+ * Returns the problem (Vietnamese) or null.
+ */
+export const subtaskProcessProblem = (process: { active: boolean; isQc: boolean } | undefined, processId: string, lineProcessId: string) => {
+  if (!process?.active) {
+    return "Quy trình không tồn tại hoặc đã ngừng.";
+  }
+  if (process.isQc) {
+    return "Subtask không dùng quy trình Checking.";
+  }
+  return processId === lineProcessId ? "Subtask phải khác quy trình của task." : null;
+};
+
+/**
+ * PD-044 subtask quantity: taken from its line, which keeps at least 1 image of its own. `pool` = the images the line can
+ * give (its own quantity; when editing a subtask, plus the subtask's current one). Returns the problem or null.
+ */
+export const subtaskQtyProblem = (pool: number, qty: number) =>
+  qty >= 1 && qty <= pool - 1 ? null : `Subtask lấy tối đa ${Math.max(pool - 1, 0)} tấm — task giữ lại ít nhất 1 tấm.`;
+
+/**
+ * PD-044 quantity request: the new total ("Số lượng giao": the line and its subtasks) must differ from the current one and
+ * leave the line at least 1 image of its own besides its subtasks. Returns the problem or null.
+ */
+export const qtyRequestProblem = (input: { currentTotal: number; subtaskQty: number; requestedTotal: number }) => {
+  if (input.requestedTotal === input.currentTotal) {
+    return `Số tấm mới phải khác số hiện tại (${input.currentTotal}).`;
+  }
+  return input.requestedTotal - input.subtaskQty < 1
+    ? `Tổng mới phải lớn hơn số tấm của các subtask (${input.subtaskQty}) — task giữ lại ít nhất 1 tấm.`
+    : null;
 };
 
 /** Over-allocation is allowed but warned and logged (SPEC Phase 2 §2). */

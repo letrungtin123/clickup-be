@@ -1995,7 +1995,9 @@ const executeJob = async (runtime: Runtime, job: JobPlan): Promise<string> => {
         kind,
         feedbackId,
         defaultParentId,
-        assignedAt: at
+        assignedAt: at,
+        // Replayed history may lack a QC (PD-047 requires QC on new lines).
+        historicQcOptional: true
       });
       const loaded = await selectTasks(tx, organizationId, created.ids);
       keys.forEach((key, index) => {

@@ -34,14 +34,18 @@ import { syncJobChat } from "./job-chat.service.js";
 import {
   assertJobVisible,
   assertTaskVisible,
-  finishedStatusIds,
+  isSubtaskRow,
   jobArchivedError,
+  lineFinishedSql,
   loadMemberRoles,
   loadTask,
   loadTaskExtras,
   loadWorkflowModel,
+  notSubtaskSql,
   relationOf,
   selectTasks,
+  subtaskJsonCode,
+  taskRowCode,
   taskSelectSql,
   toProductionTask,
   toProductionTasks,
@@ -49,7 +53,15 @@ import {
 } from "./jobs.repo.js";
 import { enqueueProductionEvents, taskAssignedEvent, taskQtyEvent, taskStatusEvent } from "./notifications.js";
 import { publishProductionChange } from "./realtime.js";
-import { assertLinesCreatable, forbidden, lineAllowed } from "./job-permissions.js";
+import {
+  assertLinesCreatable,
+  doneQtyEditAllowed,
+  forbidden,
+  lineAllowed,
+  qtyAssignedEditAllowed,
+  subtaskDeleteAllowed,
+  subtaskManageAllowed
+} from "./job-permissions.js";
 import { onTaskDeleted, onTaskQtyChanged, onTaskStatusEntered } from "./scoring-hooks.js";
 import {
   assertDeclaredDoneQty,
@@ -57,12 +69,18 @@ import {
   computeIsLate,
   deriveJobStatus,
   feedbackTaskDeadline,
+  isLineFinished,
   isQcFail,
+  lineFinishStatusIds,
   overAllocationWarning,
+  qcStageCodes,
   statusByCode,
   statusById,
+  subtaskProcessProblem,
+  subtaskQtyProblem,
   systemFollowUp,
   taskLineErrors,
+  type TaskLineRules,
   type Workflow,
   type WorkflowStatus
 } from "./workflow.js";
@@ -91,7 +109,7 @@ type LogInput = {
   taskId: string;
   jobId: string;
   userId: string | null;
-  action: "CREATE" | "STATUS" | "QTY" | "ASSIGN" | "NOTE" | "FIELD" | "DELETE";
+  action: "CREATE" | "STATUS" | "QTY" | "ASSIGN" | "NOTE" | "FIELD" | "DELETE" | "SUBTASK" | "QTY_REQUEST";
   from?: Record<string, unknown> | null;
   to?: Record<string, unknown> | null;
   note?: string | null;
@@ -126,13 +144,52 @@ const statusLogValue = (status: WorkflowStatus) => ({ statusId: status.id, code:
 
 // Status engine -----------------------------------------------------------------------------------------
 
-type MoveExtras = { qtyDone?: number | undefined; otHours?: number | undefined; override?: boolean; at?: Date };
+type MoveExtras = {
+  qtyDone?: number | undefined;
+  otHours?: number | undefined;
+  override?: boolean;
+  at?: Date;
+  /** PD-044: the Done quantity of each subtask moving with its line (default: its qty_assigned). */
+  subtaskQtyDone?: readonly { taskId: string; qtyDone: number }[] | undefined;
+};
+
+/**
+ * PD-044: the live subtasks of the given lines that are not in `tasks` already, locked (callers hold the job lock, so
+ * nothing changes them in between). Rows that cannot have subtasks (feedback redo tasks, subtasks) need no query.
+ */
+const lockSubtasksOf = async (tx: QuerySql, organizationId: string, tasks: readonly TaskRow[]) => {
+  const lineIds = tasks.filter((task) => task.kind === "NORMAL" && task.parent_task_id === null).map((task) => task.id);
+  if (lineIds.length === 0) {
+    return [];
+  }
+  const known = new Set(tasks.map((task) => task.id));
+  const ids = (
+    await tx<{ id: string }[]>`
+      SELECT id FROM production.tasks
+      WHERE organization_id = ${organizationId} AND parent_task_id = ANY(${lineIds}::uuid[]) AND kind = 'NORMAL' AND deleted_at IS NULL
+      ORDER BY created_at, number
+      FOR UPDATE
+    `
+  )
+    .map((row) => row.id)
+    .filter((id) => !known.has(id));
+  return await selectTasks(tx, organizationId, ids);
+};
 
 /**
  * Applies the same status change to locked tasks (one task, or a job-level bulk move): Done/Checked timestamps
  * and quantity, closed_at, lateness, QC-fail counter, history rows and the scoring hook. One UPDATE and one
  * history INSERT for all of them (PERF-15); the scoring hook still runs per task when the target status
  * records scores. Callers validate permissions first; the result keeps the input order.
+ *
+ * PD-045 closing (closed_at, per row): a line becomes finished work when it enters "Đã check" or later, a Checking line
+ * when it enters Done (`isLineFinished`); moving back into the pipeline reopens it. A closed or Done line is never
+ * flagged late or reminded (computeIsLate, markLateTasks / markDueSoonTasks).
+ *
+ * PD-044: the live subtasks of every line move with it in the same call (same status, timestamps, closing and lateness;
+ * each records its own score entry at the first Done, with its Done quantity from `subtaskQtyDone`); they raise no
+ * notification and never count as a QC fail (the line does). Back into Done before QC checked the line, the worker may
+ * give a new Done quantity (the scoring hook adjusts the ledger). Only the input rows are returned.
  */
 export const moveTasks = async (
   tx: QuerySql,
@@ -148,47 +205,70 @@ export const moveTasks = async (
     return [];
   }
   const now = extras.at ?? new Date();
-  // Entering Complete or later closes the task (BUG-PR-08); moving back into the pipeline reopens it.
-  const closing = finishedStatusIds(workflow).includes(to.id);
-  const planned = tasks.map((task) => {
+  // Becoming finished work closes the task (BUG-PR-08, PD-045); moving back into the pipeline reopens it.
+  const finish = lineFinishStatusIds(workflow);
+  const subtaskQty = new Map((extras.subtaskQtyDone ?? []).map((entry) => [entry.taskId, entry.qtyDone]));
+  const planMove = (task: TaskRow) => {
     const from = statusById(workflow, task.status_id);
     if (!from) {
       throw new AppError("WORKFLOW_INCOMPLETE", "Trạng thái hiện tại của task không còn tồn tại.", 409);
     }
-    if (to.code === "WAITING_QC" && !task.qc_id) {
+    const subtask = isSubtaskRow(task);
+    if (to.code === "WAITING_QC" && !task.qc_id && !subtask) {
       throw new AppError("QC_REQUIRED", "Cần gán QC trước khi chuyển sang chờ QC.", 400);
     }
     const firstDone = to.countsDone && task.done_at === null;
+    // The worker's Done quantity: the line's from the request, each subtask's from `subtaskQtyDone` (PD-044).
+    const declared = subtask ? subtaskQty.get(task.id) : extras.qtyDone;
     let qtyDone = task.qty_done;
     let otHours = task.ot_hours === null ? null : Number(task.ot_hours);
+    let qtyChanged = false;
     if (firstDone) {
-      qtyDone = extras.qtyDone ?? task.qty_assigned;
+      qtyDone = declared ?? task.qty_assigned;
       // SEC2-03: the declared quantity feeds points / Khoán money in the append-only ledger.
       assertDeclaredDoneQty(task.qty_assigned, qtyDone);
       // PD-035: "Giờ OT" is optional, also on the OT shift; sent at Done it replaces the line's own value.
-      if (extras.otHours !== undefined) {
+      if (extras.otHours !== undefined && !subtask) {
         otHours = extras.otHours;
       }
-    } else if (extras.qtyDone !== undefined && extras.qtyDone !== task.qty_done) {
-      throw new AppError("QTY_LOCKED", "Số lượng đã chốt ở lần Done đầu tiên; nhờ Leader sửa nếu cần.", 400);
+    } else if (declared !== undefined && declared !== task.qty_done) {
+      if (!to.countsDone) {
+        throw new AppError("QTY_LOCKED", "Số lượng hoàn thành chỉ nhập khi chuyển sang Done.", 400);
+      }
+      if (task.checked_at !== null) {
+        throw new AppError("QTY_LOCKED", "Task đã được QC check — số lượng đã chốt; nhờ Leader sửa nếu cần.", 400);
+      }
+      // PD-044: back into Done (e.g. after "Cần sửa lại") the worker may give a new quantity until QC checked the line.
+      assertDeclaredDoneQty(task.qty_assigned, declared);
+      qtyDone = declared;
+      qtyChanged = true;
     }
-    const qcFail = isQcFail(from, to, extras.override === true);
+    const qcFail = !subtask && isQcFail(from, to, extras.override === true);
     const doneAt = task.done_at ?? (to.countsDone ? now : null);
     const checkedAt = task.checked_at ?? (to.countsChecked ? now : null);
+    const closing = isLineFinished(workflow, { statusId: to.id, isChecking: task.process_is_qc, doneAt }, finish);
     const closedAt = closing ? (task.closed_at ?? now) : null;
     const isLate = computeIsLate({ doneAt, closed: closedAt !== null, deadline: task.deadline, now });
-    return { task, from, firstDone, qtyDone, otHours, qcFail, doneAt, checkedAt, closedAt, isLate };
-  });
+    return { task, subtask, from, firstDone, qtyChanged, qtyDone, otHours, qcFail, doneAt, checkedAt, closing, closedAt, isLate };
+  };
+  // The input rows are checked before anything is read or written (SEC2-03); then their subtasks join (PD-044).
+  const inputPlans = tasks.map(planMove);
+  const cascaded = await lockSubtasksOf(tx, organizationId, tasks);
+  const movingSubtasks = new Set([...tasks, ...cascaded].filter(isSubtaskRow).map((task) => task.id));
+  if ([...subtaskQty.keys()].some((id) => !movingSubtasks.has(id))) {
+    throw new AppError("SUBTASK_INVALID", "Số lượng Done gửi kèm không thuộc subtask của task này.", 400);
+  }
+  const planned = [...inputPlans, ...cascaded.map(planMove)];
 
   // Existing timestamps are kept by the database (coalesce) so their microseconds survive.
   await tx`
     UPDATE production.tasks AS t
     SET status_id = ${to.id},
-        qty_done = CASE WHEN (m->>'firstDone')::boolean THEN (m->>'qtyDone')::int ELSE t.qty_done END,
+        qty_done = CASE WHEN (m->>'setQty')::boolean THEN (m->>'qtyDone')::int ELSE t.qty_done END,
         ot_hours = CASE WHEN (m->>'firstDone')::boolean THEN (m->>'otHours')::numeric ELSE t.ot_hours END,
         done_at = coalesce(t.done_at, (m->>'doneAt')::timestamptz),
         checked_at = coalesce(t.checked_at, (m->>'checkedAt')::timestamptz),
-        closed_at = CASE WHEN ${closing} THEN coalesce(t.closed_at, (m->>'closedAt')::timestamptz) ELSE NULL END,
+        closed_at = CASE WHEN (m->>'closing')::boolean THEN coalesce(t.closed_at, (m->>'closedAt')::timestamptz) ELSE NULL END,
         is_late = (m->>'isLate')::boolean,
         qc_fail_count = t.qc_fail_count + (m->>'qcFail')::int,
         updated_at = now()
@@ -196,10 +276,12 @@ export const moveTasks = async (
       planned.map((plan) => ({
         id: plan.task.id,
         firstDone: plan.firstDone,
+        setQty: plan.firstDone || plan.qtyChanged,
         qtyDone: plan.qtyDone,
         otHours: plan.otHours,
         doneAt: plan.doneAt?.toISOString() ?? null,
         checkedAt: plan.checkedAt?.toISOString() ?? null,
+        closing: plan.closing,
         closedAt: plan.closedAt?.toISOString() ?? null,
         isLate: plan.isLate,
         qcFail: plan.qcFail ? 1 : 0
@@ -215,10 +297,11 @@ export const moveTasks = async (
       jobId: plan.task.job_id,
       userId: actorId,
       action: "STATUS" as const,
-      from: statusLogValue(plan.from),
+      from: { ...statusLogValue(plan.from), ...(plan.qtyChanged ? { qtyDone: plan.task.qty_done } : {}) },
       to: {
         ...statusLogValue(to),
         ...(plan.firstDone ? { qtyDone: plan.qtyDone, ...(plan.otHours !== null ? { otHours: plan.otHours } : {}) } : {}),
+        ...(plan.qtyChanged ? { qtyDone: plan.qtyDone } : {}),
         ...(plan.qcFail ? { qcFail: true } : {}),
         ...(extras.override ? { override: true } : {})
       },
@@ -226,7 +309,11 @@ export const moveTasks = async (
       at: now
     }))
   );
+  // Subtasks raise nothing: their line's notification covers them (PD-044).
   const events = planned.flatMap((plan) => {
+    if (plan.subtask) {
+      return [];
+    }
     const enteredWaitingQc = to.code === "WAITING_QC";
     const enteredChecked = to.countsChecked && plan.task.checked_at === null;
     return enteredWaitingQc || enteredChecked || plan.qcFail
@@ -245,7 +332,7 @@ export const moveTasks = async (
       });
     }
   }
-  return planned.map((plan) => ({
+  return planned.slice(0, tasks.length).map((plan) => ({
     ...plan.task,
     status_id: to.id,
     status_code: to.code,
@@ -387,22 +474,25 @@ const taskListFilters = async (sql: QuerySql, organizationId: string, query: { t
   `;
 };
 
-/** Personal board: tasks I work on and/or check, soonest deadline first (full-precision keyset, BUG-PR-05). */
+/**
+ * Personal board: tasks I work on and/or check, soonest deadline first (full-precision keyset, BUG-PR-05). Subtasks are
+ * listed inside their line (`subtasks`), not as cards of their own (PD-044). Without `includeFinished`, finished lines
+ * are left out (PD-045: "Đã check" or later; a Checking line once Done — lineFinishedSql).
+ */
 export const listMyProductionTasks = async (context: AccessContext, query: MyProductionTasksQuery): Promise<ProductionTaskPage> => {
   assertProductionMember(context);
   const sql = getSql();
   const organizationId = context.organization.id;
   const cursor = decodeTimeCursor(query.cursor);
   const workflow = await loadWorkflowModel(sql, organizationId);
-  const finished = query.includeFinished ? [] : finishedStatusIds(workflow);
   const me = context.user.id;
   const filters = await taskListFilters(sql, organizationId, query);
   const rows = await sql<TaskRow[]>`
     ${taskSelectSql(sql)}
     WHERE t.organization_id = ${organizationId}
       AND ${query.role === "assignee" ? sql`t.assignee_id = ${me}` : query.role === "qc" ? sql`t.qc_id = ${me}` : sql`(t.assignee_id = ${me} OR t.qc_id = ${me})`}
-      AND NOT (t.status_id = ANY(${finished}::uuid[]))
-      AND j.archived_at IS NULL
+      ${query.includeFinished ? sql`` : sql`AND NOT ${lineFinishedSql(sql, lineFinishStatusIds(workflow), "pr")}`}
+      AND j.archived_at IS NULL AND ${notSubtaskSql(sql)}
       ${filters()}
       ${cursor ? sql`AND (t.deadline, t.id) > (${cursorInstantSql(sql, cursor.at)}, ${cursor.id}::uuid)` : sql``}
     ORDER BY t.deadline, t.id
@@ -416,17 +506,20 @@ export const listMyProductionTasks = async (context: AccessContext, query: MyPro
   };
 };
 
-/** QC queue: tasks waiting for my check, oldest Done first (archived jobs left out, BUG-PR-04). */
+/**
+ * QC queue: lines waiting for my check or that I am checking ("Chờ QC", "Đang check" — PD-044), oldest Done first
+ * (archived jobs left out, BUG-PR-04). Subtasks come with their line.
+ */
 export const listQcQueue = async (context: AccessContext, query: QcQueueQuery = { cf: [] }) => {
   assertProductionMember(context);
   const sql = getSql();
   const workflow = await loadWorkflowModel(sql, context.organization.id);
-  const waiting = workflow.statuses.filter((status) => status.code === "WAITING_QC").map((status) => status.id);
+  const waiting = workflow.statuses.filter((status) => qcStageCodes.has(status.code)).map((status) => status.id);
   const filters = await taskListFilters(sql, context.organization.id, query);
   const rows = await sql<TaskRow[]>`
     ${taskSelectSql(sql)}
     WHERE t.organization_id = ${context.organization.id} AND t.qc_id = ${context.user.id}
-      AND t.status_id = ANY(${waiting}::uuid[]) AND j.archived_at IS NULL
+      AND t.status_id = ANY(${waiting}::uuid[]) AND j.archived_at IS NULL AND ${notSubtaskSql(sql)}
       ${filters()}
     ORDER BY t.done_at NULLS LAST, t.id
     LIMIT 500
@@ -477,19 +570,27 @@ const lineContext = async (tx: QuerySql, organizationId: string, userIds: string
   };
 };
 
-/** Validates every line (all errors at once, prefixed with the line number) — nothing is written on error. */
-const assertLines = async (tx: QuerySql, organizationId: string, lines: (CreateTaskLine & { sourceTaskId?: string | undefined })[]) => {
+/**
+ * Validates every line (all errors at once, prefixed "Task N: …") — nothing is written on error. `rules.requireQc`:
+ * a work line without QC is refused (PD-047).
+ */
+const assertLines = async (
+  tx: QuerySql,
+  organizationId: string,
+  lines: (CreateTaskLine & { sourceTaskId?: string | undefined })[],
+  rules: TaskLineRules
+) => {
   const ctx = await lineContext(tx, organizationId, lines.flatMap((line) => [line.assigneeId, ...(line.qcId ? [line.qcId] : [])]));
   const errors: string[] = [];
   lines.forEach((line, index) => {
-    const lineErrors = taskLineErrors(line, ctx);
+    const lineErrors = taskLineErrors(line, ctx, rules);
     if (line.deadline && Number.isNaN(Date.parse(line.deadline))) {
       lineErrors.push("Ngày giao không hợp lệ.");
     }
     if (line.assignedAt && line.deadline && Date.parse(line.deadline) < Date.parse(line.assignedAt)) {
       lineErrors.push("Ngày giao phải từ Ngày nhận trở đi.");
     }
-    errors.push(...lineErrors.map((message) => `Dòng ${index + 1}: ${message}`));
+    errors.push(...lineErrors.map((message) => `Task ${index + 1}: ${message}`));
   });
   if (errors.length > 0) {
     throw new AppError("TASK_LINES_INVALID", errors.join(" "), 400);
@@ -501,6 +602,10 @@ const assertLines = async (tx: QuerySql, organizationId: string, lines: (CreateT
  * Returns the new ids in line order and the over-allocation warning, if any (allowed, but logged on each
  * new task). Default deadlines: job deadline − QC buffer; feedback redo tasks see feedbackTaskDeadline.
  * A task created already late is flagged late and notified by the next lateness scan (BUG-PR-03).
+ *
+ * PD-047: every NORMAL work line (not a Checking line) must name a QC ("Task N: Chọn QC cho task.", 400
+ * TASK_LINES_INVALID). `historicQcOptional` lifts that rule for the work-log importers only (BE/scripts), which replay
+ * history recorded without QC; API paths never set it.
  */
 export const insertTasks = async (
   tx: QuerySql,
@@ -508,10 +613,10 @@ export const insertTasks = async (
   workflow: Workflow,
   job: JobForTasks,
   lines: (CreateTaskLine & { sourceTaskId?: string | undefined })[],
-  options: { kind: TaskKind; feedbackId: string | null; defaultParentId: string | null; assignedAt?: Date }
+  options: { kind: TaskKind; feedbackId: string | null; defaultParentId: string | null; assignedAt?: Date; historicQcOptional?: boolean }
 ) => {
   const organizationId = context.organization.id;
-  await assertLines(tx, organizationId, lines);
+  await assertLines(tx, organizationId, lines, { requireQc: options.kind === "NORMAL" && options.historicQcOptional !== true });
   const initial = workflow.statuses.find((status) => status.isInitial && status.active);
   if (!initial) {
     throw new AppError("WORKFLOW_INCOMPLETE", "Chưa có trạng thái khởi tạo trong cấu hình.", 409);
@@ -533,7 +638,7 @@ export const insertTasks = async (
       parents.set(row.id, { assignedAt: row.assigned_at, deadline: row.deadline, customValues: row.custom_values ?? {}, tagIds: row.tag_ids ?? [] });
     }
   }
-  // Custom fields and tags of every line, all errors at once ("Dòng N: …"), before anything is written. A feedback
+  // Custom fields and tags of every line, all errors at once ("Task N: …"), before anything is written. A feedback
   // redo task ("Giao lại") inherits its source task's values and tags unless the line sends its own.
   const definitions = await loadFieldDefinitions(tx, organizationId, "TASK");
   const lineErrors: string[] = [];
@@ -543,7 +648,7 @@ export const insertTasks = async (
     try {
       return { customValues: taskLineCustomValues(definitions, line.customValues, parent?.customValues ?? null), tagIds: [...new Set(line.tagIds ?? parent?.tagIds ?? [])] };
     } catch (error) {
-      lineErrors.push(`Dòng ${index + 1}: ${error instanceof Error ? error.message : String(error)}`);
+      lineErrors.push(`Task ${index + 1}: ${error instanceof Error ? error.message : String(error)}`);
       return { customValues: {}, tagIds: [] };
     }
   });
@@ -555,7 +660,7 @@ export const insertTasks = async (
     const known = new Set(
       (await tx<{ id: string }[]>`SELECT id FROM production.tags WHERE organization_id = ${organizationId} AND id = ANY(${lineTagIds}::uuid[])`).map((row) => row.id)
     );
-    const missing = lineValues.flatMap((value, index) => (value.tagIds.some((tagId) => !known.has(tagId)) ? [`Dòng ${index + 1}: tag không tồn tại.`] : []));
+    const missing = lineValues.flatMap((value, index) => (value.tagIds.some((tagId) => !known.has(tagId)) ? [`Task ${index + 1}: tag không tồn tại.`] : []));
     if (missing.length > 0) {
       throw new AppError("TAG_NOT_FOUND", missing.join(" "), 400);
     }
@@ -684,7 +789,7 @@ export const createProductionTasks = async (context: AccessContext, jobId: strin
  * Loads a locked task with the caller's relation; hides it (404) from people who may not see it and refuses
  * changes to tasks of an archived job (409 JOB_ARCHIVED, BUG-PR-04).
  */
-const lockedTask = async (tx: QuerySql, context: AccessContext, taskId: string) => {
+export const lockedTask = async (tx: QuerySql, context: AccessContext, taskId: string) => {
   const organizationId = context.organization.id;
   await lockTaskForUpdate(tx, organizationId, taskId);
   const [task, workflow] = await Promise.all([loadTask(tx, organizationId, taskId), loadWorkflowModel(tx, organizationId)]);
@@ -695,18 +800,31 @@ const lockedTask = async (tx: QuerySql, context: AccessContext, taskId: string) 
   return { task, workflow, relation: relationOf(context, task), scopes, mine: task.assignee_id === context.user.id };
 };
 
+/** The number of a subtask's line (for messages such as "Subtask đi theo trạng thái của task #N."). */
+export const parentNumberOf = async (tx: QuerySql, organizationId: string, task: Pick<TaskRow, "parent_task_id">) =>
+  task.parent_task_id
+    ? Number(
+        (await tx<{ number: string }[]>`SELECT number FROM production.tasks WHERE organization_id = ${organizationId} AND id = ${task.parent_task_id}`)[0]
+          ?.number ?? 0
+      )
+    : 0;
+
 export const transitionProductionTask = async (context: AccessContext, taskId: string, input: TransitionTaskRequest) => {
   assertProductionMember(context);
   const organizationId = context.organization.id;
   const sql = getSql();
   const jobId = await sql.begin(async (tx) => {
     const { task, workflow, relation } = await lockedTask(tx, context, taskId);
+    if (isSubtaskRow(task)) {
+      throw new AppError("SUBTASK_FOLLOWS_PARENT", `Subtask đi theo trạng thái của task #${await parentNumberOf(tx, organizationId, task)}.`, 409);
+    }
     const option = assertTransition(workflow, task.status_id, input.toStatusId, relation, input.note);
     const target = statusById(workflow, input.toStatusId)!;
     const moved = await moveTask(tx, organizationId, workflow, task, target, context.user.id, input.note?.trim() || null, {
       qtyDone: input.qtyDone,
       otHours: input.otHours,
-      override: option.override
+      override: option.override,
+      subtaskQtyDone: input.subtaskQtyDone
     });
     await applyFollowUps(tx, organizationId, workflow, moved);
     await settleJob(tx, organizationId, workflow, task.job_id);
@@ -716,19 +834,30 @@ export const transitionProductionTask = async (context: AccessContext, taskId: s
   return await getProductionTask(context, taskId);
 };
 
-/** Leader of the job (or Admin) corrects qty_done after Done; scores are adjusted by the Phase 3 hook. */
+/**
+ * Corrects qty_done after Done; scores are adjusted by the Phase 3 hook. "update: all" at any time (trusted, not capped,
+ * the worker is notified); PD-044: also the line's worker until QC checked it ("Đã check"), capped like at Done. A subtask
+ * has its own Done quantity. The worker is notified only when someone else changed it (the actor never is).
+ */
 export const updateProductionTaskQty = async (context: AccessContext, taskId: string, input: { qtyDone: number; note?: string | undefined }) => {
   assertProductionMember(context);
   const organizationId = context.organization.id;
   const sql = getSql();
   const jobId = await sql.begin(async (tx) => {
-    const { task, scopes } = await lockedTask(tx, context, taskId);
-    // It changes recorded points: "update: all" only (PD-036), never one's own line under "own".
-    if (scopes.update !== "all") {
-      throw forbidden("Chỉ người có quyền sửa mọi công việc mới sửa được số lượng sau khi Done.");
+    const { task, scopes, mine } = await lockedTask(tx, context, taskId);
+    // It changes recorded points: "update: all" (PD-036), or the worker before QC checked the line (PD-044).
+    if (!mine && scopes.update !== "all") {
+      throw forbidden("Chỉ người làm (trước khi QC check) hoặc người có quyền sửa mọi công việc mới sửa được số lượng sau khi Done.");
     }
     if (task.done_at === null || task.qty_done === null) {
       throw new AppError("TASK_NOT_DONE", "Task chưa Done — người làm nhập số lượng khi bấm Done.", 409);
+    }
+    if (!doneQtyEditAllowed({ updateScope: scopes.update, mine, done: true, checked: task.checked_at !== null })) {
+      throw forbidden("Task đã được QC check — nhờ Leader sửa số lượng hoàn thành.");
+    }
+    if (scopes.update !== "all") {
+      // SEC2-03: the worker's own number is capped like at Done.
+      assertDeclaredDoneQty(task.qty_assigned, input.qtyDone);
     }
     if (input.qtyDone === task.qty_done) {
       return task.job_id;
@@ -741,7 +870,7 @@ export const updateProductionTaskQty = async (context: AccessContext, taskId: st
         userId: context.user.id,
         action: "QTY",
         from: { qtyDone: task.qty_done },
-        to: { qtyDone: input.qtyDone, notifyAssignee: true },
+        to: { qtyDone: input.qtyDone, notifyAssignee: !mine },
         note: input.note?.trim() || null
       }
     ]);
@@ -759,6 +888,13 @@ export const assignProductionTask = async (context: AccessContext, taskId: strin
   const sql = getSql();
   const result = await sql.begin(async (tx) => {
     const { task, workflow, scopes, mine } = await lockedTask(tx, context, taskId);
+    if (isSubtaskRow(task)) {
+      throw new AppError(
+        "SUBTASK_FIELD_LOCKED",
+        `Subtask theo người làm và QC của task — đổi trên task #${await parentNumberOf(tx, organizationId, task)}.`,
+        400
+      );
+    }
     if (!lineAllowed(scopes.update, mine)) {
       throw forbidden("Bạn không có quyền sửa công việc này.");
     }
@@ -774,8 +910,13 @@ export const assignProductionTask = async (context: AccessContext, taskId: strin
     if (qcId !== task.qc_id && task.checked_at !== null) {
       throw new AppError("TASK_ALREADY_CHECKED", "Task đã Checked, không đổi QC được.", 409);
     }
-    if (qcId === null && task.status_code === "WAITING_QC") {
-      throw new AppError("QC_REQUIRED", "Task đang chờ QC — chỉ có thể đổi sang QC khác.", 409);
+    // PD-047: a work line keeps its QC — it can be changed, not removed (a Checking line never has one; a line created
+    // without QC before PD-047 may stay without).
+    if (qcId === null && task.qc_id !== null && !task.process_is_qc) {
+      throw new AppError("QC_REQUIRED", "Task phải có QC — chỉ đổi sang QC khác.", 400);
+    }
+    if (qcId === null && qcStageCodes.has(task.status_code)) {
+      throw new AppError("QC_REQUIRED", "Task đang ở bước QC — chỉ có thể đổi sang QC khác.", 409);
     }
     const ctx = await lineContext(tx, organizationId, [assigneeId, ...(qcId ? [qcId] : [])]);
     const errors = taskLineErrors({ assigneeId, qcId, processId: task.process_id, shiftId: task.shift_id, qtyAssigned: task.qty_assigned }, ctx).filter(
@@ -793,6 +934,13 @@ export const assignProductionTask = async (context: AccessContext, taskId: strin
       UPDATE production.tasks SET assignee_id = ${assigneeId}, qc_id = ${qcId}, updated_at = now()
       WHERE organization_id = ${organizationId} AND id = ${taskId}
     `;
+    // PD-044: subtasks keep their line's worker and QC.
+    if ((task.subtasks ?? []).length > 0) {
+      await tx`
+        UPDATE production.tasks SET assignee_id = ${assigneeId}, qc_id = ${qcId}, updated_at = now()
+        WHERE organization_id = ${organizationId} AND parent_task_id = ${taskId} AND kind = 'NORMAL' AND deleted_at IS NULL
+      `;
+    }
     await insertTaskLogs(tx, organizationId, [
       {
         taskId,
@@ -808,7 +956,7 @@ export const assignProductionTask = async (context: AccessContext, taskId: strin
     if (assigneeId !== task.assignee_id) {
       events.push(taskAssignedEvent(organizationId, taskId, context.user.id));
     }
-    if (qcId && qcId !== task.qc_id && task.status_code === "WAITING_QC") {
+    if (qcId && qcId !== task.qc_id && qcStageCodes.has(task.status_code)) {
       events.push(
         taskStatusEvent(organizationId, taskId, context.user.id, {
           toCode: task.status_code,
@@ -833,15 +981,167 @@ export const assignProductionTask = async (context: AccessContext, taskId: strin
   return await getProductionTask(context, taskId);
 };
 
-export const updateProductionTask = async (context: AccessContext, taskId: string, input: In<typeof UpdateProductionTaskRequestSchema>) => {
+type UpdateTaskInput = In<typeof UpdateProductionTaskRequestSchema>;
+
+/** Changed fields of an edit as the from / to of its FIELD history row (only what changed). */
+const fieldChanges = () => {
+  const from: Record<string, unknown> = {};
+  const to: Record<string, unknown> = {};
+  const track = (key: string, before: unknown, after: unknown) => {
+    if (JSON.stringify(before) !== JSON.stringify(after)) {
+      from[key] = before;
+      to[key] = after;
+    }
+  };
+  return { from, to, track, changed: () => Object.keys(to).length > 0 };
+};
+
+/**
+ * PATCH on a subtask (PD-044): its worker, the job's Leader or "update: all". Before Done: its process (active, not
+ * Checking, not the line's) and its quantity — the difference comes from / goes back to its line, which keeps at least 1
+ * (the total the Leader gave stays the same). Any time: note, Hình lỗi, tags and custom fields. Shift, dates, OT hours and
+ * link follow the line (400 SUBTASK_FIELD_LOCKED when changed here). A process / quantity change is a SUBTASK row
+ * ("updated", fromValue = before) on the line's history; the rest the subtask's own FIELD / NOTE rows.
+ */
+const updateSubtask = async (tx: QuerySql, context: AccessContext, locked: Awaited<ReturnType<typeof lockedTask>>, input: UpdateTaskInput) => {
+  const { task, relation, scopes, mine } = locked;
+  const organizationId = context.organization.id;
+  const parent = (
+    await tx<{ id: string; number: string; process_id: string; qty_assigned: number; done_at: Date | null }[]>`
+      SELECT id, number, process_id, qty_assigned, done_at FROM production.tasks
+      WHERE organization_id = ${organizationId} AND id = ${task.parent_task_id} FOR UPDATE
+    `
+  )[0];
+  if (!parent) {
+    throw notFound();
+  }
+  const lineNumber = Number(parent.number);
+  const otHoursNow = task.ot_hours === null ? null : Number(task.ot_hours);
+  const lockedChange =
+    (input.shiftId !== undefined && input.shiftId !== task.shift_id) ||
+    (input.assignedAt !== undefined && new Date(input.assignedAt).getTime() !== task.assigned_at.getTime()) ||
+    (input.deadline !== undefined && new Date(input.deadline).getTime() !== task.deadline.getTime()) ||
+    (input.otHours !== undefined && input.otHours !== otHoursNow) ||
+    (input.workLink !== undefined && (input.workLink?.trim() || null) !== task.work_link);
+  if (lockedChange) {
+    throw new AppError("SUBTASK_FIELD_LOCKED", `Subtask theo ca, ngày nhận / giao, giờ OT và link của task — sửa trên task #${lineNumber}.`, 400);
+  }
+  if (!subtaskManageAllowed({ leads: relation.isJobLeader, updateScope: scopes.update, mine })) {
+    throw forbidden("Chỉ người làm, Leader của job hoặc người có quyền sửa mọi công việc mới sửa được subtask.");
+  }
+  const processId = input.processId ?? task.process_id;
+  const qtyAssigned = input.qtyAssigned ?? task.qty_assigned;
+  const structural = processId !== task.process_id || qtyAssigned !== task.qty_assigned;
+  if (structural && (task.done_at !== null || parent.done_at !== null)) {
+    throw new AppError("TASK_ALREADY_DONE", "Task đã Done — không đổi được quy trình và số lượng của subtask.", 409);
+  }
+  let processName = task.process_name;
+  if (processId !== task.process_id) {
+    const process = (
+      await tx<{ active: boolean; is_qc: boolean; name: string }[]>`
+        SELECT active, is_qc, name FROM production.processes WHERE organization_id = ${organizationId} AND id = ${processId}
+      `
+    )[0];
+    const problem = subtaskProcessProblem(process ? { active: process.active, isQc: process.is_qc } : undefined, processId, parent.process_id);
+    if (problem) {
+      throw new AppError("PROCESS_INVALID", problem, 400);
+    }
+    processName = process!.name;
+  }
+  const qtyProblem = qtyAssigned === task.qty_assigned ? null : subtaskQtyProblem(parent.qty_assigned + task.qty_assigned, qtyAssigned);
+  if (qtyProblem) {
+    throw new AppError("SUBTASK_QTY_INVALID", qtyProblem, 400);
+  }
+  const parentQty = parent.qty_assigned - (qtyAssigned - task.qty_assigned);
+  const errorQty = input.errorQty === undefined ? task.error_qty : input.errorQty;
+  const customValues =
+    input.customValues !== undefined
+      ? await resolveCustomValues(tx, organizationId, "TASK", input.customValues, { existing: task.custom_values as never, enforceRequired: true })
+      : task.custom_values;
+  const note = input.note === undefined ? task.note : input.note?.trim() || null;
+  await tx`
+    UPDATE production.tasks
+    SET process_id = ${processId}, qty_assigned = ${qtyAssigned}, error_qty = ${errorQty}, note = ${note},
+        custom_values = ${tx.json(customValues as never)}, updated_at = now()
+    WHERE organization_id = ${organizationId} AND id = ${task.id}
+  `;
+  if (parentQty !== parent.qty_assigned) {
+    await tx`UPDATE production.tasks SET qty_assigned = ${parentQty}, updated_at = now() WHERE organization_id = ${organizationId} AND id = ${parent.id}`;
+    await syncJobTotalImages(tx, organizationId, task.job_id);
+  }
+  if (input.tagIds) {
+    await setEntityTags(tx, organizationId, "TASK", task.id, input.tagIds);
+  }
+  const changes = fieldChanges();
+  if (input.tagIds) {
+    changes.track("tagIds", [...new Set(task.tag_ids ?? [])].sort(), [...new Set(input.tagIds)].sort());
+  }
+  changes.track("processId", task.process_id, processId);
+  changes.track("qtyAssigned", task.qty_assigned, qtyAssigned);
+  changes.track("errorQty", task.error_qty, errorQty);
+  changes.track("customValues", task.custom_values, customValues);
+  const logs: LogInput[] = [];
+  const subtaskValue = (values: { processId: string; processName: string; qtyAssigned: number; parentQtyAssigned: number }) => ({
+    subtaskId: task.id,
+    subtaskNumber: Number(task.number),
+    subtaskCode: taskRowCode(task),
+    ...values
+  });
+  if (structural) {
+    logs.push({
+      taskId: parent.id,
+      jobId: task.job_id,
+      userId: context.user.id,
+      action: "SUBTASK",
+      from: subtaskValue({ processId: task.process_id, processName: task.process_name, qtyAssigned: task.qty_assigned, parentQtyAssigned: parent.qty_assigned }),
+      to: { op: "updated", ...subtaskValue({ processId, processName, qtyAssigned, parentQtyAssigned: parentQty }) }
+    });
+  }
+  if (changes.changed()) {
+    logs.push({ taskId: task.id, jobId: task.job_id, userId: context.user.id, action: "FIELD", from: changes.from, to: changes.to });
+  }
+  if (note !== task.note) {
+    logs.push({ taskId: task.id, jobId: task.job_id, userId: context.user.id, action: "NOTE", from: { note: task.note }, to: { note } });
+  }
+  await insertTaskLogs(tx, organizationId, logs);
+  return { jobId: task.job_id, taskIds: [task.id, parent.id] };
+};
+
+/**
+ * PATCH /production/tasks/:taskId. A line: its fields follow the line's "update" scope (PD-036). "Số lượng giao"
+ * (`qtyAssigned`, the line's OWN quantity — `allocatedQty` adds its subtasks') is the Leader's number (PD-044): the job's
+ * Leader, "update: all", or the worker on a line they entered themselves; any other worker gets 403
+ * QTY_REQUEST_REQUIRED (send a request instead). Shift, dates and link changes are mirrored to the line's subtasks. A
+ * subtask: see updateSubtask.
+ */
+export const updateProductionTask = async (context: AccessContext, taskId: string, input: UpdateTaskInput) => {
   assertProductionMember(context);
   const organizationId = context.organization.id;
   const sql = getSql();
-  const jobId = await sql.begin(async (tx) => {
-    const { task, scopes, mine } = await lockedTask(tx, context, taskId);
-    if (!lineAllowed(scopes.update, mine)) {
+  const changed = await sql.begin(async (tx) => {
+    const locked = await lockedTask(tx, context, taskId);
+    if (isSubtaskRow(locked.task)) {
+      return await updateSubtask(tx, context, locked, input);
+    }
+    const { task, relation, scopes, mine } = locked;
+    const qtyChange = input.qtyAssigned !== undefined && input.qtyAssigned !== task.qty_assigned;
+    if (
+      qtyChange &&
+      !qtyAssignedEditAllowed({
+        leads: relation.isJobLeader,
+        updateScope: scopes.update,
+        mine,
+        createdByMe: task.created_by === context.user.id,
+        subtask: false
+      })
+    ) {
+      throw mine ? new AppError("QTY_REQUEST_REQUIRED", "Gửi đề nghị sửa số tấm để Leader duyệt.", 403) : forbidden("Bạn không có quyền sửa số lượng giao.");
+    }
+    const otherFields = Object.entries(input).some(([key, value]) => key !== "qtyAssigned" && value !== undefined);
+    if ((otherFields || !qtyChange) && !lineAllowed(scopes.update, mine)) {
       throw forbidden("Bạn không có quyền sửa công việc này.");
     }
+    const subtasks = task.subtasks ?? [];
     const structural =
       (input.qtyAssigned !== undefined && input.qtyAssigned !== task.qty_assigned) ||
       (input.processId !== undefined && input.processId !== task.process_id) ||
@@ -860,6 +1160,14 @@ export const updateProductionTask = async (context: AccessContext, taskId: strin
         { assigneeId: task.assignee_id, qcId: task.qc_id, processId: input.processId, shiftId: task.shift_id, qtyAssigned: task.qty_assigned },
         ctx
       ).filter((message) => !message.startsWith("Ca làm"));
+      // PD-044: a line with subtasks stays a work line, apart from its subtasks' processes.
+      if (subtasks.length > 0 && ctx.processes.get(input.processId)?.isQc) {
+        errors.push("Task có subtask không chuyển sang Checking được.");
+      }
+      const twin = subtasks.find((subtask) => subtask.process_id === input.processId);
+      if (twin) {
+        errors.push(`Quy trình trùng với subtask #${subtaskJsonCode(twin, task.number)} của task.`);
+      }
       if (errors.length > 0) {
         throw new AppError("PROCESS_INVALID", errors.join(" "), 400);
       }
@@ -900,38 +1208,48 @@ export const updateProductionTask = async (context: AccessContext, taskId: strin
     if (input.tagIds) {
       await setEntityTags(tx, organizationId, "TASK", taskId, input.tagIds);
     }
-    const from: Record<string, unknown> = {};
-    const to: Record<string, unknown> = {};
-    const track = (key: string, before: unknown, after: unknown) => {
-      if (JSON.stringify(before) !== JSON.stringify(after)) {
-        from[key] = before;
-        to[key] = after;
-      }
-    };
+    const shiftId = input.shiftId ?? task.shift_id;
+    // PD-044: subtasks keep their line's shift, dates and link (and its lateness rule).
+    const mirrored =
+      shiftId !== task.shift_id ||
+      assignedAt.getTime() !== task.assigned_at.getTime() ||
+      deadline.getTime() !== task.deadline.getTime() ||
+      workLink !== task.work_link;
+    if (subtasks.length > 0 && mirrored) {
+      await tx`
+        UPDATE production.tasks
+        SET shift_id = ${shiftId}, assigned_at = ${assignedAt}::timestamptz, deadline = ${deadline}::timestamptz, work_link = ${workLink},
+            is_late = CASE WHEN done_at IS NOT NULL THEN done_at > ${deadline}::timestamptz WHEN closed_at IS NOT NULL THEN false
+              ELSE now() > ${deadline}::timestamptz END,
+            updated_at = now()
+        WHERE organization_id = ${organizationId} AND parent_task_id = ${taskId} AND kind = 'NORMAL' AND deleted_at IS NULL
+      `;
+    }
+    const changes = fieldChanges();
     // Tag changes are part of the task history too (FIELD tagIds, sorted).
     if (input.tagIds) {
-      track("tagIds", [...new Set(task.tag_ids ?? [])].sort(), [...new Set(input.tagIds)].sort());
+      changes.track("tagIds", [...new Set(task.tag_ids ?? [])].sort(), [...new Set(input.tagIds)].sort());
     }
-    track("qtyAssigned", task.qty_assigned, input.qtyAssigned ?? task.qty_assigned);
-    track("processId", task.process_id, input.processId ?? task.process_id);
-    track("shiftId", task.shift_id, input.shiftId ?? task.shift_id);
-    track("assignedAt", task.assigned_at.toISOString(), assignedAt.toISOString());
-    track("deadline", task.deadline.toISOString(), deadline.toISOString());
-    track("errorQty", task.error_qty, errorQty);
-    track("otHours", task.ot_hours === null ? null : Number(task.ot_hours), otHours);
-    track("workLink", task.work_link, workLink);
-    track("customValues", task.custom_values, customValues);
+    changes.track("qtyAssigned", task.qty_assigned, input.qtyAssigned ?? task.qty_assigned);
+    changes.track("processId", task.process_id, input.processId ?? task.process_id);
+    changes.track("shiftId", task.shift_id, shiftId);
+    changes.track("assignedAt", task.assigned_at.toISOString(), assignedAt.toISOString());
+    changes.track("deadline", task.deadline.toISOString(), deadline.toISOString());
+    changes.track("errorQty", task.error_qty, errorQty);
+    changes.track("otHours", task.ot_hours === null ? null : Number(task.ot_hours), otHours);
+    changes.track("workLink", task.work_link, workLink);
+    changes.track("customValues", task.custom_values, customValues);
     const logs: LogInput[] = [];
-    if (Object.keys(to).length > 0) {
-      logs.push({ taskId, jobId: task.job_id, userId: context.user.id, action: "FIELD", from, to });
+    if (changes.changed()) {
+      logs.push({ taskId, jobId: task.job_id, userId: context.user.id, action: "FIELD", from: changes.from, to: changes.to });
     }
     if (note !== task.note) {
       logs.push({ taskId, jobId: task.job_id, userId: context.user.id, action: "NOTE", from: { note: task.note }, to: { note } });
     }
     await insertTaskLogs(tx, organizationId, logs);
-    return task.job_id;
+    return { jobId: task.job_id, taskIds: [taskId, ...(mirrored ? subtasks.map((subtask) => subtask.id) : [])] };
   });
-  publishProductionChange(organizationId, jobId, [taskId], "tasks", context.user.id);
+  publishProductionChange(organizationId, changed.jobId, changed.taskIds, "tasks", context.user.id);
   return await getProductionTask(context, taskId);
 };
 
@@ -950,12 +1268,20 @@ export const softDeleteTasks = async (tx: QuerySql, organizationId: string, acto
   const at = new Date();
   const reversed = new Map<string, number>();
   for (const task of tasks) {
-    reversed.set(task.id, await onTaskDeleted(tx, { organizationId, taskId: task.id, taskNumber: Number(task.number), at }));
+    reversed.set(task.id, await onTaskDeleted(tx, { organizationId, taskId: task.id, taskNumber: Number(task.number), taskCode: taskRowCode(task), at }));
   }
   await tx`
     UPDATE production.tasks SET deleted_at = ${at}, deleted_by = ${actorId}, updated_at = now()
     WHERE organization_id = ${organizationId} AND id = ANY(${tasks.map((task) => task.id)}::uuid[]) AND deleted_at IS NULL
   `;
+  // An open quantity request of a deleted line has nothing left to decide (PD-044).
+  const pending = tasks.filter((task) => task.pending_qty_request).map((task) => task.id);
+  if (pending.length > 0) {
+    await tx`
+      UPDATE production.task_qty_requests SET status = 'CANCELLED', decided_at = ${at}, decided_by = ${actorId}, decision_note = 'Task đã bị xoá.'
+      WHERE organization_id = ${organizationId} AND task_id = ANY(${pending}::uuid[]) AND status = 'PENDING'
+    `;
+  }
   await insertTaskLogs(
     tx,
     organizationId,
@@ -972,22 +1298,81 @@ export const softDeleteTasks = async (tx: QuerySql, organizationId: string, acto
   return [...reversed.values()].reduce((sum, count) => sum + count, 0);
 };
 
-/** DELETE /production/tasks/:taskId — "delete: all", or "own" for my own line (PD-036). */
+/**
+ * Deletes a locked subtask (PD-044): before its line's Done its worker, the job's Leader or the "delete" scope; after
+ * Done only "delete: all" (its points are reversed like any line's). Its quantity always goes back to the line; a SUBTASK
+ * row ("deleted") goes on the line's history.
+ */
+const deleteSubtask = async (tx: QuerySql, context: AccessContext, locked: Awaited<ReturnType<typeof lockedTask>>) => {
+  const { task, relation, scopes, mine } = locked;
+  const organizationId = context.organization.id;
+  const parent = (
+    await tx<{ id: string; qty_assigned: number; done_at: Date | null }[]>`
+      SELECT id, qty_assigned, done_at FROM production.tasks WHERE organization_id = ${organizationId} AND id = ${task.parent_task_id} FOR UPDATE
+    `
+  )[0];
+  if (!parent) {
+    throw notFound();
+  }
+  const done = parent.done_at !== null || task.done_at !== null;
+  const allowed = subtaskDeleteAllowed({ leads: relation.isJobLeader, deleteScope: scopes.delete, mine, done });
+  if (!allowed) {
+    throw forbidden(done ? "Task đã Done — chỉ người có quyền xoá mọi công việc mới xoá được subtask." : "Bạn không có quyền xoá subtask này.");
+  }
+  const reversedEntries = await softDeleteTasks(tx, organizationId, context.user.id, [task], { withJob: false });
+  const parentQty = parent.qty_assigned + task.qty_assigned;
+  await tx`UPDATE production.tasks SET qty_assigned = ${parentQty}, updated_at = now() WHERE organization_id = ${organizationId} AND id = ${parent.id}`;
+  await insertTaskLogs(tx, organizationId, [
+    {
+      taskId: parent.id,
+      jobId: task.job_id,
+      userId: context.user.id,
+      action: "SUBTASK",
+      from: { qtyAssigned: task.qty_assigned, parentQtyAssigned: parent.qty_assigned },
+      to: {
+        op: "deleted",
+        subtaskId: task.id,
+        subtaskNumber: Number(task.number),
+        subtaskCode: taskRowCode(task),
+        processId: task.process_id,
+        processName: task.process_name,
+        qtyAssigned: task.qty_assigned,
+        parentQtyAssigned: parentQty,
+        reversedEntries
+      }
+    }
+  ]);
+  return { reversedEntries, taskIds: [task.id, parent.id] };
+};
+
+/**
+ * DELETE /production/tasks/:taskId — "delete: all", or "own" for my own line (PD-036). Deleting a line deletes its
+ * subtasks with it (PD-044); a subtask: see deleteSubtask.
+ */
 export const deleteProductionTask = async (context: AccessContext, taskId: string): Promise<DeleteTaskResult> => {
   assertProductionMember(context);
   const organizationId = context.organization.id;
   const sql = getSql();
   const result = await sql.begin(async (tx) => {
-    const { task, workflow, scopes, mine } = await lockedTask(tx, context, taskId);
-    if (!lineAllowed(scopes.delete, mine)) {
-      throw forbidden(scopes.delete === "own" ? "Bạn chỉ xoá được công việc của chính mình." : "Bạn không có quyền xoá công việc.");
+    const locked = await lockedTask(tx, context, taskId);
+    const { task, workflow, scopes, mine } = locked;
+    let reversedEntries: number;
+    let taskIds = [taskId];
+    if (isSubtaskRow(task)) {
+      ({ reversedEntries, taskIds } = await deleteSubtask(tx, context, locked));
+    } else {
+      if (!lineAllowed(scopes.delete, mine)) {
+        throw forbidden(scopes.delete === "own" ? "Bạn chỉ xoá được công việc của chính mình." : "Bạn không có quyền xoá công việc.");
+      }
+      const subtasks = await lockSubtasksOf(tx, organizationId, [task]);
+      reversedEntries = await softDeleteTasks(tx, organizationId, context.user.id, [task, ...subtasks], { withJob: false });
+      taskIds = [taskId, ...subtasks.map((subtask) => subtask.id)];
     }
-    const reversedEntries = await softDeleteTasks(tx, organizationId, context.user.id, [task], { withJob: false });
     await settleJob(tx, organizationId, workflow, task.job_id);
-    return { taskId, jobId: task.job_id, reversedEntries, people: [task.assignee_id, task.qc_id] };
+    return { taskId, jobId: task.job_id, reversedEntries, taskIds, people: [task.assignee_id, task.qc_id] };
   });
   // The line's people lose it from their lists (and possibly the job from theirs); the job chat follows.
-  publishProductionChange(organizationId, result.jobId, [taskId], "tasks", context.user.id, result.people);
+  publishProductionChange(organizationId, result.jobId, result.taskIds, "tasks", context.user.id, result.people);
   await syncJobChat(context, result.jobId);
   return { taskId: result.taskId, jobId: result.jobId, reversedEntries: result.reversedEntries };
 };
@@ -998,7 +1383,8 @@ export const deleteProductionTask = async (context: AccessContext, taskId: strin
  * Worker cron (every 15 min, PLAN §9: late = not Done by the deadline). Open tasks of active jobs past their
  * deadline are flagged late; the ones not yet notified for their current deadline are returned (and marked
  * notified) — so a task created or edited when already late is notified too, once per deadline (BUG-PR-03).
- * Tasks closed without Done (BUG-PR-08) and tasks of archived jobs (BUG-PR-04) are not open work.
+ * Tasks closed without Done (BUG-PR-08) and tasks of archived jobs (BUG-PR-04) are not open work. Subtasks are not
+ * scanned (PD-044): their line is, and its people are told once.
  */
 export const markLateTasks = async (sql: QuerySql = getSql()) => {
   const rows = await sql<{ organization_id: string; job_id: string; id: string; notify: boolean; flagged: boolean }[]>`
@@ -1006,7 +1392,7 @@ export const markLateTasks = async (sql: QuerySql = getSql()) => {
       SELECT t.id, NOT t.is_late AS flagged, t.late_notified_deadline IS DISTINCT FROM t.deadline AS notify
       FROM production.tasks t
       JOIN production.jobs j ON j.organization_id = t.organization_id AND j.id = t.job_id AND j.archived_at IS NULL
-      WHERE t.done_at IS NULL AND t.closed_at IS NULL AND t.deleted_at IS NULL AND t.deadline < now()
+      WHERE t.done_at IS NULL AND t.closed_at IS NULL AND t.deleted_at IS NULL AND t.deadline < now() AND ${notSubtaskSql(sql)}
         AND (NOT t.is_late OR t.late_notified_deadline IS DISTINCT FROM t.deadline)
       ORDER BY t.deadline
       LIMIT 5000
@@ -1040,7 +1426,7 @@ export const markDueSoonTasks = (sql: QuerySql = getSql()) => sql<{ organization
     FROM production.tasks t
     JOIN production.jobs j ON j.organization_id = t.organization_id AND j.id = t.job_id AND j.archived_at IS NULL
     LEFT JOIN production.settings s ON s.organization_id = t.organization_id AND s.key = 'due_soon_hours'
-    WHERE t.done_at IS NULL AND t.closed_at IS NULL AND t.deleted_at IS NULL AND t.deadline > now()
+    WHERE t.done_at IS NULL AND t.closed_at IS NULL AND t.deleted_at IS NULL AND t.deadline > now() AND ${notSubtaskSql(sql)}
       AND t.deadline <= now() + make_interval(hours => coalesce((s.value #>> '{}')::int, 2))
       AND t.due_soon_notified_deadline IS DISTINCT FROM t.deadline
     ORDER BY t.deadline

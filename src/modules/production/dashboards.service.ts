@@ -13,7 +13,7 @@ import { toIso } from "../../lib/db-types.js";
 import type { AccessContext } from "../access/access-context.js";
 import { assertProductionAdmin, assertProductionRole, isProductionAdmin } from "./access.js";
 import { closeDaysOf, loadSettings } from "./catalog.service.js";
-import { loadWorkflowModel } from "./jobs.repo.js";
+import { loadWorkflowModel, notSubtaskSql } from "./jobs.repo.js";
 import { getKpiReport } from "./kpi-settlement.service.js";
 import { executeReport } from "./reports.js";
 import { listPinnedReports } from "./saved-reports.service.js";
@@ -80,6 +80,7 @@ export const getLeaderDashboard = async (context: AccessContext, query: { leader
 
   // The jobs they lead and the jobs without a leader (every Leader leads those, PD-035).
   const scope = leaderId ? sql`AND (j.leader_id = ${leaderId} OR j.leader_id IS NULL)` : sql``;
+  // Lines only: a subtask follows its line and is shown inside it (PD-044); its images still count as workload.
   const openTasks = (window: ReturnType<typeof sql>) => sql<OpenTaskRow[]>`
     SELECT t.id, t.number::text AS number, t.job_id, j.code AS job_code,
       json_build_object('id', ua.id, 'display_name', ua.display_name, 'email', ua.email, 'avatar_url', ua.avatar_url) AS assignee,
@@ -92,6 +93,7 @@ export const getLeaderDashboard = async (context: AccessContext, query: { leader
     JOIN public.app_users ua ON ua.id = t.assignee_id
     LEFT JOIN public.app_users uq ON uq.id = t.qc_id
     WHERE t.organization_id = ${organizationId} AND t.deleted_at IS NULL AND t.done_at IS NULL AND t.closed_at IS NULL ${window}
+      AND ${notSubtaskSql(sql)}
       AND j.archived_at IS NULL ${scope}
     ORDER BY t.deadline, t.number
     LIMIT ${taskListLimit}
@@ -99,7 +101,8 @@ export const getLeaderDashboard = async (context: AccessContext, query: { leader
   // Workload statuses resolved to ids so the open-task partial index applies (PERF-10).
   const workflow = await loadWorkflowModel(sql, organizationId);
   const notStarted = workflow.statuses.filter((status) => status.code === "ASSIGNED").map((status) => status.id);
-  const processing = workflow.statuses.filter((status) => status.code === "PROCESSING").map((status) => status.id);
+  // "Đang làm" workload includes lines QC sent back ("Cần sửa lại", PD-044): they are the worker's to redo.
+  const processing = workflow.statuses.filter((status) => status.code === "PROCESSING" || status.code === "REWORK").map((status) => status.id);
   const [late, dueSoon, counts, workload] = await Promise.all([
     openTasks(sql`AND t.deadline < ${now}`),
     openTasks(sql`AND t.deadline >= ${now} AND t.deadline < ${dueSoonUntil}`),
@@ -108,6 +111,7 @@ export const getLeaderDashboard = async (context: AccessContext, query: { leader
       FROM production.tasks t
       JOIN production.jobs j ON j.organization_id = t.organization_id AND j.id = t.job_id
       WHERE t.organization_id = ${organizationId} AND t.deleted_at IS NULL AND t.done_at IS NULL AND t.closed_at IS NULL AND t.deadline < ${dueSoonUntil}
+        AND ${notSubtaskSql(sql)}
         AND j.archived_at IS NULL ${scope}
     `,
     sql<
@@ -132,7 +136,7 @@ export const getLeaderDashboard = async (context: AccessContext, query: { leader
         SELECT t.assignee_id,
           coalesce(sum(t.qty_assigned) FILTER (WHERE t.status_id = ANY(${notStarted}::uuid[])), 0)::int AS qty_not_started,
           coalesce(sum(t.qty_assigned) FILTER (WHERE t.status_id = ANY(${processing}::uuid[])), 0)::int AS qty_processing,
-          count(*)::int AS open_tasks
+          count(*) FILTER (WHERE ${notSubtaskSql(sql)})::int AS open_tasks
         FROM production.tasks t
         JOIN production.jobs j ON j.organization_id = t.organization_id AND j.id = t.job_id AND j.archived_at IS NULL
         WHERE t.organization_id = ${organizationId} AND t.deleted_at IS NULL AND t.status_id = ANY(${[...notStarted, ...processing]}::uuid[])

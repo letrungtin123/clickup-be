@@ -117,6 +117,7 @@ const jobRow = (overrides: Partial<JobRow> = {}): JobRow => ({
   job_status_name: "Mới nhận",
   job_status_color: "slate",
   job_status_closed: false,
+  job_status_requires_all_checked: false,
   status_id: null,
   status_code: null,
   status_name: null,
@@ -126,12 +127,17 @@ const jobRow = (overrides: Partial<JobRow> = {}): JobRow => ({
   qty_checked: 0,
   task_count: 3,
   late_task_count: 0,
+  unchecked_task_count: 0,
   open_feedback_count: 0,
   workers: [
     { user: userJson(other, "Worker B"), qty: 25, task_count: 2 },
     { user: userJson(me, "Worker A"), qty: 15, task_count: 1 }
   ],
   qc_people: [userJson(third, "Checker C")],
+  process_totals: [
+    { id: "00000000-0000-4000-8000-000000000901", name: "Retouch mẫu", qty: 7 },
+    { id: "00000000-0000-4000-8000-000000000902", name: "Cắt nền mẫu", qty: 3 }
+  ],
   person_share: null,
   custom_values: {},
   tag_ids: null,
@@ -188,7 +194,13 @@ const taskRow = (number: number, assignee: string, qty: number, qc: string | nul
   closed_at: null,
   deadline_cursor: "2099-01-01T00:00:00.000000Z",
   job_archived: false,
-  job_open_feedback: false
+  job_open_feedback: false,
+  split_reason: null,
+  created_by: null,
+  sub_seq: null,
+  parent_number: null,
+  subtasks: null,
+  pending_qty_request: null
 });
 
 const failure = async (promise: Promise<unknown>) => {
@@ -230,14 +242,28 @@ describe("job people summary (Người làm)", () => {
     expect(listQuery().text).toContain("ORDER BY w.qty DESC");
   });
 
+  it("carries Tổng tấm per process (PD-048): work tasks incl. subtasks, Checking left out, largest first", async () => {
+    db.state.handler = (call) => (call.text.startsWith("WITH page AS MATERIALIZED") ? [jobRow()] : undefined);
+    const page = JobPageSchema.parse(await listJobs(contextWith(["LEADER"]), JobQuerySchema.parse({})));
+    expect(page.items[0]!.processTotals.map((item) => [item.process.name, item.qty])).toEqual([
+      ["Retouch mẫu", 7],
+      ["Cắt nền mẫu", 3]
+    ]);
+    expect(listQuery().text).toContain("AS process_totals");
+    expect(listQuery().text).toContain("t.kind = 'NORMAL' AND NOT pr.is_qc");
+  });
+
   it("view scope (PD-036): own lists only jobs with a live line of mine, none is refused; workers are never hidden", async () => {
-    // Default matrix: STAFF / QC view "own".
-    await listJobs(contextWith(["STAFF"]), JobQuerySchema.parse({}));
+    // Default matrix: QC views "own".
+    await listJobs(contextWith(["QC"]), JobQuerySchema.parse({}));
     expect(listQuery().text).toContain("AND t.deleted_at IS NULL AND (t.assignee_id = $ OR t.qc_id = $)");
     expect(listQuery().text).toContain("people ON true");
-    // Leader / Account view "all": no ownership filter.
+    // Leader / Account view "all": no ownership filter; STAFF too since PD-047.
     db.state.calls = [];
     await listJobs(contextWith(["LEADER"]), JobQuerySchema.parse({}));
+    expect(listQuery().text).not.toContain("t.qc_id = $)");
+    db.state.calls = [];
+    await listJobs(contextWith(["STAFF"]), JobQuerySchema.parse({}));
     expect(listQuery().text).not.toContain("t.qc_id = $)");
     // A matrix where STAFF may not view jobs.
     clearProductionConfigCache();
@@ -263,13 +289,15 @@ describe("job people summary (Người làm)", () => {
     expect(detail.people).toEqual(toJobPeople(jobRow()));
   });
 
-  it("job detail: someone outside the job gets 404, people included", async () => {
+  it("job detail: someone outside the job gets 404 with an own view (QC by default), people included", async () => {
     db.state.handler = (call) => {
       if (call.text.includes("people ON true")) return [jobRow()];
       if (call.text.includes("AS job_leader_id") && call.text.includes("t.job_id = $")) return [taskRow(1, other, 10, third)];
       return undefined;
     };
-    expect(await failure(getJobDetail(contextWith(["STAFF"]), jobId, db.sql as never))).toEqual({ code: "JOB_NOT_FOUND", status: 404 });
+    expect(await failure(getJobDetail(contextWith(["QC"]), jobId, db.sql as never))).toEqual({ code: "JOB_NOT_FOUND", status: 404 });
+    // PD-047: STAFF views every job by default.
+    expect((await getJobDetail(contextWith(["STAFF"]), jobId, db.sql as never)).tasks.map((task) => task.assignee.id)).toEqual([other]);
   });
 
   it("e-mails of colleagues in the summary are hidden from STAFF / QC callers (SEC2-09)", () => {

@@ -14,10 +14,12 @@ import { insertTasks, loadJobForTasks, settleJob } from "./tasks.service.js";
  * "Nhập công việc" (PD-035 / PD-038): one row of the company's work-log Excel typed by a staff member, added to an
  * EXISTING job: the row names the project and the job (picked from GET /production/jobs/options). The quick entry never
  * creates a job — jobs are created with "Tạo job" only (PD-038). The line is an ordinary task in the initial status; the
- * normal workflow applies afterwards.
+ * normal workflow applies afterwards. PD-047: a work line (not Checking) must name a QC (400 TASK_LINES_INVALID
+ * "Task 1: Chọn QC cho task.", insertTasks).
  *
  * Permissions (PD-036 "create"): "all" enters a row for anyone, "own" only for oneself — also into a job the caller could
- * not see before (the line is theirs). Archived jobs refuse new lines (409), deleted ones are not found.
+ * not see before (the line is theirs); "none" (STAFF by default since PD-047) refuses (403). Archived jobs refuse new
+ * lines (409), deleted ones are not found.
  */
 
 /** The job of the entry: a live job of the chosen project (404 when missing / deleted, 400 when of another project). */

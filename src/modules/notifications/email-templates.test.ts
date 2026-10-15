@@ -132,7 +132,9 @@ describe("templates", () => {
       "Linh đã giao cho bạn WEB-12: Thiết kế banner"
     );
     const qc = renderNotificationSection(make({ type: "production.qc_failed", title: "JOB-2026-001", payload: productionPayload }), base);
-    expect(qc.headline).toBe("Task JOB-2026-001 #3 không đạt QC");
+    // PD-044: QC sends the line to "Cần sửa lại".
+    expect(qc.headline).toBe("Task JOB-2026-001 #3 cần sửa lại");
+    expect(qc.subject).toBe("QC yêu cầu sửa lại task JOB-2026-001 #3");
     expect(qc.excerpt).toBe("Da chưa mịn");
     expect(qc.facts).toContainEqual({ label: "Số lượng", value: "20 tấm" });
     expect(qc.facts).toContainEqual({ label: "Ngày giao", value: "17:00, 10/10/2026" });
@@ -154,6 +156,65 @@ describe("templates", () => {
     );
     expect(decided).toMatchObject({ headline: "Đơn nghỉ phép của bạn bị từ chối", excerpt: "Trùng lịch giao hàng" });
     expect(decided.facts).toContainEqual({ label: "Buổi", value: "Cả ngày" });
+  });
+
+  it("renders the PD-044 quantity request and its decision", () => {
+    const request = { ...productionPayload, requestId: ids.task, fromQty: 20, toQty: 25, reason: "Thư mục có thêm 5 ảnh", approved: null, decisionNote: null };
+    const asked = renderNotificationSection(make({ type: "production.qty_change_requested", actorName: "Người A", payload: request }), base);
+    expect(asked).toMatchObject({
+      headline: "Người A đề nghị sửa số lượng giao task JOB-2026-001 #3: 20 → 25 tấm",
+      excerpt: "Thư mục có thêm 5 ảnh",
+      link: `${base}/production/tasks/${ids.productionTask}`
+    });
+    const approved = renderNotificationSection(
+      make({ type: "production.qty_change_decided", actorName: "Leader A", payload: { ...request, approved: true, decisionNote: "Ok" } }),
+      base
+    );
+    expect(approved).toMatchObject({ headline: "Leader A đã duyệt sửa số lượng giao task JOB-2026-001 #3: 20 → 25 tấm", excerpt: "Ok" });
+    const rejected = renderNotificationSection(
+      make({ type: "production.qty_change_decided", actorName: "Leader A", payload: { ...request, approved: false, decisionNote: "Đã đủ ảnh" } }),
+      base
+    );
+    expect(rejected).toMatchObject({ headline: "Leader A đã từ chối sửa số lượng giao task JOB-2026-001 #3: 20 → 25 tấm", excerpt: "Đã đủ ảnh" });
+  });
+
+  it("PD-045: a subtask is named by its code (#1216a) in the headline, the subject and the facts", () => {
+    const section = renderNotificationSection(
+      make({ type: "production.task_waiting_qc", title: "JOB-2026-001", payload: { ...productionPayload, taskNumber: 1300, taskCode: "1216a" } }),
+      base
+    );
+    expect(section.headline).toBe("Task JOB-2026-001 #1216a đang chờ bạn QC");
+    expect(section.subject).toBe("Task JOB-2026-001 #1216a đang chờ bạn QC");
+    expect(section.facts).toContainEqual({ label: "Task", value: "#1216a" });
+  });
+
+  it("PD-045: the job status change names who, the job and from → to; it opens the job", () => {
+    const section = renderNotificationSection(
+      make({
+        type: "production.job_status_changed",
+        title: "JOB-2026-001",
+        body: "Đang làm → Đã xong",
+        actorName: "Leader A",
+        payload: {
+          jobId: ids.job,
+          jobCode: "JOB-2026-001",
+          jobName: "Lô ảnh tháng 10",
+          from: { id: ids.job, name: "Đang làm", color: "blue" },
+          to: { id: ids.job, name: "Đã xong", color: "green" }
+        }
+      }),
+      base
+    );
+    expect(section).toMatchObject({
+      subject: "Leader A đã đổi trạng thái job JOB-2026-001: Đang làm → Đã xong",
+      headline: "Leader A đã đổi trạng thái job JOB-2026-001: Đang làm → Đã xong",
+      link: `${base}/production/jobs/${ids.job}`
+    });
+    expect(section.facts).toEqual([
+      { label: "Gói công việc", value: "JOB-2026-001" },
+      { label: "Tên job", value: "Lô ảnh tháng 10" },
+      { label: "Trạng thái", value: "Đang làm → Đã xong" }
+    ]);
   });
 
   it("falls back to title / body for unknown types", () => {

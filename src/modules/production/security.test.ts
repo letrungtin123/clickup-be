@@ -99,6 +99,7 @@ vi.mock("./jobs.repo.js", async (importOriginal) => ({
 }));
 
 const { leadsJob } = await import("./access.js");
+const { allowedTransitions } = await import("./workflow.js");
 const { relationOf, toProductionTask, assertJobVisible } = await import("./jobs.repo.js");
 const { effectiveJobScopes, defaultJobPermissions } = await import("../../contracts/production-catalog.js");
 /** The caller's access with the default job permission matrix (PD-036). */
@@ -210,6 +211,12 @@ const taskRow = (overrides: Partial<TaskRow> = {}): TaskRow => ({
   deadline_cursor: "2099-01-01 00:00:00.000000+00",
   job_archived: false,
   job_open_feedback: false,
+  split_reason: null,
+  created_by: null,
+  sub_seq: null,
+  parent_number: null,
+  subtasks: null,
+  pending_qty_request: null,
   ...overrides
 });
 
@@ -292,13 +299,15 @@ describe("SEC2-04 — job-leader powers need the LEADER (or ADMIN) role", () => 
     expect(demoted.isJobLeader).toBe(false);
     const view = toProductionTask(task, workflow, demoted, accessOf(["STAFF", "QC"]));
     expect(view.capabilities).toMatchObject({ canEdit: false, canAssign: false, canEditQty: false, canDelete: false });
-    // CHECKED → COMPLETE belongs to the JOB_LEADER actor.
+    // CHECKED → COMPLETE belongs to the JOB_LEADER actor (the job's "Complete" action, PD-044).
     expect(view.capabilities.transitions.map((option) => option.toStatusId)).not.toContain("COMPLETE");
+    expect(allowedTransitions(workflow, "CHECKED", demoted, "job").map((option) => option.toStatusId)).not.toContain("COMPLETE");
 
     const leader = relationOf(contextWith(["LEADER"]), task);
     const led = toProductionTask(task, workflow, leader, accessOf(["LEADER"]));
     expect(led.capabilities).toMatchObject({ canEdit: true, canDelete: true });
-    expect(led.capabilities.transitions.map((option) => option.toStatusId)).toContain("COMPLETE");
+    expect(led.capabilities.transitions.map((option) => option.toStatusId)).not.toContain("COMPLETE");
+    expect(allowedTransitions(workflow, "CHECKED", leader, "job").map((option) => option.toStatusId)).toContain("COMPLETE");
   });
 
   it("quantity correction by a demoted leader → 403, nothing written", async () => {
@@ -316,7 +325,8 @@ describe("SEC2-04 — job-leader powers need the LEADER (or ADMIN) role", () => 
   });
 
   it("job visibility of non-all-jobs callers no longer goes through leader_id", async () => {
-    expect(await failure(assertJobVisible(db.sql as unknown as QuerySql, contextWith(["STAFF"]), jobId))).toEqual({ code: "JOB_NOT_FOUND", status: 404 });
+    // QC views "own" by default (STAFF views "all" since PD-047).
+    expect(await failure(assertJobVisible(db.sql as unknown as QuerySql, contextWith(["QC"]), jobId))).toEqual({ code: "JOB_NOT_FOUND", status: 404 });
     const check = db.state.calls.at(-1)!;
     expect(check.text).not.toContain("leader_id");
     expect(check.text).toContain("t.assignee_id = $ OR t.qc_id = $");
@@ -363,9 +373,9 @@ describe("SEC2-08 — deleting a production comment has the same checks as editi
     expect(wrote(/^UPDATE production\.comments/)).toBe(false);
   });
 
-  it("an author taken off the task can no longer delete there (404)", async () => {
+  it("an author taken off the task can no longer delete there (404, an own view: QC by default)", async () => {
     db.state.handler = answer("TASK", taskRow({ assignee_id: third }));
-    expect(await failure(deleteProductionComment(contextWith(["STAFF"]), commentId))).toEqual({ code: "TASK_NOT_FOUND", status: 404 });
+    expect(await failure(deleteProductionComment(contextWith(["QC"]), commentId))).toEqual({ code: "TASK_NOT_FOUND", status: 404 });
     expect(wrote(/^UPDATE production\.comments/)).toBe(false);
   });
 

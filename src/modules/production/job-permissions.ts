@@ -47,10 +47,46 @@ export const wholeJobAllowed = (scope: JobPermissionScope, assigneeIds: readonly
 export const jobStatusChangeAllowed = (scope: JobPermissionScope, relation: { assignee: boolean; leads: boolean }) =>
   scope === "all" || (scope === "own" && (relation.assignee || relation.leads));
 
+/**
+ * PD-044 "Số lượng giao" of a line (before Done) is the Leader's number: changed directly by the job's Leader (`leads`,
+ * actsAsJobLeader) or "update: all", and by its worker only on a line they entered themselves; otherwise the worker sends
+ * a request the Leader approves (POST …/qty-requests). A subtask's quantity moves between it and its line, so its worker,
+ * the Leader or "update: all" may change it.
+ */
+export const qtyAssignedEditAllowed = (input: {
+  leads: boolean;
+  updateScope: JobPermissionScope;
+  mine: boolean;
+  createdByMe: boolean;
+  subtask: boolean;
+}) => input.leads || input.updateScope === "all" || (input.mine && (input.subtask || input.createdByMe));
+
+/**
+ * PD-044 the Done quantity after Done: "update: all" at any time (scores are adjusted, unchanged), and the line's worker
+ * until QC checked it ("Đã check") — a subtask has its own Done quantity.
+ */
+export const doneQtyEditAllowed = (input: { updateScope: JobPermissionScope; mine: boolean; done: boolean; checked: boolean }) =>
+  input.done && (input.updateScope === "all" || (input.mine && !input.checked));
+
+/**
+ * PD-044 subtasks: their line's worker, the job's Leader or "update: all" split a line, and edit / delete a subtask while
+ * the line is not Done (deleting one after Done needs "delete: all", see deleteProductionTask).
+ */
+export const subtaskManageAllowed = (input: { leads: boolean; updateScope: JobPermissionScope; mine: boolean }) =>
+  input.mine || input.leads || input.updateScope === "all";
+
+/**
+ * PD-044 deleting a subtask: before its line's Done its worker, the job's Leader or the "delete" scope (all / own line);
+ * after Done only "delete: all" (it reverses recorded points). PD-047: the worker deletes their own subtasks before Done
+ * whatever the delete scope (STAFF has "delete: none" by default, so they never delete the lines the Leader split).
+ */
+export const subtaskDeleteAllowed = (input: { leads: boolean; deleteScope: JobPermissionScope; mine: boolean; done: boolean }) =>
+  input.done ? input.deleteScope === "all" : input.mine || input.leads || lineAllowed(input.deleteScope, input.mine);
+
 /** "Nhập công việc" and its job picker (GET /production/jobs/options): "create" own or all. */
 export const workEntryAllowed = (scope: JobPermissionScope) => scope !== "none";
 
-/** New lines: "all" for anyone, "own" only for myself. Returns the problems ("Dòng N: …"); empty = allowed. */
+/** New lines: "all" for anyone, "own" only for myself. Returns the problems ("Task N: …"); empty = allowed. */
 export const lineCreateErrors = (scope: JobPermissionScope, assigneeIds: readonly string[], me: string) => {
   if (scope === "all") {
     return [];
@@ -58,7 +94,7 @@ export const lineCreateErrors = (scope: JobPermissionScope, assigneeIds: readonl
   if (scope === "none") {
     return ["Bạn không có quyền tạo công việc."];
   }
-  return assigneeIds.flatMap((id, index) => (id === me ? [] : [`Dòng ${index + 1}: bạn chỉ tạo được công việc của chính mình.`]));
+  return assigneeIds.flatMap((id, index) => (id === me ? [] : [`Task ${index + 1}: bạn chỉ tạo được công việc của chính mình.`]));
 };
 
 export const assertLinesCreatable = (scopes: JobScopes, assigneeIds: readonly string[], me: string) => {

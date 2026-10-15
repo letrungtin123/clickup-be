@@ -1,6 +1,16 @@
 import type { JobScopes, ProductionRole } from "../../contracts/production-catalog.js";
 import { productionRoleCodes } from "../../contracts/production-catalog.js";
-import type { FeedbackSchema, JobPeople, JobPersonShare, JobStatusRef, JobSummary, ProductionTask, TaskKind } from "../../contracts/production-jobs.js";
+import type {
+  FeedbackSchema,
+  JobPeople,
+  JobPersonShare,
+  JobStatusRef,
+  JobSummary,
+  ProductionSubtask,
+  ProductionTask,
+  TaskKind,
+  TaskQtyRequest
+} from "../../contracts/production-jobs.js";
 import { AppError } from "../../lib/app-error.js";
 import { toIso, toNullableIso, type QuerySql } from "../../lib/db-types.js";
 import type { AccessContext } from "../access/access-context.js";
@@ -9,8 +19,26 @@ import { userJsonSql } from "../work/tasks.repo.js";
 import { actsAsJobLeader, productionRolesOf } from "./access.js";
 import { cachedConfig } from "./catalog-cache.js";
 import { cursorTextSql } from "./cursor.js";
-import { leadsForView, lineAllowed, loadJobScopes, ownJobsSql } from "./job-permissions.js";
-import { allowedTransitions, finishedStatusIds, statusById, type TaskRelation, type Workflow } from "./workflow.js";
+import {
+  doneQtyEditAllowed,
+  leadsForView,
+  lineAllowed,
+  loadJobScopes,
+  ownJobsSql,
+  qtyAssignedEditAllowed,
+  subtaskDeleteAllowed,
+  subtaskManageAllowed
+} from "./job-permissions.js";
+import { parentNumberSql, taskCode } from "./task-codes.js";
+import {
+  allowedTransitions,
+  isSubtask,
+  lineFinishStatusIds,
+  statusById,
+  type LineFinishStatusIds,
+  type TaskRelation,
+  type Workflow
+} from "./workflow.js";
 import type { z } from "zod";
 
 /** Shared reads for production jobs and tasks (SPEC Phase 2). */
@@ -140,14 +168,93 @@ export type TaskRow = {
   tag_ids: string[] | null;
   created_at: Date;
   updated_at: Date;
-  /** Entered a finished status (Complete or later): no longer open work (BUG-PR-08). */
+  /**
+   * Became finished work (BUG-PR-08; PD-045: entered "Đã check" or later, a Checking line Done — isLineFinished): no
+   * longer open work. Lines finished before PD-045 may have it null; lists use the status rule instead.
+   */
   closed_at: Date | null;
+  /** PD-045 subtask letter index (1 = a), null for other rows. */
+  sub_seq: number | null;
+  /** A subtask's line number (null for other rows): with sub_seq, the display code "1216a". */
+  parent_number: string | number | null;
   /** deadline at full precision (keyset cursor of "Task của tôi"). */
   deadline_cursor: string;
   job_archived: boolean;
   /** The job has client feedback that is not resolved yet. */
   job_open_feedback: boolean;
+  /** Subtask (PD-044): why it was split off its line. */
+  split_reason: string | null;
+  /** Who entered the line (PD-044: a worker changes "Số lượng giao" of a line they entered themselves directly). */
+  created_by: string | null;
+  /** A line's live subtasks, oldest first (null: none, or the row is not a NORMAL line). */
+  subtasks: SubtaskJson[] | null;
+  /** The open quantity change request of the line (PD-044), if any. */
+  pending_qty_request: QtyRequestJson | null;
 };
+
+/** A subtask as `taskSelectSql` aggregates it under its line. */
+export type SubtaskJson = {
+  id: string;
+  number: number | string;
+  /** PD-045 letter index (1 = a); null only for rows written before the column existed. */
+  sub_seq: number | null;
+  process_id: string;
+  process_name: string;
+  qty_assigned: number;
+  qty_done: number | null;
+  reason: string | null;
+  created_by: UserRefJson | null;
+  created_at: string;
+};
+
+/** A quantity change request (production.task_qty_requests) as JSON. */
+export type QtyRequestJson = {
+  id: string;
+  task_id: string;
+  from_qty: number;
+  to_qty: number;
+  reason: string;
+  status: TaskQtyRequest["status"];
+  requested_by_id: string;
+  requested_by: UserRefJson | null;
+  created_at: string;
+  decided_by: UserRefJson | null;
+  decided_at: string | null;
+  decision_note: string | null;
+};
+
+/** PD-044: a subtask (NORMAL row with a parent line) — it follows its line's status, people, shift and dates. */
+export const isSubtaskRow = (row: Pick<TaskRow, "kind" | "parent_task_id">) => isSubtask({ kind: row.kind, parentTaskId: row.parent_task_id });
+
+/** Sum of a line's subtask quantities (0 without subtasks). */
+export const subtaskQtySum = (row: Pick<TaskRow, "subtasks">) => (row.subtasks ?? []).reduce((sum, subtask) => sum + subtask.qty_assigned, 0);
+
+/** "Số lượng Leader giao" (PD-044): a line's own quantity plus its subtasks'; a subtask's own. */
+export const allocatedQtyOf = (row: Pick<TaskRow, "qty_assigned" | "subtasks">) => row.qty_assigned + subtaskQtySum(row);
+
+/** Not a subtask, on the task alias `t` (lists of lines: Việc của tôi, Hàng chờ QC, lateness scans). */
+export const notSubtaskSql = (sql: QuerySql) => sql`NOT (t.kind = 'NORMAL' AND t.parent_task_id IS NOT NULL)`;
+
+/**
+ * PD-045 finished line (= workflow `isLineFinished`) on the task alias `t` and the process alias `processAlias`: its
+ * status is "Đã check" or later, or it is a Checking line that was Done and is still in Done or later.
+ */
+export const lineFinishedSql = (sql: QuerySql, ids: LineFinishStatusIds, processAlias: "pr" | "tp") => sql`
+  (t.status_id = ANY(${ids.checked}::uuid[])
+    OR (${sql(processAlias)}.is_qc AND t.done_at IS NOT NULL AND t.status_id = ANY(${ids.checkingDone}::uuid[])))
+`;
+
+/** PD-045 display code of a task row: "1216" for a line, "1216a" for a subtask. */
+export const taskRowCode = (row: Pick<TaskRow, "number" | "sub_seq" | "parent_number">) =>
+  taskCode({ number: row.number, subSeq: row.sub_seq, parentNumber: row.parent_number });
+
+/** JSON of a quantity request `r` (production.task_qty_requests). */
+export const qtyRequestJsonSql = (sql: QuerySql) => sql`
+  json_build_object('id', r.id, 'task_id', r.task_id, 'from_qty', r.from_qty, 'to_qty', r.to_qty, 'reason', r.reason, 'status', r.status,
+    'requested_by_id', r.requested_by, 'requested_by', (SELECT ${userJsonSql(sql)} FROM public.app_users au WHERE au.id = r.requested_by),
+    'created_at', r.created_at, 'decided_by', (SELECT ${userJsonSql(sql)} FROM public.app_users au WHERE au.id = r.decided_by),
+    'decided_at', r.decided_at, 'decision_note', r.decision_note)
+`;
 
 export const taskSelectSql = (sql: QuerySql) => sql`
   SELECT t.id, t.number, t.job_id, j.code AS job_code, j.leader_id AS job_leader_id,
@@ -165,7 +272,21 @@ export const taskSelectSql = (sql: QuerySql) => sql`
     t.kind, t.parent_task_id, t.feedback_id, t.note, t.work_link, t.is_late, t.qc_fail_count, t.custom_values,
     (SELECT array_agg(et.tag_id ORDER BY et.created_at) FROM production.entity_tags et
       WHERE et.organization_id = t.organization_id AND et.entity = 'TASK' AND et.entity_id = t.id) AS tag_ids,
-    t.created_at, t.updated_at
+    t.created_at, t.updated_at, t.split_reason, t.created_by,
+    -- PD-045 display code: a subtask's letter index and its line's number.
+    t.sub_seq, ${parentNumberSql(sql)} AS parent_number,
+    -- PD-044: a line's live subtasks (production_tasks_parent_idx) and its open quantity request (one per line).
+    CASE WHEN t.kind = 'NORMAL' AND t.parent_task_id IS NULL THEN (
+      SELECT json_agg(json_build_object('id', s.id, 'number', s.number, 'sub_seq', s.sub_seq, 'process_id', s.process_id, 'process_name', sp.name,
+          'qty_assigned', s.qty_assigned, 'qty_done', s.qty_done, 'reason', s.split_reason,
+          'created_by', (SELECT ${userJsonSql(sql)} FROM public.app_users au WHERE au.id = s.created_by), 'created_at', s.created_at)
+        ORDER BY s.created_at, s.number)
+      FROM production.tasks s
+      JOIN production.processes sp ON sp.organization_id = s.organization_id AND sp.id = s.process_id
+      WHERE s.organization_id = t.organization_id AND s.parent_task_id = t.id AND s.kind = 'NORMAL' AND s.deleted_at IS NULL
+    ) END AS subtasks,
+    (SELECT ${qtyRequestJsonSql(sql)} FROM production.task_qty_requests r
+      WHERE r.organization_id = t.organization_id AND r.task_id = t.id AND r.status = 'PENDING') AS pending_qty_request
   -- Deleted lines (PD-036) are kept for audit only: no read through this select ever shows them.
   FROM (SELECT * FROM production.tasks WHERE deleted_at IS NULL) t
   JOIN production.jobs j ON j.organization_id = t.organization_id AND j.id = t.job_id
@@ -326,29 +447,108 @@ export const toProductionTasks = async (sql: QuerySql, context: AccessContext, w
   return rows.map((row) => toProductionTask(row, workflow, relationOf(context, row), access, extras.get(row.id)));
 };
 
+type CapabilityRow = Pick<
+  TaskRow,
+  "assignee_id" | "job_archived" | "done_at" | "checked_at" | "kind" | "parent_task_id" | "process_is_qc" | "created_by" | "pending_qty_request"
+>;
+
 /**
  * What the caller may do with a line besides workflow moves (PD-036 matrix; archived jobs are read-only, BUG-PR-04):
  * edit its fields ("update" all / own line), change its QC (same, until Checked), give it to someone else (update
- * "all", before Done), correct its Done quantity (update "all", after Done — it changes scores) and delete it.
+ * "all", before Done) and delete it. PD-044: correct the Done quantity after Done ("update: all" any time, the worker
+ * until "Đã check"), change "Số lượng giao" directly or ask the Leader for it, decide a request, split subtasks. A subtask
+ * (`leads` = the caller acts as the job's leader) is managed by its worker, the Leader or "update: all"; it follows its
+ * line's people, so it is never assigned on its own.
  */
-export const taskCapabilities = (row: Pick<TaskRow, "assignee_id" | "job_archived" | "done_at" | "checked_at">, access: TaskAccess) => {
+export const taskCapabilities = (row: CapabilityRow, access: TaskAccess, leads = false) => {
   const live = !row.job_archived;
   const mine = row.assignee_id === access.userId;
-  const canEdit = live && lineAllowed(access.scopes.update, mine);
+  const subtask = isSubtaskRow(row);
+  const beforeDone = row.done_at === null;
+  const manages = subtaskManageAllowed({ leads, updateScope: access.scopes.update, mine });
+  const canEdit = live && (subtask ? manages : lineAllowed(access.scopes.update, mine));
+  const canEditQtyAssigned =
+    live &&
+    beforeDone &&
+    qtyAssignedEditAllowed({ leads, updateScope: access.scopes.update, mine, createdByMe: row.created_by === access.userId, subtask });
+  const workLine = row.kind === "NORMAL" && !subtask;
   return {
     canEdit,
-    canAssign: canEdit && row.checked_at === null,
-    canChangeAssignee: canEdit && access.scopes.update === "all" && row.done_at === null,
-    canEditQty: live && access.scopes.update === "all" && row.done_at !== null,
-    canDelete: live && lineAllowed(access.scopes.delete, mine)
+    canAssign: canEdit && !subtask && row.checked_at === null,
+    canChangeAssignee: canEdit && !subtask && access.scopes.update === "all" && beforeDone,
+    canEditQty: live && doneQtyEditAllowed({ updateScope: access.scopes.update, mine, done: !beforeDone, checked: row.checked_at !== null }),
+    canEditQtyAssigned,
+    canRequestQty: live && mine && workLine && beforeDone && !canEditQtyAssigned && row.pending_qty_request === null,
+    canDecideQtyRequest: live && row.pending_qty_request !== null && (leads || access.scopes.update === "all"),
+    canCreateSubtask: live && workLine && !row.process_is_qc && beforeDone && manages,
+    canDelete:
+      live &&
+      (subtask ? subtaskDeleteAllowed({ leads, deleteScope: access.scopes.delete, mine, done: !beforeDone }) : lineAllowed(access.scopes.delete, mine))
   };
+};
+
+/** A subtask's display code from its line's number (PD-045): "1216a". */
+export const subtaskJsonCode = (row: Pick<SubtaskJson, "number" | "sub_seq">, lineNumber: number | string) =>
+  taskCode({ number: row.number, subSeq: row.sub_seq, parentNumber: lineNumber });
+
+const toSubtask = (row: SubtaskJson, lineNumber: number | string): ProductionSubtask => ({
+  id: row.id,
+  number: Number(row.number),
+  code: subtaskJsonCode(row, lineNumber),
+  process: { id: row.process_id, name: row.process_name },
+  qtyAssigned: row.qty_assigned,
+  qtyDone: row.qty_done,
+  reason: row.reason,
+  createdBy: toUserRef(row.created_by),
+  createdAt: toIso(row.created_at)
+});
+
+export const toTaskQtyRequest = (row: QtyRequestJson): TaskQtyRequest => ({
+  id: row.id,
+  taskId: row.task_id,
+  fromQty: row.from_qty,
+  toQty: row.to_qty,
+  reason: row.reason,
+  status: row.status,
+  requestedBy: toUserRef(row.requested_by),
+  createdAt: toIso(row.created_at),
+  decidedBy: toUserRef(row.decided_by),
+  decidedAt: toNullableIso(row.decided_at),
+  decisionNote: row.decision_note
+});
+
+/**
+ * Job detail order (PD-044): every line in creation order, each followed by its subtasks (oldest first). Subtasks whose
+ * line is not in `rows` keep their place at the end.
+ */
+export const withSubtasksAfterLines = <T extends Pick<TaskRow, "id" | "kind" | "parent_task_id">>(rows: readonly T[]): T[] => {
+  const byParent = new Map<string, T[]>();
+  for (const row of rows) {
+    if (isSubtaskRow(row)) {
+      byParent.set(row.parent_task_id!, [...(byParent.get(row.parent_task_id!) ?? []), row]);
+    }
+  }
+  const placed = new Set<string>();
+  const ordered: T[] = [];
+  for (const row of rows) {
+    if (!isSubtaskRow(row)) {
+      ordered.push(row);
+      for (const child of byParent.get(row.id) ?? []) {
+        ordered.push(child);
+        placed.add(child.id);
+      }
+    }
+  }
+  return [...ordered, ...rows.filter((row) => isSubtaskRow(row) && !placed.has(row.id))];
 };
 
 export const toProductionTask = (row: TaskRow, workflow: Workflow, relation: TaskRelation, access: TaskAccess, extras: TaskExtras = noExtras): ProductionTask => {
   const doneStatusIds = new Set(workflow.statuses.filter((status) => status.countsDone).map((status) => status.id));
+  const subtask = isSubtaskRow(row);
   return {
     id: row.id,
     number: Number(row.number),
+    code: taskRowCode(row),
     jobId: row.job_id,
     jobCode: row.job_code,
     project: { id: row.project_id, code: row.project_code, name: row.project_name },
@@ -367,6 +567,11 @@ export const toProductionTask = (row: TaskRow, workflow: Workflow, relation: Tas
     status: { id: row.status_id, code: row.status_code, name: row.status_name, color: toColor(row.status_color) },
     kind: row.kind,
     parentTaskId: row.parent_task_id,
+    isSubtask: subtask,
+    splitReason: row.split_reason,
+    subtasks: subtask ? [] : (row.subtasks ?? []).map((item) => toSubtask(item, row.number)),
+    allocatedQty: subtask ? row.qty_assigned : allocatedQtyOf(row),
+    pendingQtyRequest: row.pending_qty_request ? toTaskQtyRequest(row.pending_qty_request) : null,
     feedbackId: row.feedback_id,
     note: row.note,
     workLink: row.work_link,
@@ -380,22 +585,26 @@ export const toProductionTask = (row: TaskRow, workflow: Workflow, relation: Tas
     createdAt: toIso(row.created_at),
     updatedAt: toIso(row.updated_at),
     capabilities: {
-      transitions: allowedTransitions(workflow, row.status_id, relation).map((option) => {
-        // Quantity / OT hours are asked only at the first Done (they are locked afterwards, PD-014).
-        const entersDone = doneStatusIds.has(option.toStatusId) && !doneStatusIds.has(row.status_id) && row.done_at === null;
-        return {
-          ...option,
-          asksQty: entersDone,
-          asksOtHours: entersDone && row.requires_ot_hours
-        };
-      }),
-      ...taskCapabilities(row, access)
+      // A subtask has no moves of its own: it follows its line (PD-044).
+      transitions: subtask
+        ? []
+        : allowedTransitions(workflow, row.status_id, relation).map((option) => {
+            const entersDone = doneStatusIds.has(option.toStatusId) && !doneStatusIds.has(row.status_id);
+            return {
+              ...option,
+              // The Done quantity is asked at the first Done, and again on re-entering Done (e.g. after "Cần sửa lại")
+              // until QC checked the line (PD-044); OT hours only at the first Done.
+              asksQty: entersDone && (row.done_at === null || row.checked_at === null),
+              asksOtHours: entersDone && row.done_at === null && row.requires_ot_hours
+            };
+          }),
+      ...taskCapabilities(row, access, relation.isJobLeader)
     }
   };
 };
 
-/** Statuses that count as "finished" for personal boards: from COMPLETE onwards (workflow.ts). */
-export { finishedStatusIds, statusById };
+/** PD-045 finished lines ("Đã check" or later; a Checking line: Done — workflow.ts) for personal boards and job readiness. */
+export { lineFinishStatusIds, statusById };
 
 // Jobs ------------------------------------------------------------------------------------------------
 
@@ -422,6 +631,8 @@ export type JobRow = {
   job_status_name: string;
   job_status_color: string;
   job_status_closed: boolean;
+  /** PD-045: the status can be chosen only when every line is checked ("Đã xong"). */
+  job_status_requires_all_checked: boolean;
   /** Derived workflow status (internal, PD-014). */
   status_id: string | null;
   status_code: string | null;
@@ -432,11 +643,15 @@ export type JobRow = {
   qty_checked: number;
   task_count: number;
   late_task_count: number;
+  /** PD-045: live lines not finished yet (lineFinishedSql). */
+  unchecked_task_count: number;
   open_feedback_count: number;
   /** Distinct task assignees, most images first (null: no task). */
   workers: { user: UserRefJson; qty: number; task_count: number }[] | null;
   /** Distinct task QC people, by name (null: none). */
   qc_people: UserRefJson[] | null;
+  /** PD-048 images per process of the live work tasks (subtasks under their own process, Checking left out). */
+  process_totals: { id: string; name: string; qty: number }[] | null;
   /** The `personId` person's part of the job (job list per-person view); null otherwise. */
   person_share: { processes: string[] | null; task_count: number; qty_assigned: number; qty_done: number; qty_checked: number } | null;
   custom_values: Record<string, unknown>;
@@ -450,20 +665,22 @@ export type JobRow = {
 
 /**
  * Job rows (list and detail). With `personId` (job list per-person view) each row also carries that person's
- * part of the job: their own tasks' processes and quantities.
+ * part of the job: their own tasks' processes and quantities. `finish` (lineFinishStatusIds of the organization's
+ * workflow) counts the lines not checked yet (PD-045 `uncheckedTaskCount`).
  */
-export const jobSelectSql = (sql: QuerySql, personId?: string) => sql`
+export const jobSelectSql = (sql: QuerySql, finish: LineFinishStatusIds, personId?: string) => sql`
   SELECT j.id, j.number, j.code, j.name, p.id AS project_id, p.code AS project_code, p.name AS project_name, c.name AS client_name,
     ${cursorTextSql(sql, "j.created_at")} AS created_cursor,
     j.leader_id, (SELECT ${userJsonSql(sql)} FROM public.app_users au WHERE au.id = j.leader_id) AS leader,
     j.received_at, j.deadline, j.total_images, j.total_images_manual, j.drive_link, j.channel_id,
     js.id AS job_status_id, js.name AS job_status_name, js.color AS job_status_color, js.is_closed AS job_status_closed,
+    js.requires_all_checked AS job_status_requires_all_checked,
     st.id AS status_id, st.code AS status_code, st.name AS status_name, st.color AS status_color,
     coalesce(agg.qty_assigned, 0)::int AS qty_assigned, coalesce(agg.qty_done, 0)::int AS qty_done,
     coalesce(agg.qty_checked, 0)::int AS qty_checked, coalesce(agg.task_count, 0)::int AS task_count,
-    coalesce(agg.late_task_count, 0)::int AS late_task_count,
+    coalesce(agg.late_task_count, 0)::int AS late_task_count, coalesce(agg.unchecked_task_count, 0)::int AS unchecked_task_count,
     (SELECT count(*)::int FROM production.feedbacks f WHERE f.organization_id = j.organization_id AND f.job_id = j.id AND f.status <> 'RESOLVED') AS open_feedback_count,
-    people.workers, people.qc_people,
+    people.workers, people.qc_people, people.process_totals,
     ${personId ? sql`mine.person_share` : sql`NULL::json AS person_share`},
     j.custom_values,
     (SELECT array_agg(et.tag_id ORDER BY et.created_at) FROM production.entity_tags et
@@ -481,8 +698,11 @@ export const jobSelectSql = (sql: QuerySql, personId?: string) => sql`
     SELECT sum(t.qty_assigned) FILTER (WHERE t.kind = 'NORMAL' AND NOT tp.is_qc) AS qty_assigned,
       sum(coalesce(t.qty_done, 0)) FILTER (WHERE t.done_at IS NOT NULL AND t.kind = 'NORMAL' AND NOT tp.is_qc) AS qty_done,
       sum(coalesce(t.qty_done, 0)) FILTER (WHERE t.kind = 'NORMAL' AND (t.checked_at IS NOT NULL OR (tp.is_qc AND t.done_at IS NOT NULL))) AS qty_checked,
-      count(*) AS task_count,
-      count(*) FILTER (WHERE t.is_late AND t.done_at IS NULL AND t.closed_at IS NULL) AS late_task_count
+      -- Lines: a subtask (PD-044) is part of its line, not a line of its own (its images are in the sums above).
+      count(*) FILTER (WHERE ${notSubtaskSql(sql)}) AS task_count,
+      count(*) FILTER (WHERE t.is_late AND t.done_at IS NULL AND t.closed_at IS NULL AND ${notSubtaskSql(sql)}) AS late_task_count,
+      -- PD-045: lines not "Đã check" yet (a Checking line: not Done) — what holds a requiresAllChecked job status up.
+      count(*) FILTER (WHERE ${notSubtaskSql(sql)} AND NOT ${lineFinishedSql(sql, finish, "tp")}) AS unchecked_task_count
     FROM production.tasks t
     JOIN production.processes tp ON tp.organization_id = t.organization_id AND tp.id = t.process_id
     WHERE t.organization_id = j.organization_id AND t.job_id = j.id AND t.deleted_at IS NULL
@@ -493,7 +713,7 @@ export const jobSelectSql = (sql: QuerySql, personId?: string) => sql`
     SELECT
       (SELECT json_agg(json_build_object('user', ${userJsonSql(sql)}, 'qty', w.qty, 'task_count', w.task_count) ORDER BY w.qty DESC, au.display_name, au.id)
         FROM (
-          SELECT t.assignee_id, sum(t.qty_assigned)::int AS qty, count(*)::int AS task_count
+          SELECT t.assignee_id, sum(t.qty_assigned)::int AS qty, count(*) FILTER (WHERE ${notSubtaskSql(sql)})::int AS task_count
           FROM production.tasks t WHERE t.organization_id = j.organization_id AND t.job_id = j.id AND t.deleted_at IS NULL
           GROUP BY t.assignee_id
         ) w
@@ -504,7 +724,17 @@ export const jobSelectSql = (sql: QuerySql, personId?: string) => sql`
           WHERE t.organization_id = j.organization_id AND t.job_id = j.id AND t.qc_id IS NOT NULL AND t.deleted_at IS NULL
           GROUP BY t.qc_id
         ) q
-        JOIN public.app_users au ON au.id = q.qc_id) AS qc_people
+        JOIN public.app_users au ON au.id = q.qc_id) AS qc_people,
+      -- PD-048 "Tổng tấm" per process: the same tasks as qty_assigned (NORMAL, not Checking), subtasks under their own
+      -- process; largest first, then by name.
+      (SELECT json_agg(json_build_object('id', pt.id, 'name', pt.name, 'qty', pt.qty) ORDER BY pt.qty DESC, pt.name, pt.id)
+        FROM (
+          SELECT pr.id, pr.name, sum(t.qty_assigned)::int AS qty
+          FROM production.tasks t
+          JOIN production.processes pr ON pr.organization_id = t.organization_id AND pr.id = t.process_id
+          WHERE t.organization_id = j.organization_id AND t.job_id = j.id AND t.deleted_at IS NULL AND t.kind = 'NORMAL' AND NOT pr.is_qc
+          GROUP BY pr.id, pr.name
+        ) pt) AS process_totals
   ) people ON true
   ${personId ? personShareSql(sql, personId) : sql``}
 `;
@@ -521,7 +751,7 @@ const personShareSql = (sql: QuerySql, personId: string) => sql`
             WHERE t2.organization_id = j.organization_id AND t2.job_id = j.id AND t2.assignee_id = ${personId} AND t2.deleted_at IS NULL
           )
       ),
-      'task_count', count(*),
+      'task_count', count(*) FILTER (WHERE ${notSubtaskSql(sql)}),
       'qty_assigned', coalesce(sum(t.qty_assigned), 0),
       'qty_done', coalesce(sum(coalesce(t.qty_done, 0)) FILTER (WHERE t.done_at IS NOT NULL), 0),
       'qty_checked', coalesce(sum(coalesce(t.qty_done, 0)) FILTER (WHERE t.checked_at IS NOT NULL OR (tp.is_qc AND t.done_at IS NOT NULL)), 0)
@@ -549,12 +779,15 @@ export const toJobPeople = (row: Pick<JobRow, "workers" | "qc_people">): JobPeop
   qc: (row.qc_people ?? []).map((user) => toUserRef(user)!)
 });
 
-/** The manual job status columns (PD-038) of a row as the API ref. */
-export const toJobStatusRef = (row: Pick<JobRow, "job_status_id" | "job_status_name" | "job_status_color" | "job_status_closed">): JobStatusRef => ({
+/** The manual job status columns (PD-038, PD-045) of a row as the API ref. */
+export const toJobStatusRef = (
+  row: Pick<JobRow, "job_status_id" | "job_status_name" | "job_status_color" | "job_status_closed" | "job_status_requires_all_checked">
+): JobStatusRef => ({
   id: row.job_status_id,
   name: row.job_status_name,
   color: toColor(row.job_status_color),
-  isClosed: row.job_status_closed
+  isClosed: row.job_status_closed,
+  requiresAllChecked: row.job_status_requires_all_checked
 });
 
 export const toJobSummary = (row: JobRow): JobSummary => ({
@@ -578,6 +811,8 @@ export const toJobSummary = (row: JobRow): JobSummary => ({
   qtyAssigned: row.qty_assigned,
   qtyDone: row.qty_done,
   qtyChecked: row.qty_checked,
+  uncheckedTaskCount: row.unchecked_task_count,
+  processTotals: (row.process_totals ?? []).map((item) => ({ process: { id: item.id, name: item.name }, qty: Number(item.qty) })),
   taskCount: row.task_count,
   lateTaskCount: row.late_task_count,
   openFeedbackCount: row.open_feedback_count,

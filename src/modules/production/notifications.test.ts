@@ -167,6 +167,26 @@ describe("productionRecipients (SPEC Phase 4 / PLAN §8)", () => {
     expect(productionRecipients.kpiSettledPerson(assignee)).toEqual([assignee]);
     expect(sorted(productionRecipients.kpiSettledAdmins([admin, superadmin, admin]))).toEqual(sorted([admin, superadmin]));
   });
+
+  it("PD-044 quantity request → the job's active Leader, else the Admins (never the requester); decision → the requester", () => {
+    expect(productionRecipients.qtyChangeRequested(people, [admin, superadmin], assignee)).toEqual([leader]);
+    // No active Leader (none, or demoted: leaderId null) → the production Admins.
+    expect(sorted(productionRecipients.qtyChangeRequested({ ...people, leaderId: null }, [admin, superadmin, admin], assignee))).toEqual(
+      sorted([admin, superadmin])
+    );
+    // The Leader asking on their own line, or an Admin asking: never told about their own request.
+    expect(productionRecipients.qtyChangeRequested({ ...people, assigneeId: leader }, [admin], leader)).toEqual([admin]);
+    expect(productionRecipients.qtyChangeRequested({ ...people, leaderId: null, assigneeId: admin }, [admin, superadmin], admin)).toEqual([superadmin]);
+    expect(productionRecipients.qtyChangeDecided(assignee)).toEqual([assignee]);
+  });
+
+  it("PD-045 job status changed → the active Leader + every Account / Admin (superadmins included), never the actor", () => {
+    expect(sorted(productionRecipients.jobStatusChanged(leader, [admin, superadmin, creator, admin], assignee))).toEqual(sorted([leader, admin, superadmin, creator]));
+    // The Leader (or an Admin) who changed it is not told; no active Leader → the Account / Admin people only.
+    expect(sorted(productionRecipients.jobStatusChanged(leader, [admin, superadmin], leader))).toEqual(sorted([admin, superadmin]));
+    expect(sorted(productionRecipients.jobStatusChanged(null, [admin, superadmin], admin))).toEqual([superadmin]);
+    expect(productionRecipients.jobStatusChanged(null, [], writer)).toEqual([]);
+  });
 });
 
 describe("worker handlers load the people the rules need", () => {
@@ -193,6 +213,116 @@ describe("worker handlers load the people the rules need", () => {
     await productionNotificationHandlers["production.task.status_changed"]!(envelope("production.task.status_changed", { taskId, enteredWaitingQc: true }, assignee));
     expect(draftsOf("production.qc_failed")[0]).toMatchObject({ recipientIds: [assignee], body: "Sai màu" });
     expect(draftsOf("production.task_waiting_qc")[0]?.recipientIds).toEqual([qc]);
+  });
+
+  it("PD-044 quantity request → the active Leader with the request in the payload; no Leader → the Admins", async () => {
+    const requestId = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
+    const request = (status: string) => ({
+      id: requestId,
+      from_qty: 10,
+      to_qty: 12,
+      reason: "Thư mục có thêm 2 ảnh",
+      status,
+      requested_by: assignee,
+      decision_note: status === "REJECTED" ? "Đã đủ ảnh" : null
+    });
+    let state = { leaderActive: true, status: "PENDING" };
+    db.state.handler = (call) => {
+      if (call.text.includes("AS leader_active") && call.text.includes("FROM production.tasks t")) {
+        return [taskInfo({ leader_active: state.leaderActive })];
+      }
+      if (call.text.includes("FROM production.task_qty_requests")) {
+        return [request(state.status)];
+      }
+      if (call.text.includes("role_code = 'ADMIN'")) {
+        return [{ user_id: admin }, { user_id: superadmin }];
+      }
+      return undefined;
+    };
+    await productionNotificationHandlers["production.task.qty_change_requested"]!(envelope("production.task.qty_change_requested", { taskId, requestId }, assignee));
+    const [asked] = draftsOf("production.qty_change_requested");
+    expect(asked).toMatchObject({ recipientIds: [leader], body: "#3: 10 → 12 tấm — Thư mục có thêm 2 ảnh" });
+    expect(asked!.payload).toMatchObject({
+      productionTaskId: taskId,
+      requestId,
+      fromQty: 10,
+      toQty: 12,
+      reason: "Thư mục có thêm 2 ảnh",
+      approved: null,
+      decisionNote: null
+    });
+    expect(db.state.calls.some((call) => call.text.includes("role_code = 'ADMIN'"))).toBe(false);
+
+    delivered.drafts = [];
+    state = { leaderActive: false, status: "PENDING" };
+    await productionNotificationHandlers["production.task.qty_change_requested"]!(envelope("production.task.qty_change_requested", { taskId, requestId }, assignee));
+    expect(sorted(draftsOf("production.qty_change_requested")[0]!.recipientIds)).toEqual(sorted([admin, superadmin]));
+
+    // Cancelled before the worker ran: nobody is told.
+    delivered.drafts = [];
+    state = { leaderActive: true, status: "CANCELLED" };
+    await productionNotificationHandlers["production.task.qty_change_requested"]!(envelope("production.task.qty_change_requested", { taskId, requestId }, assignee));
+    expect(delivered.drafts).toHaveLength(0);
+
+    // The decision goes back to the worker who asked.
+    state = { leaderActive: true, status: "REJECTED" };
+    await productionNotificationHandlers["production.task.qty_change_decided"]!(envelope("production.task.qty_change_decided", { taskId, requestId }, leader));
+    const [decided] = draftsOf("production.qty_change_decided");
+    expect(decided).toMatchObject({ recipientIds: [assignee], body: "#3: 10 → 12 tấm bị từ chối — Đã đủ ảnh" });
+    expect(decided!.payload).toMatchObject({ approved: false, decisionNote: "Đã đủ ảnh" });
+  });
+
+  it("PD-045: a subtask is named by its code (1216a) in the body and the payload", async () => {
+    db.state.handler = (call) =>
+      call.text.includes("AS leader_active") && call.text.includes("FROM production.tasks t") ? [taskInfo({ number: 1300, sub_seq: 1, parent_number: "1216" })] : undefined;
+    await productionNotificationHandlers["production.task.status_changed"]!(envelope("production.task.status_changed", { taskId, enteredWaitingQc: true }, assignee));
+    const [draft] = draftsOf("production.task_waiting_qc");
+    expect(draft).toMatchObject({ body: "#1216a · Retouch · 10 tấm" });
+    expect(draft!.payload).toMatchObject({ taskNumber: 1300, taskCode: "1216a" });
+    // The task query reads the subtask's letter and its line's number.
+    const query = db.state.calls.find((call) => call.text.includes("AS leader_active"))!;
+    expect(query.text).toContain("t.sub_seq");
+    expect(query.text).toContain("AS parent_number");
+
+    delivered.drafts = [];
+    db.state.handler = (call) => (call.text.includes("AS leader_active") && call.text.includes("FROM production.tasks t") ? [taskInfo({ sub_seq: null, parent_number: null })] : undefined);
+    await productionNotificationHandlers["production.task.status_changed"]!(envelope("production.task.status_changed", { taskId, enteredWaitingQc: true }, assignee));
+    expect(draftsOf("production.task_waiting_qc")[0]).toMatchObject({ body: "#3 · Retouch · 10 tấm", payload: { taskCode: "3" } });
+  });
+
+  it("PD-045 job status changed → active Leader + Account / Admin (minus the actor), title the job code, body from → to", async () => {
+    const accountant = "abababab-abab-4bab-8bab-abababababab";
+    const from = { id: "a1111111-1111-4111-8111-111111111111", name: "Đang làm", color: "blue" };
+    const to = { id: "a2222222-2222-4222-8222-222222222222", name: "Đã xong", color: "green" };
+    let leaderActive = true;
+    db.state.handler = (call) => {
+      if (call.text.includes("AS leader_active FROM production.jobs j")) {
+        return [{ code: "JOB-9", name: "Lô ảnh 9", leader_id: leader, leader_active: leaderActive }];
+      }
+      if (call.text.includes("ur.role_code = ANY(")) {
+        return [{ user_id: accountant }, { user_id: admin }, { user_id: superadmin }];
+      }
+      return undefined;
+    };
+    await productionNotificationHandlers["production.job.status_changed"]!(envelope("production.job.status_changed", { jobId, from, to }, admin));
+    const [draft] = draftsOf("production.job_status_changed");
+    expect(sorted(draft!.recipientIds)).toEqual(sorted([leader, accountant, superadmin]));
+    expect(draft).toMatchObject({ title: "JOB-9", body: "Đang làm → Đã xong", actorUserId: admin, payload: { jobId, jobCode: "JOB-9", jobName: "Lô ảnh 9", from, to } });
+    // ACCOUNT / ADMIN holders, superadmins included.
+    const roleQuery = db.state.calls.find((call) => call.text.includes("ur.role_code = ANY("))!;
+    expect(roleQuery.values).toContainEqual(["ACCOUNT", "ADMIN"]);
+    expect(roleQuery.text).toContain("r.key = 'superadmin'");
+
+    // A demoted Leader is not told; a malformed event or a deleted job tells nobody.
+    delivered.drafts = [];
+    leaderActive = false;
+    await productionNotificationHandlers["production.job.status_changed"]!(envelope("production.job.status_changed", { jobId, from, to }, admin));
+    expect(sorted(draftsOf("production.job_status_changed")[0]!.recipientIds)).toEqual(sorted([accountant, superadmin]));
+    delivered.drafts = [];
+    await productionNotificationHandlers["production.job.status_changed"]!(envelope("production.job.status_changed", { jobId, from }, admin));
+    db.state.handler = () => [];
+    await productionNotificationHandlers["production.job.status_changed"]!(envelope("production.job.status_changed", { jobId, from, to }, admin));
+    expect(delivered.drafts).toHaveLength(0);
   });
 
   it("a job comment notifies leader, creator and every worker / QC of the job, never the writer", async () => {

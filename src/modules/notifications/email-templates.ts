@@ -139,7 +139,9 @@ type Template = { headline: string; subject?: string; facts?: Fact[]; excerpt?: 
 const contextOf = (notification: EmailNotification) => {
   const payload = notification.payload;
   const jobCode = text(payload.jobCode) ?? notification.title;
+  // PD-045: the task's display code ("1216", a subtask "1216a"); older notifications carry the number only.
   const taskNumber = num(payload.taskNumber);
+  const taskCode = text(payload.taskCode) ?? (taskNumber !== null ? String(taskNumber) : null);
   const qty = num(payload.qty);
   const kind = text(payload.channelKind);
   return {
@@ -151,12 +153,12 @@ const contextOf = (notification: EmailNotification) => {
     channel: kind === "dm" || kind === "group_dm" ? "tin nhắn trực tiếp" : `#${notification.title}`,
     isDirect: kind === "dm" || kind === "group_dm",
     jobCode,
-    taskRef: taskNumber !== null ? `${jobCode} #${taskNumber}` : jobCode,
-    hasTask: taskNumber !== null,
+    taskRef: taskCode !== null ? `${jobCode} #${taskCode}` : jobCode,
+    hasTask: taskCode !== null,
     note: text(payload.note),
     productionFacts: [
       ["Gói công việc", jobCode],
-      ["Task", taskNumber !== null ? `#${taskNumber}` : null],
+      ["Task", taskCode !== null ? `#${taskCode}` : null],
       ["Công đoạn", text(payload.processName)],
       ["Số lượng", qty !== null ? `${qty} tấm` : null],
       ["Ngày giao", formatDateTime(payload.deadline)]
@@ -205,6 +207,10 @@ const leaveFacts = (n: EmailNotification): Fact[] => {
     ["Buổi", part ? (leaveParts[part] ?? part) : null]
   ];
 };
+
+/** The name of a { id, name, color } job status in a notification payload (PD-045); null when missing. */
+const jobStatusName = (value: unknown) =>
+  typeof value === "object" && value !== null ? text((value as Record<string, unknown>).name) : null;
 
 /** Work-task templates: the subject also names the task, e.g. "Linh đã giao cho bạn WEB-12: Thiết kế banner". */
 const taskTemplate = (c: Context, headline: string, excerpt: string | null = null): Template => ({
@@ -261,12 +267,14 @@ const templates = {
     ]
   }),
   "production.task_waiting_qc": (_n, c) => ({ headline: `Task ${c.taskRef} đang chờ bạn QC`, facts: c.productionFacts }),
+  // PD-044: QC sends the line back to "Cần sửa lại" (the QC's reason is the excerpt).
   "production.qc_failed": (_n, c) => ({
-    headline: `Task ${c.taskRef} không đạt QC`,
+    headline: `Task ${c.taskRef} cần sửa lại`,
+    subject: `QC yêu cầu sửa lại task ${c.taskRef}`,
     facts: c.productionFacts,
     excerpt: c.note ?? c.excerpt
   }),
-  "production.task_checked": (_n, c) => ({ headline: `Task ${c.taskRef} đã qua QC (Checked)`, facts: c.productionFacts }),
+  "production.task_checked": (_n, c) => ({ headline: `Task ${c.taskRef} đã qua QC (Đã check)`, facts: c.productionFacts }),
   "production.task_due_soon": (n, c) => {
     const deadline = formatDateTime(n.payload.deadline);
     return { headline: `Task ${c.taskRef} sắp đến hạn${deadline ? ` (${deadline})` : ""}`, facts: c.productionFacts };
@@ -282,6 +290,42 @@ const templates = {
       headline: `${c.actor} đã sửa số lượng task ${c.taskRef}${from !== null && to !== null ? `: ${from} → ${to} tấm` : ""}`,
       facts: c.productionFacts,
       excerpt: c.note
+    };
+  },
+  // PD-044 "Số lượng giao": the worker's request (→ the job's Leader) and its decision (→ the worker).
+  "production.qty_change_requested": (n, c) => {
+    const from = num(n.payload.fromQty);
+    const to = num(n.payload.toQty);
+    return {
+      headline: `${c.actor} đề nghị sửa số lượng giao task ${c.taskRef}${from !== null && to !== null ? `: ${from} → ${to} tấm` : ""}`,
+      facts: c.productionFacts,
+      excerpt: text(n.payload.reason) ?? c.excerpt
+    };
+  },
+  "production.qty_change_decided": (n, c) => {
+    const from = num(n.payload.fromQty);
+    const to = num(n.payload.toQty);
+    const change = from !== null && to !== null ? `: ${from} → ${to} tấm` : "";
+    return {
+      headline:
+        n.payload.approved === true
+          ? `${c.actor} đã duyệt sửa số lượng giao task ${c.taskRef}${change}`
+          : `${c.actor} đã từ chối sửa số lượng giao task ${c.taskRef}${change}`,
+      facts: c.productionFacts,
+      excerpt: text(n.payload.decisionNote)
+    };
+  },
+  // PD-045: the job's status (the manual chip) changed → its Leader and the production Account / Admin people.
+  "production.job_status_changed": (n, c) => {
+    const from = jobStatusName(n.payload.from);
+    const to = jobStatusName(n.payload.to);
+    return {
+      headline: `${c.actor} đã đổi trạng thái job ${c.jobCode}${from && to ? `: ${from} → ${to}` : to ? ` sang ${to}` : ""}`,
+      facts: [
+        ["Gói công việc", c.jobCode],
+        ["Tên job", text(n.payload.jobName)],
+        ["Trạng thái", from && to ? `${from} → ${to}` : to]
+      ]
     };
   },
   "production.feedback": (n, c) => ({

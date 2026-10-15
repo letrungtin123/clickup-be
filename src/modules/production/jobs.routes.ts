@@ -6,9 +6,12 @@ import {
   CreateFeedbackRequestSchema,
   CreateJobRequestSchema,
   CreateProductionCommentRequestSchema,
+  CreateQtyRequestSchema,
+  CreateSubtaskRequestSchema,
   CreateTasksRequestSchema,
   CreateTasksResultSchema,
   CreateWorkEntryRequestSchema,
+  DecideQtyRequestSchema,
   DeleteJobResultSchema,
   DeleteTaskResultSchema,
   JobChatResultSchema,
@@ -49,6 +52,7 @@ import {
   listJobOptions,
   listJobs,
   reassignFeedback,
+  refuseRetiredFeedback,
   transitionJob,
   updateJob
 } from "./jobs.service.js";
@@ -63,6 +67,8 @@ import {
   updateProductionTask,
   updateProductionTaskQty
 } from "./tasks.service.js";
+import { cancelQtyRequest, createQtyRequest, decideQtyRequest } from "./qty-requests.service.js";
+import { createProductionSubtask } from "./subtasks.service.js";
 import { createProductionComment, deleteProductionComment, listProductionTimeline, updateProductionComment } from "./timeline.service.js";
 import { createWorkEntry } from "./work-entries.service.js";
 
@@ -95,6 +101,9 @@ export const createProductionJobRoutes = (): ExpressRouter => {
       201
     )
   );
+  // Job-level line move — retired by PD-045 (the job's status is the manual chip above; the line workflow stops at
+  // "Đã check"): 409 JOB_TRANSITION_RETIRED for everyone but a production ADMIN, who may still apply a listed,
+  // note-free move to every line it fits (see transitionJob).
   routes.post(
     "/production/jobs/:jobId/transition",
     handle(async (context, req) =>
@@ -102,26 +111,28 @@ export const createProductionJobRoutes = (): ExpressRouter => {
     )
   );
   routes.post("/production/jobs/:jobId/chat", handle(async (context, req) => JobChatResultSchema.parse(await openJobChat(context, param(req, "jobId")))));
+  // Client feedback ("Ghi feedback", "Đóng feedback", "Giao lại") — retired by PD-045: 409 FEEDBACK_RETIRED before the
+  // body is read (404 for non-members). The handlers stay wired to the guarded services.
   routes.post(
     "/production/jobs/:jobId/feedbacks",
-    handle(
-      async (context, req) => JobDetailSchema.parse(await createFeedback(context, param(req, "jobId"), CreateFeedbackRequestSchema.parse(req.body))),
-      201
-    )
+    handle(async (context, req) => {
+      refuseRetiredFeedback(context);
+      return JobDetailSchema.parse(await createFeedback(context, param(req, "jobId"), CreateFeedbackRequestSchema.parse(req.body)));
+    }, 201)
   );
   routes.post(
     "/production/feedbacks/:feedbackId/close",
-    handle(async (context, req) =>
-      JobDetailSchema.parse(await closeFeedback(context, param(req, "feedbackId"), CloseFeedbackRequestSchema.parse(req.body)))
-    )
+    handle(async (context, req) => {
+      refuseRetiredFeedback(context);
+      return JobDetailSchema.parse(await closeFeedback(context, param(req, "feedbackId"), CloseFeedbackRequestSchema.parse(req.body)));
+    })
   );
   routes.post(
     "/production/feedbacks/:feedbackId/reassign",
-    handle(
-      async (context, req) =>
-        CreateTasksResultSchema.parse(await reassignFeedback(context, param(req, "feedbackId"), ReassignFeedbackRequestSchema.parse(req.body))),
-      201
-    )
+    handle(async (context, req) => {
+      refuseRetiredFeedback(context);
+      return CreateTasksResultSchema.parse(await reassignFeedback(context, param(req, "feedbackId"), ReassignFeedbackRequestSchema.parse(req.body)));
+    }, 201)
   );
 
   // "Nhập công việc": one work-log row (PD-035)
@@ -167,6 +178,32 @@ export const createProductionJobRoutes = (): ExpressRouter => {
     handle(async (context, req) =>
       ProductionTaskSchema.parse(await assignProductionTask(context, param(req, "taskId"), AssignTaskRequestSchema.parse(req.body)))
     )
+  );
+  // PD-044: subtasks (answers the line) and "Số lượng giao" requests (answer the line).
+  routes.post(
+    "/production/tasks/:taskId/subtasks",
+    handle(
+      async (context, req) =>
+        ProductionTaskSchema.parse(await createProductionSubtask(context, param(req, "taskId"), CreateSubtaskRequestSchema.parse(req.body))),
+      201
+    )
+  );
+  routes.post(
+    "/production/tasks/:taskId/qty-requests",
+    handle(
+      async (context, req) => ProductionTaskSchema.parse(await createQtyRequest(context, param(req, "taskId"), CreateQtyRequestSchema.parse(req.body))),
+      201
+    )
+  );
+  routes.post(
+    "/production/qty-requests/:requestId/decision",
+    handle(async (context, req) =>
+      ProductionTaskSchema.parse(await decideQtyRequest(context, param(req, "requestId"), DecideQtyRequestSchema.parse(req.body)))
+    )
+  );
+  routes.delete(
+    "/production/qty-requests/:requestId",
+    handle(async (context, req) => ProductionTaskSchema.parse(await cancelQtyRequest(context, param(req, "requestId"))))
   );
 
   // Comments & timeline

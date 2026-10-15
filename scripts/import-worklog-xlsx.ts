@@ -669,7 +669,8 @@ const replayHistory = async (sql: ReturnType<typeof getSql>, organizationId: str
             qtyAssigned: item.row.volume!,
             deadline: deadline.toISOString()
           })),
-          { kind: "NORMAL", feedbackId: null, defaultParentId: null, assignedAt: vn(assignedDay, "09:00") }
+          // History may lack a QC (PD-047 requires QC on new lines; importers replay old rows).
+          { kind: "NORMAL", feedbackId: null, defaultParentId: null, assignedAt: vn(assignedDay, "09:00"), historicQcOptional: true }
         );
         for (const [index, id] of ids.entries()) tasks.push({ task: await loadTask(tx, organizationId, id), item: batch[index]! });
       }

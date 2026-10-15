@@ -12,6 +12,10 @@ import type { Workflow, WorkflowStatus } from "./workflow.js";
  * PD-035 (a job carries the work-log Excel's fields: optional leader, Ngày nhận / Ngày giao, automatic Tổng tấm,
  * Hình lỗi, optional Giờ OT, "Nhập công việc") and PD-036 (job permission matrix, delete semantics), without a
  * database (same fake `sql` as security.test.ts). Fake names and ids only: the repository is public.
+ *
+ * PD-047 made the STAFF default view all / create none / update own / delete none. Most tests here exercise the "own"
+ * scope, so the fake organization stores a matrix with STAFF "own" everywhere (`db.state.settings`, read by
+ * loadSettings); tests of the new defaults clear it.
  */
 type Call = { text: string; values: unknown[] };
 type Fragment = { readonly isFragment: true; text: string; values: unknown[] };
@@ -19,7 +23,9 @@ type Fragment = { readonly isFragment: true; text: string; values: unknown[] };
 const db = vi.hoisted(() => {
   const state = {
     calls: [] as Call[],
-    handler: (() => []) as (call: Call) => unknown[] | undefined
+    handler: (() => []) as (call: Call) => unknown[] | undefined,
+    /** Rows of `SELECT key, value FROM production.settings` (null: asked to the handler). */
+    settings: null as unknown[] | null
   };
   const isFragment = (value: unknown): value is Fragment =>
     typeof value === "object" && value !== null && (value as { isFragment?: unknown }).isFragment === true;
@@ -47,7 +53,8 @@ const db = vi.hoisted(() => {
         const call = { text: text.replace(/\s+/g, " ").trim(), values: flat };
         state.calls.push(call);
         try {
-          resolve(state.handler(call) ?? []);
+          const settings = state.settings && call.text.startsWith("SELECT key, value FROM production.settings") ? state.settings : null;
+          resolve(settings ?? state.handler(call) ?? []);
         } catch (error) {
           reject(error);
         }
@@ -94,9 +101,9 @@ vi.mock("./jobs.repo.js", async (importOriginal) => ({
 }));
 
 const { actsAsJobLeader } = await import("./access.js");
-const { jobViewAllowed, lineAllowed, lineCreateErrors, rolesWithAll, wholeJobAllowed } = await import("./job-permissions.js");
+const { jobViewAllowed, lineAllowed, lineCreateErrors, rolesWithAll, subtaskDeleteAllowed, wholeJobAllowed } = await import("./job-permissions.js");
 const { relationOf, taskCapabilities } = await import("./jobs.repo.js");
-const { createProductionTasks, deleteProductionTask, moveTasks, updateProductionTask } = await import("./tasks.service.js");
+const { assignProductionTask, createProductionTasks, deleteProductionTask, moveTasks, updateProductionTask } = await import("./tasks.service.js");
 const { createJob, deleteJob, updateJob } = await import("./jobs.service.js");
 const { createWorkEntry } = await import("./work-entries.service.js");
 const { deleteProcess } = await import("./catalog.service.js");
@@ -198,6 +205,12 @@ const taskRow = (overrides: Partial<TaskRow> = {}): TaskRow => ({
   deadline_cursor: "2099-01-01 00:00:00.000000+00",
   job_archived: false,
   job_open_feedback: false,
+  split_reason: null,
+  created_by: null,
+  sub_seq: null,
+  parent_number: null,
+  subtasks: null,
+  pending_qty_request: null,
   ...overrides
 });
 
@@ -255,11 +268,18 @@ const failure = async (promise: Promise<unknown>) => {
   return null;
 };
 const callsLike = (pattern: RegExp) => db.state.calls.filter((call) => pattern.test(call.text));
-const line = (overrides: Record<string, unknown> = {}) => CreateTaskLineSchema.parse({ assigneeId: me, processId, shiftId, qtyAssigned: 5, ...overrides });
+// PD-047: a new work line names its QC.
+const line = (overrides: Record<string, unknown> = {}) =>
+  CreateTaskLineSchema.parse({ assigneeId: me, qcId: checker, processId, shiftId, qtyAssigned: 5, ...overrides });
+
+/** The fake organization's matrix: STAFF keeps "own" everywhere (as before PD-047), see the file comment. */
+const ownStaff: JobPermissionMatrix = { ...defaultJobPermissions, STAFF: { view: "own", create: "own", update: "own", delete: "own" } };
+const ownStaffSettings = [{ key: "job_permissions", value: ownStaff }];
 
 beforeEach(() => {
   db.state.calls = [];
   db.state.handler = () => [];
+  db.state.settings = ownStaffSettings;
   hooks.deleted = [];
   clearProductionConfigCache();
 });
@@ -268,8 +288,12 @@ beforeEach(() => {
 
 describe("job permission matrix (PD-036)", () => {
   it("a user's scope is the most permissive over their roles; ADMIN is always all; no role is none", () => {
-    expect(effectiveJobScopes(["STAFF"], defaultJobPermissions)).toEqual({ view: "own", create: "own", update: "own", delete: "own" });
+    // PD-047 defaults: staff see every job and update their own tasks, but neither enter work nor delete tasks.
+    expect(effectiveJobScopes(["STAFF"], defaultJobPermissions)).toEqual({ view: "all", create: "none", update: "own", delete: "none" });
+    expect(effectiveJobScopes(["QC"], defaultJobPermissions)).toEqual({ view: "own", create: "own", update: "own", delete: "own" });
+    expect(effectiveJobScopes(["STAFF", "QC"], defaultJobPermissions)).toEqual({ view: "all", create: "own", update: "own", delete: "own" });
     expect(effectiveJobScopes(["STAFF", "LEADER"], defaultJobPermissions)).toEqual({ view: "all", create: "all", update: "all", delete: "all" });
+    expect(effectiveJobScopes(["STAFF"], ownStaff)).toEqual({ view: "own", create: "own", update: "own", delete: "own" });
     const strict: JobPermissionMatrix = {
       ...defaultJobPermissions,
       ACCOUNT: { view: "all", create: "none", update: "own", delete: "none" },
@@ -294,30 +318,157 @@ describe("job permission matrix (PD-036)", () => {
     expect(jobViewAllowed("own", { involved: true, leads: false })).toBe(true);
     expect(jobViewAllowed("own", { involved: false, leads: false })).toBe(false);
     expect(jobViewAllowed("none", { involved: true, leads: true })).toBe(false);
-    expect(lineCreateErrors("own", [me, worker], me)).toEqual(["Dòng 2: bạn chỉ tạo được công việc của chính mình."]);
+    expect(lineCreateErrors("own", [me, worker], me)).toEqual(["Task 2: bạn chỉ tạo được công việc của chính mình."]);
     expect(lineCreateErrors("all", [worker], me)).toEqual([]);
     expect(lineCreateErrors("none", [me], me)).toHaveLength(1);
   });
 
   it("task capabilities follow the update / delete scopes; moves keep the workflow rules", () => {
-    const own = { scopes: effectiveJobScopes(["STAFF"], defaultJobPermissions), userId: me };
-    expect(taskCapabilities(taskRow(), own)).toEqual({ canEdit: true, canAssign: true, canChangeAssignee: false, canEditQty: false, canDelete: true });
-    expect(taskCapabilities(taskRow({ assignee_id: worker }), own)).toEqual({
+    const own = { scopes: effectiveJobScopes(["STAFF"], ownStaff), userId: me };
+    const none = {
       canEdit: false,
       canAssign: false,
       canChangeAssignee: false,
       canEditQty: false,
+      canEditQtyAssigned: false,
+      canRequestQty: false,
+      canDecideQtyRequest: false,
+      canCreateSubtask: false,
       canDelete: false
-    });
+    };
+    // My line entered by the Leader: I ask for a new "Số lượng giao" (PD-044) and may split subtasks.
+    expect(taskCapabilities(taskRow(), own)).toEqual({ ...none, canEdit: true, canAssign: true, canRequestQty: true, canCreateSubtask: true, canDelete: true });
+    expect(taskCapabilities(taskRow({ assignee_id: worker }), own)).toEqual(none);
     const all = { scopes: effectiveJobScopes(["LEADER"], defaultJobPermissions), userId: me };
     expect(taskCapabilities(taskRow({ assignee_id: worker, done_at: new Date() }), all)).toMatchObject({ canChangeAssignee: false, canEditQty: true });
-    expect(taskCapabilities(taskRow({ job_archived: true }), all)).toEqual({
-      canEdit: false,
+    expect(taskCapabilities(taskRow({ job_archived: true }), all)).toEqual(none);
+  });
+
+  it("PD-044 capabilities: Số lượng giao, quantity requests, Done quantity, subtasks", () => {
+    const own = { scopes: effectiveJobScopes(["STAFF"], ownStaff), userId: me };
+    const all = { scopes: effectiveJobScopes(["LEADER"], defaultJobPermissions), userId: me };
+    // A line I entered myself: I change its quantity directly, no request.
+    expect(taskCapabilities(taskRow({ created_by: me }), own)).toMatchObject({ canEditQtyAssigned: true, canRequestQty: false });
+    // The job's Leader (even with an "own" scope) changes it directly and decides an open request.
+    const pending = {
+      id: jobId,
+      task_id: taskId,
+      from_qty: 10,
+      to_qty: 12,
+      reason: "Thiếu ảnh",
+      status: "PENDING" as const,
+      requested_by_id: worker,
+      requested_by: userJson(worker),
+      created_at: "2026-10-14T03:00:00.000Z",
+      decided_by: null,
+      decided_at: null,
+      decision_note: null
+    };
+    const led = taskRow({ assignee_id: worker, pending_qty_request: pending });
+    expect(taskCapabilities(led, own, true)).toMatchObject({ canEditQtyAssigned: true, canDecideQtyRequest: true, canCreateSubtask: true });
+    expect(taskCapabilities(led, own)).toMatchObject({ canEditQtyAssigned: false, canDecideQtyRequest: false, canCreateSubtask: false });
+    // One open request per line.
+    expect(taskCapabilities(taskRow({ pending_qty_request: pending }), own)).toMatchObject({ canRequestQty: false });
+    // Done quantity: the worker until QC checked the line, "update: all" any time.
+    expect(taskCapabilities(taskRow({ done_at: new Date() }), own)).toMatchObject({ canEditQty: true, canRequestQty: false, canCreateSubtask: false });
+    expect(taskCapabilities(taskRow({ done_at: new Date(), checked_at: new Date() }), own)).toMatchObject({ canEditQty: false });
+    expect(taskCapabilities(taskRow({ assignee_id: worker, done_at: new Date(), checked_at: new Date() }), all)).toMatchObject({ canEditQty: true });
+    // Checking lines and feedback redo lines are not split.
+    expect(taskCapabilities(taskRow({ process_is_qc: true }), own)).toMatchObject({ canCreateSubtask: false });
+    expect(taskCapabilities(taskRow({ kind: "FB_WRONG", feedback_id: jobId }), own)).toMatchObject({ canCreateSubtask: false, canRequestQty: false });
+    // A subtask: its worker edits its process / quantity (moved from its line), deletes it before Done; never assigned
+    // on its own, never split again, never asks for a quantity.
+    const subtask = taskRow({ parent_task_id: jobId, split_reason: "Cắt nền riêng" });
+    expect(taskCapabilities(subtask, own)).toEqual({
+      canEdit: true,
       canAssign: false,
       canChangeAssignee: false,
       canEditQty: false,
-      canDelete: false
+      canEditQtyAssigned: true,
+      canRequestQty: false,
+      canDecideQtyRequest: false,
+      canCreateSubtask: false,
+      canDelete: true
     });
+    // After Done only "delete: all" deletes a subtask.
+    expect(taskCapabilities({ ...subtask, done_at: new Date() }, own)).toMatchObject({ canDelete: false, canEditQty: true });
+    expect(taskCapabilities({ ...subtask, assignee_id: worker, done_at: new Date() }, all)).toMatchObject({ canDelete: true });
+  });
+
+  it("PD-047 capabilities with the staff defaults: my task is edited, never deleted; my subtasks are deleted before Done", () => {
+    const staff = { scopes: effectiveJobScopes(["STAFF"], defaultJobPermissions), userId: me };
+    // The task the Leader gave me: edit, change its QC, ask for a quantity, split — no delete.
+    expect(taskCapabilities(taskRow(), staff)).toMatchObject({ canEdit: true, canAssign: true, canRequestQty: true, canCreateSubtask: true, canDelete: false });
+    expect(taskCapabilities(taskRow({ created_by: me }), staff)).toMatchObject({ canDelete: false });
+    // Someone else's task: visible (view all) but nothing to change.
+    expect(taskCapabilities(taskRow({ assignee_id: worker }), staff)).toMatchObject({ canEdit: false, canDelete: false, canCreateSubtask: false });
+    // My subtask: deleted before its task's Done whatever the delete scope; after Done only "delete: all".
+    const subtask = taskRow({ parent_task_id: jobId, split_reason: "Cắt nền riêng" });
+    expect(taskCapabilities(subtask, staff)).toMatchObject({ canEdit: true, canDelete: true });
+    expect(taskCapabilities({ ...subtask, done_at: new Date() }, staff)).toMatchObject({ canDelete: false });
+    expect(taskCapabilities({ ...subtask, assignee_id: worker }, staff)).toMatchObject({ canDelete: false });
+    expect(subtaskDeleteAllowed({ leads: false, deleteScope: "none", mine: true, done: false })).toBe(true);
+    expect(subtaskDeleteAllowed({ leads: false, deleteScope: "none", mine: true, done: true })).toBe(false);
+    expect(subtaskDeleteAllowed({ leads: false, deleteScope: "none", mine: false, done: false })).toBe(false);
+    expect(subtaskDeleteAllowed({ leads: true, deleteScope: "none", mine: false, done: false })).toBe(true);
+  });
+
+  it("PD-047 staff defaults: no Chia task, no Nhập công việc, no task delete (403); own subtasks are deleted", async () => {
+    db.state.settings = null;
+    db.state.handler = lineQueries();
+    const chia = await failure(createProductionTasks(contextWith(["STAFF"]), jobId, [line()]));
+    expect(chia).toEqual({ code: "FORBIDDEN", status: 403, message: "Bạn không có quyền tạo công việc." });
+    const entry = CreateWorkEntryRequestSchema.parse({
+      projectId,
+      jobId,
+      processId,
+      shiftId,
+      qcId: checker,
+      qtyAssigned: 3,
+      assignedAt: "2026-10-12T00:00:00+07:00",
+      deadline: "2026-10-12T23:59:00+07:00"
+    });
+    expect(await failure(createWorkEntry(contextWith(["STAFF"]), entry))).toEqual({ code: "FORBIDDEN", status: 403, message: "Bạn không có quyền tạo công việc." });
+    expect(callsLike(/^INSERT INTO production\.tasks/)).toHaveLength(0);
+
+    // My own task: not deleted with "delete: none".
+    db.state.handler = (call) =>
+      call.text.startsWith("SELECT job_id FROM production.tasks") ? [{ job_id: jobId }]
+      : call.text.includes("AS job_leader_id") ? [taskRow()]
+      : undefined;
+    expect(await failure(deleteProductionTask(contextWith(["STAFF"]), taskId))).toEqual({
+      code: "FORBIDDEN",
+      status: 403,
+      message: "Bạn không có quyền xoá công việc."
+    });
+    expect(callsLike(/^UPDATE production\.tasks SET deleted_at/)).toHaveLength(0);
+
+    // My own subtask before Done: deleted, its quantity goes back to the task.
+    db.state.calls = [];
+    const parentId = "99999999-9999-4999-8999-999999999999";
+    db.state.handler = (call) =>
+      call.text.startsWith("SELECT job_id FROM production.tasks") ? [{ job_id: jobId }]
+      : call.text.includes("AS job_leader_id") ? [taskRow({ parent_task_id: parentId, qty_assigned: 4, sub_seq: 1, parent_number: 7 })]
+      : call.text.startsWith("SELECT id, qty_assigned, done_at FROM production.tasks") ? [{ id: parentId, qty_assigned: 6, done_at: null }]
+      : call.text.includes("AS open") ? [{ open: false }]
+      : undefined;
+    expect(await deleteProductionTask(contextWith(["STAFF"]), taskId)).toEqual({ taskId, jobId, reversedEntries: 2 });
+    expect(callsLike(/^UPDATE production\.tasks SET deleted_at/)).toHaveLength(1);
+    expect(callsLike(/^UPDATE production\.tasks SET qty_assigned = \$/)[0]?.values).toContain(10);
+
+    // After the task's Done the subtask stays (only "delete: all").
+    db.state.calls = [];
+    db.state.handler = (call) =>
+      call.text.startsWith("SELECT job_id FROM production.tasks") ? [{ job_id: jobId }]
+      : call.text.includes("AS job_leader_id") ? [taskRow({ parent_task_id: parentId, qty_assigned: 4, sub_seq: 1, parent_number: 7 })]
+      : call.text.startsWith("SELECT id, qty_assigned, done_at FROM production.tasks") ? [{ id: parentId, qty_assigned: 6, done_at: new Date() }]
+      : undefined;
+    expect(await failure(deleteProductionTask(contextWith(["STAFF"]), taskId))).toEqual({
+      code: "FORBIDDEN",
+      status: 403,
+      message: "Task đã Done — chỉ người có quyền xoá mọi công việc mới xoá được subtask."
+    });
+    expect(callsLike(/^UPDATE production\.tasks SET deleted_at/)).toHaveLength(0);
   });
 
   it("POST /jobs (a job without lines) needs create all; STAFF enters work through Nhập công việc", async () => {
@@ -330,7 +481,7 @@ describe("job permission matrix (PD-036)", () => {
     db.state.handler = lineQueries({ extra: (call) => (call.text.includes("AND (t.assignee_id = $ OR t.qc_id = $)") ? [{ "?column?": 1 }] : undefined) });
     const result = await failure(createProductionTasks(contextWith(["STAFF"]), jobId, [line(), line({ assigneeId: worker })]));
     expect(result).toMatchObject({ code: "FORBIDDEN", status: 403 });
-    expect(result?.message).toContain("Dòng 2");
+    expect(result?.message).toBe("Task 2: bạn chỉ tạo được công việc của chính mình.");
     expect(callsLike(/^INSERT INTO production\.tasks/)).toHaveLength(0);
   });
 
@@ -418,6 +569,55 @@ describe("job permission matrix (PD-036)", () => {
   });
 });
 
+// PD-047 — a task's QC is changed, never removed --------------------------------------------------------------------
+
+describe("PD-047 — a work task keeps a QC", () => {
+  const otherQc = "45454545-4545-4545-8545-454545454545";
+  const assignQueries = (row: TaskRow, processIsQc = false) =>
+    lineQueries({
+      extra: (call) =>
+        call.text.startsWith("SELECT job_id FROM production.tasks") ? [{ job_id: jobId }]
+        : call.text.includes("AS job_leader_id") ? [row]
+        : call.text.startsWith("SELECT om.user_id")
+          ? [
+              { user_id: me, roles: ["STAFF"], superadmin: false },
+              { user_id: worker, roles: ["STAFF"], superadmin: false },
+              { user_id: checker, roles: ["QC"], superadmin: false },
+              { user_id: otherQc, roles: ["QC"], superadmin: false }
+            ]
+        : call.text.startsWith("SELECT id, active, is_qc, name FROM production.processes") ? [{ id: processId, active: true, is_qc: processIsQc, name: "Retouch" }]
+        : undefined
+    });
+  const assignUpdates = () => callsLike(/^UPDATE production\.tasks SET assignee_id = \$, qc_id = \$/);
+
+  it("removing the QC of a work task → 400 QC_REQUIRED, nothing written; changing it to another QC is fine", async () => {
+    db.state.handler = assignQueries(taskRow({ qc_id: checker, qc: userJson(checker) }));
+    expect(await failure(assignProductionTask(contextWith(["STAFF"]), taskId, { qcId: null }))).toEqual({
+      code: "QC_REQUIRED",
+      status: 400,
+      message: "Task phải có QC — chỉ đổi sang QC khác."
+    });
+    expect(await failure(assignProductionTask(contextWith(["LEADER"]), taskId, { assigneeId: worker, qcId: null }))).toMatchObject({ code: "QC_REQUIRED" });
+    expect(assignUpdates()).toHaveLength(0);
+
+    await assignProductionTask(contextWith(["STAFF"]), taskId, { qcId: otherQc });
+    expect(assignUpdates()[0]?.values).toEqual([me, otherQc, org, taskId]);
+  });
+
+  it("a task created without QC before PD-047 stays as it is; a Checking task never needs one", async () => {
+    // Re-assigning a legacy task without QC: allowed, still without QC.
+    db.state.handler = assignQueries(taskRow({ qc_id: null }));
+    await assignProductionTask(contextWith(["LEADER"]), taskId, { assigneeId: worker });
+    expect(assignUpdates()[0]?.values).toEqual([worker, null, org, taskId]);
+
+    // A Checking task (its assignee is the checker) has no QC of its own: clearing a historic one is allowed.
+    db.state.calls = [];
+    db.state.handler = assignQueries(taskRow({ assignee_id: checker, qc_id: otherQc, process_is_qc: true }), true);
+    await assignProductionTask(contextWith(["LEADER"]), taskId, { qcId: null });
+    expect(assignUpdates()[0]?.values).toEqual([checker, null, org, taskId]);
+  });
+});
+
 // PD-035 — work-log fields ---------------------------------------------------------------------------------------
 
 describe("work-log fields (PD-035)", () => {
@@ -426,7 +626,9 @@ describe("work-log fields (PD-035)", () => {
     expect(actsAsJobLeader(contextWith(["STAFF"]), null)).toBe(false);
     expect(actsAsJobLeader(contextWith(["LEADER"]), worker)).toBe(false);
     const checked = taskRow({ status_id: "CHECKED", status_code: "CHECKED", assignee_id: worker });
-    const targets = (roles: string[]) => allowedTransitions(workflow, "CHECKED", relationOf(contextWith(roles), checked)).map((option) => option.toStatusId);
+    // The job's Complete action (PD-044: never one line at a time).
+    const targets = (roles: string[]) =>
+      allowedTransitions(workflow, "CHECKED", relationOf(contextWith(roles), checked), "job").map((option) => option.toStatusId);
     expect(targets(["LEADER"])).toContain("COMPLETE");
     expect(targets(["STAFF"])).not.toContain("COMPLETE");
   });
@@ -442,13 +644,13 @@ describe("work-log fields (PD-035)", () => {
     expect(TransitionTaskRequestSchema.safeParse({ toStatusId: jobId }).success).toBe(true);
   });
 
-  it("a line defaults to the job's Ngày nhận / Ngày giao and stores Hình lỗi and Giờ OT; QC is optional on my own line", async () => {
+  it("a line defaults to the job's Ngày nhận / Ngày giao and stores Hình lỗi and Giờ OT", async () => {
     db.state.handler = lineQueries();
     await createProductionTasks(contextWith(["LEADER"]), jobId, [line({ errorQty: 3, otHours: 1.5 })]);
     const insert = callsLike(/^INSERT INTO production\.tasks/)[0]!;
     expect(insert.text).toContain("error_qty, ot_hours");
     const [row] = insert.values.find((value) => Array.isArray(value)) as Record<string, unknown>[];
-    expect(row).toMatchObject({ assigneeId: me, qcId: null, errorQty: 3, otHours: 1.5, assignedAt: jobReceived.toISOString(), deadline: jobDeadline.toISOString() });
+    expect(row).toMatchObject({ assigneeId: me, qcId: checker, errorQty: 3, otHours: 1.5, assignedAt: jobReceived.toISOString(), deadline: jobDeadline.toISOString() });
     // Automatic Tổng tấm: no over-allocation warning, synced from the lines when the job is settled.
     expect(JSON.stringify(callsLike(/^INSERT INTO production\.task_logs/)[0]?.values)).not.toContain("warning");
     expect(callsLike(/^UPDATE production\.jobs j SET total_images = s\.total/)[0]?.text).toContain("NOT j.total_images_manual");
@@ -516,8 +718,50 @@ describe("work-log fields (PD-035)", () => {
     expect(callsLike(/^UPDATE production\.jobs j SET total_images = s\.total/)).toHaveLength(0);
   });
 
+  it("PD-047: Chia task and Nhập công việc refuse a work line without QC (400, nothing written); a Checking line has none", async () => {
+    db.state.handler = lineQueries();
+    const missing = await failure(createProductionTasks(contextWith(["LEADER"]), jobId, [line(), line({ qcId: null }), line({ qcId: undefined })]));
+    expect(missing).toEqual({ code: "TASK_LINES_INVALID", status: 400, message: "Task 2: Chọn QC cho task. Task 3: Chọn QC cho task." });
+    const entry = CreateWorkEntryRequestSchema.parse({
+      projectId,
+      jobId,
+      processId,
+      shiftId,
+      qtyAssigned: 3,
+      assignedAt: "2026-10-12T00:00:00+07:00",
+      deadline: "2026-10-12T23:59:00+07:00"
+    });
+    db.state.handler = lineQueries({
+      extra: (call) =>
+        call.text.startsWith("SELECT 1 FROM production.projects") ? [{ "?column?": 1 }]
+        : call.text.startsWith("SELECT project_id FROM production.jobs") ? [{ project_id: projectId }]
+        : undefined
+    });
+    expect(await failure(createWorkEntry(contextWith(["LEADER"]), entry))).toEqual({
+      code: "TASK_LINES_INVALID",
+      status: 400,
+      message: "Task 1: Chọn QC cho task."
+    });
+    expect(callsLike(/^INSERT INTO production\.tasks/)).toHaveLength(0);
+
+    // A Checking line (QC process) is the checker's own work: no QC of its own, nothing required.
+    const checkingId = "abababab-abab-4bab-8bab-abababababab";
+    db.state.handler = lineQueries({
+      extra: (call) =>
+        call.text.startsWith("SELECT id, active, is_qc, name FROM production.processes")
+          ? [
+              { id: processId, active: true, is_qc: false, name: "Retouch" },
+              { id: checkingId, active: true, is_qc: true, name: "Checking" }
+            ]
+          : undefined
+    });
+    await createProductionTasks(contextWith(["LEADER"]), jobId, [line({ assigneeId: checker, qcId: null, processId: checkingId })]);
+    const [row] = callsLike(/^INSERT INTO production\.tasks/)[0]!.values.find((value) => Array.isArray(value)) as Record<string, unknown>[];
+    expect(row).toMatchObject({ assigneeId: checker, qcId: null, processId: checkingId });
+  });
+
   it("Nhập công việc never creates a job: it needs an existing job of the chosen project (PD-038)", async () => {
-    const base = { projectId, processId, shiftId, qtyAssigned: 12, assignedAt: "2026-10-12T00:00:00+07:00", deadline: "2026-10-12T23:59:00+07:00" };
+    const base = { projectId, processId, shiftId, qcId: checker, qtyAssigned: 12, assignedAt: "2026-10-12T00:00:00+07:00", deadline: "2026-10-12T23:59:00+07:00" };
     // The free package text is gone from the contract: a job id is required.
     expect(CreateWorkEntryRequestSchema.safeParse({ ...base, jobCode: "Folder 2026/Batch 7" }).success).toBe(false);
     expect(CreateWorkEntryRequestSchema.safeParse(base).success).toBe(false);
@@ -535,7 +779,17 @@ describe("work-log fields (PD-035)", () => {
   });
 
   it("Nhập công việc: the line goes into the chosen job (also a closed one); with own, only for myself", async () => {
-    const base = { projectId, jobId, processId, shiftId, qtyAssigned: 3, assignedAt: "2026-10-12T00:00:00+07:00", deadline: "2026-10-12T23:59:00+07:00", errorQty: 1 };
+    const base = {
+      projectId,
+      jobId,
+      processId,
+      shiftId,
+      qcId: checker,
+      qtyAssigned: 3,
+      assignedAt: "2026-10-12T00:00:00+07:00",
+      deadline: "2026-10-12T23:59:00+07:00",
+      errorQty: 1
+    };
     expect(await failure(createWorkEntry(contextWith(["STAFF"]), CreateWorkEntryRequestSchema.parse({ ...base, assigneeId: worker })))).toMatchObject({
       code: "FORBIDDEN",
       status: 403
@@ -642,6 +896,7 @@ describe("Link chia việc (PD-040)", () => {
       jobId,
       processId,
       shiftId,
+      qcId: checker,
       qtyAssigned: 3,
       assignedAt: "2026-10-12T00:00:00+07:00",
       deadline: "2026-10-12T23:59:00+07:00",
@@ -649,7 +904,7 @@ describe("Link chia việc (PD-040)", () => {
     });
     await createWorkEntry(contextWith(["STAFF"]), input);
     const [row] = callsLike(/^INSERT INTO production.tasks/)[0]!.values.find((value) => Array.isArray(value)) as Record<string, unknown>[];
-    expect(row).toMatchObject({ assigneeId: me, workLink: folder });
+    expect(row).toMatchObject({ assigneeId: me, qcId: checker, workLink: folder });
   });
 
   it("editing the link updates work_link and records a FIELD history row; null clears it; unchanged logs nothing", async () => {

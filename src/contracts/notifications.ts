@@ -34,6 +34,19 @@ export const notificationTypes = [
   "production.task_due_soon",
   "production.task_late",
   "production.qty_changed",
+  /**
+   * PD-044 quantity change requests. qty_change_requested → the job's Leader (no active Leader: production Admins);
+   * qty_change_decided → the worker who asked. Payload: task payload + { requestId, fromQty, toQty, reason, approved?,
+   * decisionNote? }. Target: productionTaskId.
+   */
+  "production.qty_change_requested",
+  "production.qty_change_decided",
+  /**
+   * PD-045: someone changed a job's status (the manual chip) → the job's active Leader and every production Account /
+   * Admin (organization superadmins included), never the person who changed it. Payload: { jobId, jobCode, jobName,
+   * from: { id, name, color }, to: { id, name, color } }. Target: jobId.
+   */
+  "production.job_status_changed",
   "production.feedback",
   "production.mentioned",
   "production.commented",

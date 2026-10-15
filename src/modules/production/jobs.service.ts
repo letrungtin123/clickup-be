@@ -21,7 +21,7 @@ import { getSql } from "../../db/client.js";
 import { AppError } from "../../lib/app-error.js";
 import { escapeLike, toIso, type QuerySql } from "../../lib/db-types.js";
 import type { AccessContext } from "../access/access-context.js";
-import { actsAsJobLeader, assertProductionMember, assertProductionRole, hasProductionRole, isProductionAdmin } from "./access.js";
+import { actsAsJobLeader, assertProductionMember, assertProductionRole, isProductionAdmin } from "./access.js";
 import { cursorInstantSql, decodeTimeCursor, encodeTimeCursor } from "./cursor.js";
 import { anyTagSql, customFieldFilterSql, resolveCustomFieldFilters, resolveCustomValues, setEntityTags } from "./custom-fields.js";
 import { syncJobChat } from "./job-chat.service.js";
@@ -38,9 +38,12 @@ import {
 import { jobStatusLogValue, loadJobStatus } from "./job-statuses.service.js";
 import {
   assertJobVisible,
+  isSubtaskRow,
   jobSelectSql,
+  lineFinishStatusIds,
   loadMemberRoles,
   loadWorkflowModel,
+  notSubtaskSql,
   relationOf,
   selectFeedbacks,
   selectTasks,
@@ -49,20 +52,75 @@ import {
   toJobStatusRef,
   toJobSummary,
   toProductionTasks,
+  withSubtasksAfterLines,
   type JobRow,
   type TaskRow
 } from "./jobs.repo.js";
-import { enqueueProductionEvents, feedbackEvent, jobLeaderAssignedEvent } from "./notifications.js";
+import { enqueueProductionEvents, feedbackEvent, jobLeaderAssignedEvent, jobStatusChangedEvent } from "./notifications.js";
 import { publishProductionChange } from "./realtime.js";
 import { insertTasks, loadJobForTasks, moveTasks, releaseParkedTasks, settleJob, softDeleteTasks, syncJobTotalImages } from "./tasks.service.js";
-import { allowedTransitions, statusByCode, statusById, systemOnlyTargetCodes, type Workflow } from "./workflow.js";
+import {
+  allowedTransitions,
+  jobLinesReady,
+  jobNotReadyMessage,
+  statusByCode,
+  statusById,
+  systemOnlyTargetCodes,
+  systemOnlyTargetMessage
+} from "./workflow.js";
 
 export { assertJobVisible };
 
 type In<T extends z.ZodTypeAny> = z.infer<T>;
 const jobNotFound = () => new AppError("JOB_NOT_FOUND", "Không tìm thấy job.", 404);
 
-const isAccountOrAdmin = (context: AccessContext) => isProductionAdmin(context) || hasProductionRole(context, "ACCOUNT");
+/**
+ * PD-045: the separate client-feedback feature ("Ghi feedback", "Giao lại", "Đóng feedback") is retired — it was never
+ * used; the owner handles client feedback with the job status "Feedback" and "Chia task" for the redo lines. Its
+ * endpoints refuse with 409 FEEDBACK_RETIRED (404 for non-members, like every production route) before reading the body;
+ * existing feedback rows are still read (job detail `feedbacks`). The service code below the guard is kept, unreachable.
+ */
+export const refuseRetiredFeedback = (context: AccessContext) => {
+  assertProductionMember(context);
+  throw new AppError(
+    "FEEDBACK_RETIRED",
+    "Tính năng ghi feedback đã bỏ — đổi trạng thái job sang “Feedback” và Chia task cho phần sửa.",
+    409
+  );
+};
+
+/**
+ * PD-045: whether a job may take `status`. A status with requiresAllChecked ("Đã xong") needs at least one live line and
+ * every live line finished (jobLinesReady: "Đã check" or later, a Checking line Done; subtasks follow their line) —
+ * otherwise 409 JOB_NOT_READY "Còn N task chưa check: #…" / "Job chưa có task nào.". `jobId` null: a job
+ * being created (no line yet). Callers hold the job's row lock, so no line moves in between.
+ */
+const assertJobStatusAllowed = async (
+  tx: QuerySql,
+  organizationId: string,
+  jobId: string | null,
+  status: { requiresAllChecked: boolean }
+) => {
+  if (!status.requiresAllChecked) {
+    return;
+  }
+  const lines = jobId
+    ? await tx<{ id: string; number: string | number; status_id: string; done_at: Date | null; is_checking: boolean }[]>`
+        SELECT t.id, t.number, t.status_id, t.done_at, pr.is_qc AS is_checking
+        FROM production.tasks t
+        JOIN production.processes pr ON pr.organization_id = t.organization_id AND pr.id = t.process_id
+        WHERE t.organization_id = ${organizationId} AND t.job_id = ${jobId} AND t.deleted_at IS NULL AND ${notSubtaskSql(tx)}
+      `
+    : [];
+  const workflow = await loadWorkflowModel(tx, organizationId);
+  const readiness = jobLinesReady(
+    workflow,
+    lines.map((line) => ({ id: line.id, number: Number(line.number), statusId: line.status_id, isChecking: line.is_checking, doneAt: line.done_at }))
+  );
+  if (!readiness.ready) {
+    throw new AppError("JOB_NOT_READY", jobNotReadyMessage(readiness)!, 409);
+  }
+};
 
 /** A named leader must hold LEADER; null = no leader (PD-035). */
 const assertLeader = async (sql: QuerySql, organizationId: string, leaderId: string | null) => {
@@ -196,7 +254,7 @@ const jobListFilterSql = (
       query.late
         ? sql`AND EXISTS (
             SELECT 1 FROM production.tasks t WHERE t.organization_id = j.organization_id AND t.job_id = j.id
-              AND t.is_late AND t.done_at IS NULL AND t.closed_at IS NULL AND t.deleted_at IS NULL)`
+              AND t.is_late AND t.done_at IS NULL AND t.closed_at IS NULL AND t.deleted_at IS NULL AND ${notSubtaskSql(sql)})`
         : sql``
     }
     ${query.tagId?.length ? sql`AND ${anyTagSql(sql, "JOB", "j.id", "j.organization_id", query.tagId)}` : sql``}
@@ -212,7 +270,7 @@ const jobListFilterSql = (
 const personTotals = async (sql: QuerySql, organizationId: string, personId: string, filters: ReturnType<typeof jobListFilterSql>): Promise<JobPersonTotals> => {
   const row = (
     await sql<{ job_count: number; task_count: number; qty_assigned: number; qty_done: number; qty_checked: number }[]>`
-      SELECT count(DISTINCT t.job_id)::int AS job_count, count(*)::int AS task_count,
+      SELECT count(DISTINCT t.job_id)::int AS job_count, count(*) FILTER (WHERE ${notSubtaskSql(sql)})::int AS task_count,
         coalesce(sum(t.qty_assigned), 0)::int AS qty_assigned,
         coalesce(sum(coalesce(t.qty_done, 0)) FILTER (WHERE t.done_at IS NOT NULL), 0)::int AS qty_done,
         coalesce(sum(coalesce(t.qty_done, 0)) FILTER (WHERE t.checked_at IS NOT NULL OR (tp.is_qc AND t.done_at IS NOT NULL)), 0)::int AS qty_checked
@@ -253,7 +311,10 @@ export const listJobs = async (context: AccessContext, query: JobQuery): Promise
     throw forbidden("Bạn không có quyền xem danh sách job.");
   }
   const cursor = decodeTimeCursor(query.cursor);
-  const plans = await resolveCustomFieldFilters(sql, organizationId, "JOB", query.cf);
+  const [plans, workflow] = await Promise.all([
+    resolveCustomFieldFilters(sql, organizationId, "JOB", query.cf),
+    loadWorkflowModel(sql, organizationId)
+  ]);
   const [rows, totals] = await Promise.all([
     sql<JobRow[]>`
       WITH page AS MATERIALIZED (
@@ -263,7 +324,7 @@ export const listJobs = async (context: AccessContext, query: JobQuery): Promise
         ORDER BY j.created_at DESC, j.id DESC
         LIMIT ${query.limit + 1}
       )
-      ${jobSelectSql(sql, query.personId)}
+      ${jobSelectSql(sql, lineFinishStatusIds(workflow), query.personId)}
       WHERE j.organization_id = ${organizationId} AND j.id IN (SELECT id FROM page)
       ORDER BY j.created_at DESC, j.id DESC
     `,
@@ -280,37 +341,31 @@ export const listJobs = async (context: AccessContext, query: JobQuery): Promise
   };
 };
 
-/** Job-level moves: every non-override, note-free move the caller may apply (never into FEEDBACK, BUG-PR-01). */
-const bulkActions = (workflow: Workflow, context: AccessContext, tasks: TaskRow[]) => {
-  const counts = new Map<string, number>();
-  for (const task of tasks) {
-    for (const option of allowedTransitions(workflow, task.status_id, relationOf(context, task))) {
-      const target = statusById(workflow, option.toStatusId);
-      // Bulk moves never need per-task input: no notes (QC fail, overrides) and no Done quantities.
-      if (!target || option.override || option.requiresNote || target.countsDone || systemOnlyTargetCodes.has(target.code)) {
-        continue;
-      }
-      counts.set(target.id, (counts.get(target.id) ?? 0) + 1);
-    }
-  }
-  return [...counts]
-    .map(([toStatusId, taskCount]) => ({ toStatusId, name: statusById(workflow, toStatusId)!.name, taskCount }))
-    .sort((a, b) => statusById(workflow, a.toStatusId)!.sortOrder - statusById(workflow, b.toStatusId)!.sortOrder);
-};
-
+/**
+ * GET /production/jobs/:jobId. PD-045: the job's only status is the manual chip (`jobStatus`, with `uncheckedTaskCount`
+ * for a requiresAllChecked status), so `bulkActions` is always empty (the line workflow stops at "Đã check"), and the
+ * retired feedback feature is never offered (`canFeedback` / `canCloseFeedback` false; existing `feedbacks` still read).
+ */
 export const getJobDetail = async (context: AccessContext, jobId: string, sql: QuerySql = getSql()): Promise<JobDetail> => {
   assertProductionMember(context);
   const organizationId = context.organization.id;
-  const row = (await sql<JobRow[]>`${jobSelectSql(sql)} WHERE j.organization_id = ${organizationId} AND j.id = ${jobId} AND j.deleted_at IS NULL`)[0];
+  // Cached per organization (PERF-14): the job row needs its finished-line statuses (uncheckedTaskCount).
+  const workflow = await loadWorkflowModel(sql, organizationId);
+  const row = (
+    await sql<JobRow[]>`
+      ${jobSelectSql(sql, lineFinishStatusIds(workflow))} WHERE j.organization_id = ${organizationId} AND j.id = ${jobId} AND j.deleted_at IS NULL
+    `
+  )[0];
   if (!row) {
     throw jobNotFound();
   }
-  const [taskRows, feedbackRows, workflow, scopes] = await Promise.all([
+  const [rows, feedbackRows, scopes] = await Promise.all([
     sql<TaskRow[]>`${taskSelectSql(sql)} WHERE t.organization_id = ${organizationId} AND t.job_id = ${jobId} ORDER BY t.created_at, t.number`,
     selectFeedbacks(sql, organizationId, jobId),
-    loadWorkflowModel(sql, organizationId),
     loadJobScopes(sql, context)
   ]);
+  // Every row, each line followed by its subtasks (PD-044; the FE nests them by parentTaskId).
+  const taskRows = withSubtasksAfterLines(rows);
   const me = context.user.id;
   const involved = taskRows.some((task) => task.assignee_id === me || task.qc_id === me);
   const leads = leadsForView(context, row.leader_id);
@@ -331,11 +386,13 @@ export const getJobDetail = async (context: AccessContext, jobId: string, sql: Q
       canSplit: !archived && scopes.create !== "none",
       splitOwnOnly: scopes.create === "own",
       canDelete: !archived && wholeJobAllowed(scopes.delete, assignees, me),
-      canFeedback: !archived && isAccountOrAdmin(context) && taskRows.some((task) => task.status_code === "DELIVERING"),
-      canCloseFeedback: !archived && isAccountOrAdmin(context) && feedbackRows.some((feedback) => feedback.status !== "RESOLVED"),
+      // Retired with the separate feedback feature (PD-045).
+      canFeedback: false,
+      canCloseFeedback: false,
       canArchive: scopes.update === "all",
       canChangeStatus: !archived && jobStatusChangeAllowed(scopes.update, { assignee: assignees.includes(me), leads }),
-      bulkActions: archived ? [] : bulkActions(workflow, context, taskRows)
+      // PD-045: no job-level line moves any more ("Complete cả gói" is gone); the job's status is the manual chip.
+      bulkActions: []
     }
   };
 };
@@ -344,7 +401,8 @@ export const getJobDetail = async (context: AccessContext, jobId: string, sql: Q
 
 /**
  * POST /production/jobs — a job without lines ("create: all", PD-036; with "own" a job is created only together with
- * one's own line through "Nhập công việc").
+ * one's own line through "Nhập công việc"). PD-045: a new job has no line yet, so a status with requiresAllChecked
+ * ("Đã xong") is refused (409 JOB_NOT_READY "Job chưa có task nào.").
  */
 export const createJob = async (context: AccessContext, input: CreateJobRequest) => {
   assertProductionMember(context);
@@ -365,6 +423,9 @@ export const createJob = async (context: AccessContext, input: CreateJobRequest)
     const customValues = await resolveCustomValues(tx, organizationId, "JOB", input.customValues, { enforceRequired: true });
     // PD-038: the chosen "Trạng thái", otherwise the first status by position (filled by the jobs_default_job_status trigger).
     const jobStatus = input.jobStatusId ? await loadJobStatus(tx, organizationId, input.jobStatusId) : null;
+    if (jobStatus) {
+      await assertJobStatusAllowed(tx, organizationId, null, jobStatus);
+    }
     const created = (
       await tx<{ id: string }[]>`
         INSERT INTO production.jobs (organization_id, project_id, code, name, leader_id, received_at, deadline, total_images, total_images_manual,
@@ -405,7 +466,7 @@ export const updateJob = async (context: AccessContext, jobId: string, input: Up
     // PD-036 "update": every job, or with "own" a job whose lines are all mine; the leader and archiving need "all".
     const scopes = await assertJobVisible(tx, context, jobId);
     if (!wholeJobAllowed(scopes.update, await jobAssignees(tx, organizationId, jobId), context.user.id)) {
-      throw forbidden(scopes.update === "own" ? "Bạn chỉ sửa được job mà mọi dòng công việc đều của bạn." : "Bạn không có quyền sửa job.");
+      throw forbidden(scopes.update === "own" ? "Bạn chỉ sửa được job mà mọi task đều của bạn." : "Bạn không có quyền sửa job.");
     }
     if (((input.leaderId !== undefined && input.leaderId !== job.leader_id) || input.archived !== undefined) && scopes.update !== "all") {
       throw forbidden("Chỉ người có quyền sửa mọi job mới đổi Leader hoặc lưu trữ / khôi phục job.");
@@ -498,7 +559,12 @@ export const updateJob = async (context: AccessContext, jobId: string, input: Up
  * PATCH /production/jobs/:jobId/status — the manual job status (PD-038), separate from the line workflow (PD-014, which
  * it never touches). Allowed with "update: all", or "own" when the caller is the assignee of a live line of the job or its
  * leader (ADMIN always: its scopes are "all"); anyone else 403 (404 when they cannot see the job). Archived jobs are
- * read-only. The change is a JOB history row (who, from → to, when) and a live-sync hint; no notification.
+ * read-only. The change is a JOB history row (who, from → to, when) and a live-sync hint.
+ *
+ * PD-045: a status with requiresAllChecked ("Đã xong") only when the job has a line and every live line is "Đã check"
+ * (a Checking line: Done) — else 409 JOB_NOT_READY (assertJobStatusAllowed, under the job's row lock). A real change
+ * enqueues `production.job.status_changed` in the same transaction (→ the job's Leader and the production Account /
+ * Admin people, never the actor).
  */
 export const changeJobStatus = async (context: AccessContext, jobId: string, input: UpdateJobStatusRequest) => {
   assertProductionMember(context);
@@ -531,6 +597,7 @@ export const changeJobStatus = async (context: AccessContext, jobId: string, inp
     if (target.id === job.job_status_id) {
       return false;
     }
+    await assertJobStatusAllowed(tx, organizationId, jobId, target);
     const previous = await loadJobStatus(tx, organizationId, job.job_status_id);
     await tx`
       UPDATE production.jobs SET job_status_id = ${target.id}, updated_at = now()
@@ -540,6 +607,7 @@ export const changeJobStatus = async (context: AccessContext, jobId: string, inp
       INSERT INTO production.task_logs (organization_id, task_id, job_id, user_id, action, from_value, to_value)
       VALUES (${organizationId}, NULL, ${jobId}, ${context.user.id}, 'JOB', ${tx.json(jobStatusLogValue(previous))}, ${tx.json(jobStatusLogValue(target))})
     `;
+    await enqueueProductionEvents(tx, [jobStatusChangedEvent(organizationId, jobId, context.user.id, previous, target)]);
     return true;
   });
   if (changed) {
@@ -572,10 +640,12 @@ export const listJobOptions = async (context: AccessContext, query: JobOptionsQu
       job_status_name: string;
       job_status_color: string;
       job_status_closed: boolean;
+      job_status_requires_all_checked: boolean;
     }[]
   >`
     SELECT j.id, j.code, j.project_id, j.deadline,
-      js.id AS job_status_id, js.name AS job_status_name, js.color AS job_status_color, js.is_closed AS job_status_closed
+      js.id AS job_status_id, js.name AS job_status_name, js.color AS job_status_color, js.is_closed AS job_status_closed,
+      js.requires_all_checked AS job_status_requires_all_checked
     FROM production.jobs j
     JOIN production.job_statuses js ON js.organization_id = j.organization_id AND js.id = j.job_status_id
     WHERE j.organization_id = ${organizationId} AND j.project_id = ${query.projectId}
@@ -617,7 +687,7 @@ export const deleteJob = async (context: AccessContext, jobId: string): Promise<
     ).map((row) => row.id);
     const tasks = await selectTasks(tx, organizationId, ids);
     if (!wholeJobAllowed(scopes.delete, tasks.map((task) => task.assignee_id), context.user.id)) {
-      throw forbidden(scopes.delete === "own" ? "Bạn chỉ xoá được job mà mọi dòng công việc đều của bạn." : "Bạn không có quyền xoá job.");
+      throw forbidden(scopes.delete === "own" ? "Bạn chỉ xoá được job mà mọi task đều của bạn." : "Bạn không có quyền xoá job.");
     }
     const reversedEntries = await softDeleteTasks(tx, organizationId, context.user.id, tasks, { withJob: true });
     await tx`
@@ -636,9 +706,23 @@ export const deleteJob = async (context: AccessContext, jobId: string): Promise<
   return { jobId, deletedTasks: result.deletedTasks, reversedEntries: result.reversedEntries };
 };
 
-/** Job-level move (e.g. Complete → Delivering → Delivered): every task the caller may move to that status. */
+/**
+ * POST /production/jobs/:jobId/transition — a job-level line move. PD-045 retired it with "Complete cả gói": the job's
+ * status is the manual chip (PATCH …/status), the line workflow stops at "Đã check" and `bulkActions` is always empty.
+ * Anyone but a production ADMIN (superadmins included) gets 409 JOB_TRANSITION_RETIRED. An ADMIN may still apply one
+ * listed move (never an override, never one needing a note, never into a Done status or FEEDBACK) to every line it fits;
+ * subtasks follow their line. With the transitions after "Đã check" deleted, nothing reaches Complete or later this way
+ * (409 NOTHING_TO_MOVE) — an ADMIN moves a single line there with an override (POST …/tasks/:id/transition).
+ */
 export const transitionJob = async (context: AccessContext, jobId: string, input: { toStatusId: string; note?: string | undefined }) => {
   assertProductionMember(context);
+  if (!isProductionAdmin(context)) {
+    throw new AppError(
+      "JOB_TRANSITION_RETIRED",
+      "Không chuyển trạng thái cả job theo task nữa — đổi trạng thái job ở chip “Trạng thái job”; các task dừng ở Đã check.",
+      409
+    );
+  }
   const organizationId = context.organization.id;
   const sql = getSql();
   const moved = await sql.begin(async (tx) => {
@@ -650,7 +734,7 @@ export const transitionJob = async (context: AccessContext, jobId: string, input
       throw new AppError("TRANSITION_NOT_ALLOWED", "Không thể chuyển cả job sang trạng thái này.", 400);
     }
     if (systemOnlyTargetCodes.has(target.code)) {
-      throw new AppError("TRANSITION_NOT_ALLOWED", `Chỉ hệ thống chuyển task sang "${target.name}" — dùng "Ghi feedback" trên job.`, 400);
+      throw new AppError("TRANSITION_NOT_ALLOWED", systemOnlyTargetMessage(target.name), 400);
     }
     const ids = (
       await tx<{ id: string }[]>`
@@ -658,26 +742,34 @@ export const transitionJob = async (context: AccessContext, jobId: string, input
         ORDER BY created_at FOR UPDATE
       `
     ).map((row) => row.id);
-    const eligible = (await selectTasks(tx, organizationId, ids)).filter((task) => {
-      const option = allowedTransitions(workflow, task.status_id, relationOf(context, task)).find((item) => item.toStatusId === target.id);
-      return option !== undefined && !option.override && !option.requiresNote;
-    });
+    const rows = await selectTasks(tx, organizationId, ids);
+    const eligible = rows
+      .filter((task) => !isSubtaskRow(task))
+      .filter((task) => {
+        const option = allowedTransitions(workflow, task.status_id, relationOf(context, task), "job").find((item) => item.toStatusId === target.id);
+        return option !== undefined && !option.override && !option.requiresNote;
+      });
     if (eligible.length === 0) {
       throw new AppError("NOTHING_TO_MOVE", `Không có task nào bạn chuyển được sang "${target.name}".`, 409);
     }
-    // One UPDATE + one history insert for the whole job (PERF-15).
+    // One UPDATE + one history insert for the whole job (PERF-15); subtasks move with their line.
     await moveTasks(tx, organizationId, workflow, eligible, target, context.user.id, input.note?.trim() || null);
     await settleJob(tx, organizationId, workflow, jobId);
-    return eligible.map((task) => task.id);
+    const movedLines = new Set(eligible.map((task) => task.id));
+    return {
+      lines: movedLines.size,
+      taskIds: [...movedLines, ...rows.filter((task) => isSubtaskRow(task) && movedLines.has(task.parent_task_id!)).map((task) => task.id)]
+    };
   });
-  publishProductionChange(organizationId, jobId, moved, "tasks", context.user.id);
-  return { moved: moved.length, job: await getJobDetail(context, jobId) };
+  publishProductionChange(organizationId, jobId, moved.taskIds, "tasks", context.user.id);
+  return { moved: moved.lines, job: await getJobDetail(context, jobId) };
 };
 
-// Feedback ------------------------------------------------------------------------------------------------
+// Feedback (retired, PD-045: every entry point refuses with 409 FEEDBACK_RETIRED — refuseRetiredFeedback) ---------------
 
 /** Account records client feedback: delivering tasks park in FEEDBACK until the re-done work is checked. */
 export const createFeedback = async (context: AccessContext, jobId: string, input: In<typeof CreateFeedbackRequestSchema>) => {
+  refuseRetiredFeedback(context);
   assertProductionRole(context, "ACCOUNT");
   const organizationId = context.organization.id;
   const sql = getSql();
@@ -729,6 +821,7 @@ export const createFeedback = async (context: AccessContext, jobId: string, inpu
 
 /** "Giao lại": the job leader creates FB tasks (default assignee = the original one, chosen in the form). */
 export const reassignFeedback = async (context: AccessContext, feedbackId: string, input: In<typeof ReassignFeedbackRequestSchema>) => {
+  refuseRetiredFeedback(context);
   assertProductionMember(context);
   const organizationId = context.organization.id;
   const sql = getSql();
@@ -773,6 +866,7 @@ export const reassignFeedback = async (context: AccessContext, feedbackId: strin
  * progress keep their own flow (the Leader completes them as usual).
  */
 export const closeFeedback = async (context: AccessContext, feedbackId: string, input: In<typeof CloseFeedbackRequestSchema>) => {
+  refuseRetiredFeedback(context);
   assertProductionRole(context, "ACCOUNT");
   const organizationId = context.organization.id;
   const sql = getSql();

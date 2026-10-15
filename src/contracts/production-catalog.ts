@@ -181,8 +181,13 @@ export type JobPermissionMatrix = z.infer<typeof JobPermissionMatrixSchema>;
 const allScopes: JobScopes = { view: "all", create: "all", update: "all", delete: "all" };
 const ownScopes: JobScopes = { view: "own", create: "own", update: "own", delete: "own" };
 const noScopes: JobScopes = { view: "none", create: "none", update: "none", delete: "none" };
-/** The owner's defaults (seeded by migration 20261013_0110). */
-export const defaultJobPermissions: JobPermissionMatrix = { ACCOUNT: allScopes, LEADER: allScopes, QC: ownScopes, STAFF: ownScopes };
+/**
+ * PD-047: staff see every job and update their own tasks but neither enter work ("Nhập công việc", "Chia task") nor delete
+ * tasks — deleting their own subtasks before Done stays allowed whatever the delete scope (subtaskDeleteAllowed).
+ */
+const staffScopes: JobScopes = { view: "all", create: "none", update: "own", delete: "none" };
+/** The owner's defaults (seeded by migration 20261013_0110; STAFF by 20261015_0200, PD-047). */
+export const defaultJobPermissions: JobPermissionMatrix = { ACCOUNT: allScopes, LEADER: allScopes, QC: ownScopes, STAFF: staffScopes };
 
 const scopeRank: Record<JobPermissionScope, number> = { none: 0, own: 1, all: 2 };
 /** The more permissive of two scopes. */
@@ -545,6 +550,8 @@ export const JobStatusSchema = z.object({
   color: Color,
   position: z.number().int(),
   isClosed: z.boolean(),
+  /** PD-045: chosen only when every line of the job is "Đã check" (a Checking line: Done) — e.g. "Đã xong". */
+  requiresAllChecked: z.boolean(),
   /** Jobs (not deleted) in this status; null for non-admins (the settings page shows it). */
   jobCount: z.number().int().nullable(),
   /** Last change of the status (like settings' updated_by / updated_at); updatedBy null = migration / system. */
@@ -557,11 +564,21 @@ export type JobStatusCollection = z.infer<typeof JobStatusCollectionSchema>;
 
 const JobStatusName = SafeText().trim().min(1, "Nhập tên trạng thái.").max(jobStatusNameMaxLength);
 export const CreateJobStatusRequestSchema = z
-  .object({ name: JobStatusName, color: Color.default("slate"), isClosed: z.boolean().default(false) })
+  .object({
+    name: JobStatusName,
+    color: Color.default("slate"),
+    isClosed: z.boolean().default(false),
+    requiresAllChecked: z.boolean().default(false)
+  })
   .strict();
 export type CreateJobStatusRequest = z.infer<typeof CreateJobStatusRequestSchema>;
 export const UpdateJobStatusRequestSchema = z
-  .object({ name: JobStatusName.optional(), color: Color.optional(), isClosed: z.boolean().optional() })
+  .object({
+    name: JobStatusName.optional(),
+    color: Color.optional(),
+    isClosed: z.boolean().optional(),
+    requiresAllChecked: z.boolean().optional()
+  })
   .strict()
   .refine((value) => Object.values(value).some((entry) => entry !== undefined), { message: "Gửi ít nhất một trường cần sửa." });
 export type UpdateJobStatusRequest = z.infer<typeof UpdateJobStatusRequestSchema>;

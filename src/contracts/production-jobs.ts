@@ -24,7 +24,14 @@ export const ProductionStatusRefSchema = z.object({ id: Id, code: z.string(), na
 export type ProductionStatusRef = z.infer<typeof ProductionStatusRefSchema>;
 
 /** A job's manual status (PD-038, catalog in production-catalog JobStatusSchema). */
-export const JobStatusRefSchema = z.object({ id: Id, name: z.string(), color: Color, isClosed: z.boolean() });
+export const JobStatusRefSchema = z.object({
+  id: Id,
+  name: z.string(),
+  color: Color,
+  isClosed: z.boolean(),
+  /** PD-045: chosen only when every line of the job is "Đã check" (e.g. "Đã xong"). */
+  requiresAllChecked: z.boolean()
+});
 export type JobStatusRef = z.infer<typeof JobStatusRefSchema>;
 
 export const TaskKindSchema = z.enum(["NORMAL", "FB_WRONG", "FB_EXTRA"]);
@@ -44,9 +51,55 @@ export const TaskTransitionOptionSchema = z.object({
 });
 export type TaskTransitionOption = z.infer<typeof TaskTransitionOptionSchema>;
 
-export const ProductionTaskSchema = z.object({
+/**
+ * PD-044: a worker's request to change the quantity the Leader gave on a line ("Số lượng giao", the total of the line
+ * and its subtasks). The job's Leader — or anyone with "update: all" (Account / Admin) — approves or rejects it; until
+ * then the line keeps its quantity. One PENDING request per line.
+ */
+export const TaskQtyRequestSchema = z.object({
+  id: Id,
+  taskId: Id,
+  /** The total when asked, and the total asked for. */
+  fromQty: z.number().int(),
+  toQty: z.number().int(),
+  reason: z.string(),
+  status: z.enum(["PENDING", "APPROVED", "REJECTED", "CANCELLED"]),
+  requestedBy: UserRefSchema.nullable(),
+  createdAt: IsoDate,
+  decidedBy: UserRefSchema.nullable(),
+  decidedAt: IsoDate.nullable(),
+  decisionNote: z.string().nullable()
+});
+export type TaskQtyRequest = z.infer<typeof TaskQtyRequestSchema>;
+
+/**
+ * PD-044: a subtask as its parent line lists it. A subtask is part of the line's images done in another process
+ * ("Công đoạn"), split off by the worker with a reason: same person, QC, shift and dates as the line; its quantity is
+ * taken from the line (the total the Leader gave stays the same) and its status always follows the line's.
+ */
+export const ProductionSubtaskSchema = z.object({
   id: Id,
   number: z.number().int(),
+  /** Display code: its line's number + a letter, e.g. "1216a" (PD-045). */
+  code: z.string(),
+  process: z.object({ id: Id, name: z.string() }),
+  qtyAssigned: z.number().int(),
+  qtyDone: z.number().int().nullable(),
+  reason: z.string().nullable(),
+  createdBy: UserRefSchema.nullable(),
+  createdAt: IsoDate
+});
+export type ProductionSubtask = z.infer<typeof ProductionSubtaskSchema>;
+
+export const ProductionTaskSchema = z.object({
+  id: Id,
+  /** Internal sequence number; show `code` instead. */
+  number: z.number().int(),
+  /**
+   * PD-045 display code ("#" + code in the UI): a line's number ("1216"); a subtask's line number + a letter in creation
+   * order ("1216a", "1216b", …, letters never reused).
+   */
+  code: z.string(),
   jobId: Id,
   /** The job's "Gói công việc" (work package, PD-035). */
   jobCode: z.string(),
@@ -69,7 +122,21 @@ export const ProductionTaskSchema = z.object({
   checkedAt: IsoDate.nullable(),
   status: ProductionStatusRefSchema,
   kind: TaskKindSchema,
+  /** Feedback redo task: its source task. Subtask (PD-044, `isSubtask`): its line. */
   parentTaskId: Id.nullable(),
+  /** PD-044: part of a line done in another process; status follows `parentTaskId`'s, no moves of its own. */
+  isSubtask: z.boolean(),
+  /** Subtask: why the worker split it off (PD-044). */
+  splitReason: z.string().nullable(),
+  /** A line's subtasks (always empty on a subtask or a feedback redo task), oldest first. */
+  subtasks: z.array(ProductionSubtaskSchema),
+  /**
+   * "Số lượng Leader giao": this line's quantity plus its subtasks' (= qtyAssigned when it has none). A subtask: its
+   * own quantity.
+   */
+  allocatedQty: z.number().int(),
+  /** The open quantity change request of the line (PD-044), if any. */
+  pendingQtyRequest: TaskQtyRequestSchema.nullable(),
   feedbackId: Id.nullable(),
   note: z.string().nullable(),
   /** "Link chia việc" (PD-040): link or folder path of the images given to the assignee; any text, null = none. */
@@ -102,9 +169,23 @@ export const ProductionTaskSchema = z.object({
     canAssign: z.boolean(),
     /** Give the line to someone else ("update: all", before Done). */
     canChangeAssignee: z.boolean(),
-    /** Correct the Done quantity after Done ("update: all"; scores are adjusted). */
+    /**
+     * Correct the Done quantity after Done (scores are adjusted): the assignee until the line is "Đã check" (PD-044),
+     * "update: all" at any time. Subtasks have their own Done quantity.
+     */
     canEditQty: z.boolean(),
-    /** Delete the line (its points are reversed, PD-036). */
+    /**
+     * Change "Số lượng giao" directly, before Done (PD-044): the job's Leader or "update: all". On a subtask the
+     * quantity moves between it and its line (the line keeps at least 1).
+     */
+    canEditQtyAssigned: z.boolean(),
+    /** Ask the Leader to change "Số lượng giao" (PD-044): the assignee without a direct right, before Done, no open request. */
+    canRequestQty: z.boolean(),
+    /** Approve / reject the open quantity request: the job's Leader, or "update: all" (PD-044). */
+    canDecideQtyRequest: z.boolean(),
+    /** Split part of the line off as a subtask (PD-044): its assignee, Leader or "update: all"; a NORMAL work line before Done. */
+    canCreateSubtask: z.boolean(),
+    /** Delete the line (its points are reversed, PD-036). A subtask gives its quantity back to its line. */
     canDelete: z.boolean()
   })
 });
@@ -164,10 +245,42 @@ export const TransitionTaskRequestSchema = z
     note: SafeText().trim().max(5000).optional(),
     qtyDone: z.number().int().min(0).max(1_000_000).optional(),
     /** Optional, also on the OT shift (PD-035): omitted keeps the line's own "Giờ OT". */
-    otHours: OtHours.optional()
+    otHours: OtHours.optional(),
+    /**
+     * Entering Done with subtasks (PD-044): the Done quantity of each subtask (default: its qtyAssigned). Subtasks move
+     * with their line; they are never moved on their own.
+     */
+    subtaskQtyDone: z
+      .array(z.object({ taskId: Id, qtyDone: z.number().int().min(0).max(1_000_000) }).strict())
+      .max(50)
+      .optional()
   })
   .strict();
 export type TransitionTaskRequest = z.infer<typeof TransitionTaskRequestSchema>;
+
+/** POST /production/tasks/:taskId/subtasks (PD-044): split `qtyAssigned` of the line off into another process. */
+export const CreateSubtaskRequestSchema = z
+  .object({
+    processId: Id,
+    qtyAssigned: z.number().int().min(1).max(1_000_000),
+    /** Optional (PD-045); empty = none. */
+    reason: SafeText().trim().max(2000).optional()
+  })
+  .strict();
+export type CreateSubtaskRequest = z.infer<typeof CreateSubtaskRequestSchema>;
+
+/** POST /production/tasks/:taskId/qty-requests (PD-044): the new total ("Số lượng giao") and why. */
+export const CreateQtyRequestSchema = z
+  .object({
+    qtyAssigned: z.number().int().min(1).max(1_000_000),
+    reason: SafeText().trim().min(1, "Nhập lý do sửa số tấm.").max(2000)
+  })
+  .strict();
+export type CreateQtyRequest = z.infer<typeof CreateQtyRequestSchema>;
+
+/** POST /production/qty-requests/:requestId/decision (PD-044). A rejection should say why (note). */
+export const DecideQtyRequestSchema = z.object({ approve: z.boolean(), note: SafeText().trim().max(2000).optional() }).strict();
+export type DecideQtyRequest = z.infer<typeof DecideQtyRequestSchema>;
 
 export const UpdateTaskQtyRequestSchema = z
   .object({ qtyDone: z.number().int().min(0).max(1_000_000), note: SafeText().trim().max(5000).optional() })
@@ -297,6 +410,16 @@ export const JobSummarySchema = z.object({
    * null = no line yet, PD-014). Kept for the feedback logic and deadline countdowns; not shown as the job's status.
    */
   status: ProductionStatusRefSchema.nullable(),
+  /**
+   * PD-045: live lines (subtasks follow their line) not yet "Đã check" (a Checking line: not Done). A job status with
+   * requiresAllChecked can be chosen only when this is 0 and the job has a line (taskCount > 0).
+   */
+  uncheckedTaskCount: z.number().int(),
+  /**
+   * PD-048 "Tổng tấm" per process ("Công đoạn"): images given over the live work tasks of the job, subtasks counted under
+   * their own process, Checking tasks left out (same tasks as qtyAssigned) — largest first, then by name.
+   */
+  processTotals: z.array(z.object({ process: z.object({ id: Id, name: z.string() }), qty: z.number().int() })),
   /** Image totals of normal tasks only (feedback redo tasks are extra work, not part of total_images). */
   qtyAssigned: z.number().int(),
   qtyDone: z.number().int(),
@@ -324,7 +447,13 @@ export const JobBulkActionSchema = z.object({
   toStatusId: Id,
   name: z.string(),
   /** How many tasks of the job this would move. */
-  taskCount: z.number().int()
+  taskCount: z.number().int(),
+  /**
+   * PD-044 "Complete cả gói": only when every line is "Đã check" (a Checking line: Done; subtasks follow their line).
+   * Otherwise the action is listed but blocked: why (e.g. "Còn 3 task chưa check") and which lines hold it up.
+   */
+  blockedReason: z.string().nullable(),
+  blockedTaskIds: z.array(Id)
 });
 
 export const JobDetailSchema = JobSummarySchema.extend({
@@ -342,8 +471,9 @@ export const JobDetailSchema = JobSummarySchema.extend({
     splitOwnOnly: z.boolean(),
     /** Delete the job and all its lines ("delete: all", or "own" when every line is mine). */
     canDelete: z.boolean(),
+    /** Retired with the separate feedback feature (PD-045): always false. */
     canFeedback: z.boolean(),
-    /** "Đóng feedback, không cần làm lại" on an open feedback (Account / Admin). */
+    /** Retired with the separate feedback feature (PD-045): always false. */
     canCloseFeedback: z.boolean(),
     /** Archive / restore ("update: all"). */
     canArchive: z.boolean(),
@@ -352,7 +482,10 @@ export const JobDetailSchema = JobSummarySchema.extend({
      * or its leader; ADMIN always. Not on archived jobs.
      */
     canChangeStatus: z.boolean(),
-    /** Job-level moves (e.g. Complete → Delivering → Delivered) the caller may apply to all eligible tasks. */
+    /**
+     * Job-level line moves. PD-045: the job's only status is the manual chip (jobStatus); the line workflow stops at
+     * "Đã check", so this is always empty.
+     */
     bulkActions: z.array(JobBulkActionSchema)
   })
 });
@@ -402,12 +535,8 @@ const JobFields = {
   deadline: IsoDateInput,
   /** "Tổng tấm" typed by the user; null / omitted = the sum of the job's NORMAL lines, kept in sync. */
   totalImages: z.number().int().min(0).max(1_000_000).nullable().optional(),
-  driveLink: SafeText()
-    .trim()
-    .max(2000)
-    .regex(/^https?:\/\//i, "Link phải bắt đầu bằng http:// hoặc https://")
-    .nullable()
-    .optional(),
+  /** "Link thư mục ảnh": a web link or a folder path (PD-046, same rule as "Link chia việc"); null / "" = none. */
+  driveLink: WorkLinkSchema.nullable().optional(),
   customValues: CustomValuesSchema.optional(),
   tagIds: z.array(Id).max(50).optional()
 };
@@ -565,6 +694,8 @@ export const TaskLogSchema = z.object({
   /** null for a job-level row (action JOB). */
   taskId: Id.nullable(),
   taskNumber: z.number().int().nullable(),
+  /** The task's display code ("1216" / "1216a", PD-045); null for a job-level row. */
+  taskCode: z.string().nullable(),
   user: UserRefSchema.nullable(),
   /**
    * JOB: an edit of the job itself (job timeline only). fromValue / toValue hold just the changed fields among
@@ -576,8 +707,16 @@ export const TaskLogSchema = z.object({
    * them).
    * DELETE: the line was deleted (PD-036); toValue holds { reversedEntries } (score rows brought back to zero) and,
    * when it was part of deleting the whole job, { withJob: true }. A deleted job adds a JOB row { deleted: true }.
+   * SUBTASK (PD-044), on the LINE's history (taskId = the line): toValue { op: "created" | "updated" | "deleted",
+   * subtaskId, subtaskNumber, subtaskCode ("1216a", PD-045; older rows may lack it), processId, processName, qtyAssigned,
+   * parentQtyAssigned } (fromValue the values before for "updated"); note = the reason given when it was created (may be
+   * null, PD-045).
+   * FIELD rows hold the changed fields' old / new values on both sides, e.g. { workLink: "old" } → { workLink: "new" }.
+   * QTY_REQUEST (PD-044): toValue { op: "requested" | "approved" | "rejected" | "cancelled", requestId, fromQty, toQty };
+   * note = the worker's reason ("requested") or the decision note.
+   * STATUS into REWORK carries { qcFail: true } and the QC's reason as note (unchanged from the QC fail of PD-014).
    */
-  action: z.enum(["CREATE", "STATUS", "QTY", "ASSIGN", "NOTE", "FIELD", "JOB", "DELETE"]),
+  action: z.enum(["CREATE", "STATUS", "QTY", "ASSIGN", "NOTE", "FIELD", "JOB", "DELETE", "SUBTASK", "QTY_REQUEST"]),
   fromValue: z.record(z.string(), z.unknown()).nullable(),
   toValue: z.record(z.string(), z.unknown()).nullable(),
   note: z.string().nullable(),
@@ -593,6 +732,10 @@ export const ProductionTimelineItemSchema = z.discriminatedUnion("kind", [
 export const ProductionTimelinePageSchema = createCursorPageSchema(ProductionTimelineItemSchema);
 export type ProductionTimelinePage = z.infer<typeof ProductionTimelinePageSchema>;
 export const ProductionTimelineQuerySchema = z.object({
+  /** "logs": history rows only (the job page's "Nhật ký", PD-044); default both comments and history. */
+  only: z.enum(["all", "logs"]).default("all"),
+  /** Job timeline, "logs" only: one line's history (its subtasks' SUBTASK rows are on the line already). */
+  taskId: Id.optional(),
   cursor: SafeText().max(500).optional(),
   limit: z.coerce.number().int().min(1).max(100).default(50)
 });

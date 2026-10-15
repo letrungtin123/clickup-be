@@ -29,6 +29,7 @@ import {
   type SummaryEntry,
   type TargetVersion
 } from "./scoring.js";
+import { parentNumberSql, taskCode } from "./task-codes.js";
 import { addDays, businessDay, isValidDay, startOfBusinessDay } from "./time.js";
 
 /** Personal scores, KPI forecast and the public board (SPEC Phase 3 §3–§4). Rules: scoring.ts. */
@@ -60,6 +61,9 @@ type EntryRow = {
   role: ScoreRole;
   task_id: string;
   task_number: string;
+  /** The line number of a subtask (null otherwise) and the subtask's letter index — for the display code. */
+  task_parent_number: string | null;
+  task_sub_seq: number | null;
   job_id: string;
   job_code: string;
   project_id: string;
@@ -85,7 +89,13 @@ type EntryRow = {
 const toEntry = (row: EntryRow): ScoreEntry => ({
   id: row.id,
   role: row.role,
-  task: { id: row.task_id, number: Number(row.task_number), jobId: row.job_id, jobCode: row.job_code },
+  task: {
+    id: row.task_id,
+    number: Number(row.task_number),
+    code: taskCode({ number: row.task_number, subSeq: row.task_sub_seq, parentNumber: row.task_parent_number }),
+    jobId: row.job_id,
+    jobCode: row.job_code
+  },
   project: { id: row.project_id, code: row.project_code },
   process: row.process_id && row.process_name !== null ? { id: row.process_id, name: row.process_name } : null,
   shift: { id: row.shift_id, name: row.shift_name },
@@ -146,7 +156,8 @@ const selectEntryPage = (
   range: { from: string; to: string },
   page: { cursor: { at: string; id: string } | null; limit: number }
 ) => sql<EntryRow[]>`
-  SELECT e.id, e.role, e.task_id, t.number::text AS task_number, e.job_id, j.code AS job_code, e.project_id, p.code AS project_code,
+  SELECT e.id, e.role, e.task_id, t.number::text AS task_number, (${parentNumberSql(sql)})::text AS task_parent_number,
+    t.sub_seq AS task_sub_seq, e.job_id, j.code AS job_code, e.project_id, p.code AS project_code,
     e.process_id, pr.name AS process_name, e.shift_id, s.name AS shift_name, e.pay_mode, e.kind, e.qty,
     e.unit_credits::text AS unit_credits, e.credits::text AS credits, e.money::text AS money, e.credit_rule_id,
     to_char(e.business_day, 'YYYY-MM-DD') AS business_day, to_char(e.period_month, 'YYYY-MM') AS period,
@@ -426,7 +437,8 @@ export const getTaskScores = async (context: AccessContext, taskId: string): Pro
   // SEC2-04: the job leader's view of everyone's rows ends with the LEADER role (a job without a leader: every Leader, PD-035).
   const everyone = settings.scoresPublic || admin || actsAsJobLeader(context, task.job_leader_id);
   const rows = await sql<(EntryRow & { owner: UserRefJson })[]>`
-    SELECT e.id, e.role, e.task_id, t.number::text AS task_number, e.job_id, j.code AS job_code, e.project_id, p.code AS project_code,
+    SELECT e.id, e.role, e.task_id, t.number::text AS task_number, (${parentNumberSql(sql)})::text AS task_parent_number,
+      t.sub_seq AS task_sub_seq, e.job_id, j.code AS job_code, e.project_id, p.code AS project_code,
       e.process_id, pr.name AS process_name, e.shift_id, s.name AS shift_name, e.pay_mode, e.kind, e.qty,
       e.unit_credits::text AS unit_credits, e.credits::text AS credits, e.money::text AS money, e.credit_rule_id,
       to_char(e.business_day, 'YYYY-MM-DD') AS business_day, to_char(e.period_month, 'YYYY-MM') AS period,
@@ -439,7 +451,12 @@ export const getTaskScores = async (context: AccessContext, taskId: string): Pro
     JOIN production.shifts s ON s.organization_id = e.organization_id AND s.id = e.shift_id
     JOIN public.app_users au ON au.id = e.user_id
     LEFT JOIN production.processes pr ON pr.organization_id = e.organization_id AND pr.id = e.process_id
-    WHERE e.organization_id = ${organizationId} AND e.task_id = ${taskId}
+    WHERE e.organization_id = ${organizationId}
+      AND (e.task_id = ${taskId} OR e.task_id IN (
+        -- PD-048: a task's page shows its subtasks' points too (each scored by its own process and quantity).
+        SELECT st.id FROM production.tasks st
+        WHERE st.organization_id = ${organizationId} AND st.parent_task_id = ${taskId} AND st.kind = 'NORMAL' AND st.deleted_at IS NULL
+      ))
       ${everyone ? sql`` : sql`AND e.user_id = ${context.user.id}`}
     ORDER BY e.created_at, e.adjusts_entry_id NULLS FIRST, e.recorded_at, e.id
   `;
@@ -454,8 +471,34 @@ export const getTaskScores = async (context: AccessContext, taskId: string): Pro
     total.money += Number(row.money);
     totals.set(key, total);
   }
+  // PD-048: per process (the task's own and each subtask's), in order of first appearance.
+  const byProcess = new Map<string, { process: { id: string; name: string } | null; qty: number; cents: number; units: Set<string>; missingRule: boolean }>();
+  for (const row of rows) {
+    const key = row.process_id ?? "none";
+    const group = byProcess.get(key) ?? {
+      process: row.process_id && row.process_name !== null ? { id: row.process_id, name: row.process_name } : null,
+      qty: 0,
+      cents: 0,
+      units: new Set<string>(),
+      missingRule: false
+    };
+    group.qty += row.qty;
+    group.cents += Math.round(Number(row.credits) * 100);
+    if (row.adjusts_entry_id === null) {
+      group.units.add(row.unit_credits);
+      if (row.credit_rule_id === null) group.missingRule = true;
+    }
+    byProcess.set(key, group);
+  }
   return {
     taskId,
+    byProcess: [...byProcess.values()].map((group) => ({
+      process: group.process,
+      qty: group.qty,
+      credits: group.cents / 100 + 0,
+      unitCredits: group.units.size === 1 ? Number([...group.units][0]) : null,
+      missingRule: group.missingRule
+    })),
     moneyVisible,
     items: rows.map((row) => ({ ...toEntry(row), user: userRef(row.owner), money: visible(row.owner.id) ? Number(row.money) : null })),
     totals: [...totals.values()].map((total) => ({
