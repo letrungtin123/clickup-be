@@ -30,11 +30,11 @@ const org = "11111111-1111-4111-8111-111111111111";
 const me = "22222222-2222-4222-8222-222222222222";
 const target = "33333333-3333-4333-8333-333333333333";
 
-const contextWith = (roles: string[]) =>
+const contextWith = (roles: string[], superadmin = false) =>
   ({
     user: { id: me, displayName: "Me", email: null },
     organization: { id: org, slug: "o", name: "O" },
-    hasFullOrganizationAuthority: false,
+    hasFullOrganizationAuthority: superadmin,
     productionRoles: roles,
     departments: ["PHOTO_RETOUCH"],
     canSwitchDepartment: false,
@@ -42,6 +42,8 @@ const contextWith = (roles: string[]) =>
     role: { id: "r", organizationId: org, key: "member", name: "x", permissions: [] }
   }) as unknown as AccessContext;
 const admin = contextWith(["ADMIN"]);
+/** PD-050: members' production profile is configuration, written by the organization superadmin only. */
+const owner = contextWith([], true);
 
 const row = (userId: string, name: string, roles: string[] | null, departments: string[] | null, superadmin = false) => ({
   user_id: userId,
@@ -86,13 +88,13 @@ beforeEach(() => {
 describe("PATCH /production/members/:userId keeps production roles inside PHOTO_RETOUCH", () => {
   it("refuses roles for someone outside PHOTO_RETOUCH (no role written); removing all roles stays possible", async () => {
     db.state.handler = memberAnswer(false);
-    expect(await failure(updateMember(admin, target, { roles: ["STAFF"] }))).toEqual({ code: "PRODUCTION_ROLES_NOT_ALLOWED", status: 400 });
+    expect(await failure(updateMember(owner, target, { roles: ["STAFF"] }))).toEqual({ code: "PRODUCTION_ROLES_NOT_ALLOWED", status: 400 });
     expect(statements("DELETE FROM production.user_roles")).toHaveLength(0);
     expect(statements("INSERT INTO production.user_roles")).toHaveLength(0);
     // The check is the shared SQL predicate (superadmins included).
     expect(db.state.calls.some((call) => call.text.startsWith("public.is_department_member("))).toBe(true);
 
-    const member = await updateMember(admin, target, { roles: [] });
+    const member = await updateMember(owner, target, { roles: [] });
     expect(member).toMatchObject({ roles: [], departments: ["PRODUCTION"] });
     expect(statements("DELETE FROM production.user_roles")).toHaveLength(1);
   });
@@ -100,7 +102,7 @@ describe("PATCH /production/members/:userId keeps production roles inside PHOTO_
   it("grants roles to a Photo Retouch member; the in-transaction hook (department change) runs before the role write", async () => {
     db.state.handler = memberAnswer(true);
     const order: string[] = [];
-    const member = await updateMember(admin, target, { roles: ["STAFF", "QC"] }, () => {
+    const member = await updateMember(owner, target, { roles: ["STAFF", "QC"] }, () => {
       order.push(`hook@${db.state.calls.length}`);
       return Promise.resolve();
     });

@@ -23,8 +23,8 @@ export type LeaveStatus = z.infer<typeof LeaveStatusSchema>;
 
 /** Server-enforced limits (also useful for FE form hints). */
 export const leaveLimits = {
-  /** A request may start at most this many days before today. */
-  maxPastDays: 30,
+  /** A request may start at most this many days before today — 0: never in the past (PD-051). */
+  maxPastDays: 0,
   /** A request may start at most this many days after today. */
   maxFutureDays: 366,
   /** Inclusive length of one request, in days. */

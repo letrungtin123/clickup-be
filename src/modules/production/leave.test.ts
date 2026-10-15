@@ -98,7 +98,8 @@ describe("assertValidNewLeave", () => {
   it("accepts full-day ranges and single-day half days", () => {
     expect(codeOf(() => assertValidNewLeave(full("2026-10-12", "2026-11-11"), today))).toBeNull();
     expect(codeOf(() => assertValidNewLeave(half("2026-10-12", "MORNING"), today))).toBeNull();
-    expect(codeOf(() => assertValidNewLeave(full("2026-09-09", "2026-09-09"), today))).toBeNull();
+    // PD-051: from today on.
+    expect(codeOf(() => assertValidNewLeave(full(today, today), today))).toBeNull();
   });
 
   it("rejects invalid or reversed dates", () => {
@@ -112,9 +113,11 @@ describe("assertValidNewLeave", () => {
     );
   });
 
-  it("limits length (31 days), the past (30 days) and the future (366 days)", () => {
+  it("limits length (31 days), refuses the past (PD-051) and the far future (366 days)", () => {
     expect(codeOf(() => assertValidNewLeave(full("2026-10-12", "2026-11-12"), today))?.code).toBe("LEAVE_TOO_LONG");
     expect(codeOf(() => assertValidNewLeave(full("2026-09-08", "2026-09-08"), today))?.code).toBe("LEAVE_TOO_OLD");
+    // Yesterday is the past too: "Không thể xin nghỉ cho ngày đã qua — chọn từ hôm nay trở đi."
+    expect(codeOf(() => assertValidNewLeave(full("2026-10-08", "2026-10-09"), today))?.code).toBe("LEAVE_TOO_OLD");
     expect(codeOf(() => assertValidNewLeave(full("2027-10-11", "2027-10-11"), today))?.code).toBe("LEAVE_TOO_FAR");
   });
 });

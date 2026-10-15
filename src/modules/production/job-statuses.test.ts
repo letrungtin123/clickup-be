@@ -96,8 +96,10 @@ const statusNew = "a1111111-1111-4111-8111-111111111111";
 const statusDoing = "a2222222-2222-4222-8222-222222222222";
 const statusDelivered = "a3333333-3333-4333-8333-333333333333";
 
-const contextWith = (roles: string[]) =>
-  ({ user: { id: me }, organization: { id: org }, hasFullOrganizationAuthority: false, productionRoles: roles, role: { permissions: [] } }) as unknown as AccessContext;
+const contextWith = (roles: string[], superadmin = false) =>
+  ({ user: { id: me }, organization: { id: org }, hasFullOrganizationAuthority: superadmin, productionRoles: roles, role: { permissions: [] } }) as unknown as AccessContext;
+/** PD-050: the job status catalog is configuration, written by the organization superadmin only. */
+const owner = contextWith([], true);
 
 const catalog = [
   { id: statusNew, name: "Mới nhận", color: "slate", is_closed: false, requires_all_checked: false },
@@ -374,8 +376,8 @@ describe("job list, create job and the work-entry picker (PD-038)", () => {
       job_status_requires_all_checked: false
     }));
     db.state.handler = (call) => (call.text.includes("FROM production.jobs j JOIN production.job_statuses js") ? rows : undefined);
-    // QC keeps "create: own" by default (PD-047 took it from STAFF).
-    const result = await listJobOptions(contextWith(["QC"]), JobOptionsQuerySchema.parse({ projectId, q: "Bátch", statusIds: statusDelivered, limit: "2" }));
+    // Since PD-051 neither STAFF nor QC enters work by default: the picker is for "create" own / all (Leader here).
+    const result = await listJobOptions(contextWith(["LEADER"]), JobOptionsQuerySchema.parse({ projectId, q: "Bátch", statusIds: statusDelivered, limit: "2" }));
     const query = callsLike(/FROM production\.jobs j JOIN production\.job_statuses js/)[0]!;
     expect(query.text).toContain("j.deleted_at IS NULL AND j.archived_at IS NULL");
     expect(query.text).toContain("ORDER BY js.is_closed, j.deadline DESC, j.id DESC");
@@ -418,7 +420,7 @@ describe("Cấu hình → Trạng thái job (PD-038)", () => {
   const statusRows = (count: number) =>
     catalog.slice(0, count).map((row, index) => ({ ...row, position: index + 1, job_count: 0, updated_at: new Date(), updated_by: null }));
 
-  it("every member reads the catalog (job counts for ADMIN only); writes are ADMIN only", async () => {
+  it("every member reads the catalog (job counts for ADMIN only); writes are the superadmin's only (PD-050)", async () => {
     db.state.handler = (call) => (call.text.includes("FROM production.job_statuses s") ? statusRows(3) : undefined);
     const list = await listJobStatuses(contextWith(["STAFF"]));
     expect(list.items.map((item) => item.name)).toEqual(["Mới nhận", "Đang làm", "Đã giao khách"]);
@@ -427,26 +429,32 @@ describe("Cấu hình → Trạng thái job (PD-038)", () => {
     expect(await failure(updateJobStatus(contextWith(["STAFF"]), statusNew, UpdateCatalogStatusSchema.parse({ color: "red" })))).toMatchObject({ status: 403 });
     expect(await failure(reorderJobStatuses(contextWith(["ACCOUNT"]), [statusNew]))).toMatchObject({ status: 403 });
     expect(await failure(deleteJobStatus(contextWith(["LEADER"]), statusNew, undefined))).toMatchObject({ status: 403 });
+    // A production Admin reads it too, but no longer edits it.
+    const admin = contextWith(["ADMIN"]);
+    expect(await failure(createJobStatus(admin, CreateJobStatusRequestSchema.parse({ name: "Chờ duyệt" })))).toMatchObject({ code: "FORBIDDEN", status: 403 });
+    expect(await failure(updateJobStatus(admin, statusNew, UpdateCatalogStatusSchema.parse({ color: "red" })))).toMatchObject({ code: "FORBIDDEN", status: 403 });
+    expect(await failure(reorderJobStatuses(admin, [statusNew]))).toMatchObject({ code: "FORBIDDEN", status: 403 });
+    expect(await failure(deleteJobStatus(admin, statusNew, undefined))).toMatchObject({ code: "FORBIDDEN", status: 403 });
     expect(callsLike(/^(INSERT INTO|UPDATE|DELETE FROM) production\.job_statuses/)).toHaveLength(0);
   });
 
   it("add appends after the last one and records who; rename / colour / đóng record who too", async () => {
     db.state.handler = (call) => (call.text.startsWith("SELECT count(*)::int AS count FROM production.job_statuses") ? [{ count: 3 }] : undefined);
-    await createJobStatus(contextWith(["ADMIN"]), CreateJobStatusRequestSchema.parse({ name: "  Chờ duyệt ", color: "teal", isClosed: false }));
+    await createJobStatus(owner, CreateJobStatusRequestSchema.parse({ name: "  Chờ duyệt ", color: "teal", isClosed: false }));
     const insert = callsLike(/^INSERT INTO production\.job_statuses/)[0]!;
     expect(insert.text).toContain("coalesce(max(position), 0) + 1");
     // requiresAllChecked defaults to false (PD-045).
     expect(insert.values).toEqual([org, "Chờ duyệt", "teal", false, false, me, me, org]);
     db.state.calls = [];
-    await createJobStatus(contextWith(["ADMIN"]), CreateJobStatusRequestSchema.parse({ name: "Xong hết", requiresAllChecked: true }));
+    await createJobStatus(owner, CreateJobStatusRequestSchema.parse({ name: "Xong hết", requiresAllChecked: true }));
     expect(callsLike(/^INSERT INTO production\.job_statuses/)[0]!.text).toContain("requires_all_checked");
     expect(callsLike(/^INSERT INTO production\.job_statuses/)[0]!.values).toEqual([org, "Xong hết", "slate", false, true, me, me, org]);
     db.state.handler = (call) => (call.text.startsWith("UPDATE production.job_statuses") ? [{ id: statusNew }] : undefined);
-    await updateJobStatus(contextWith(["ADMIN"]), statusNew, UpdateCatalogStatusSchema.parse({ isClosed: true }));
+    await updateJobStatus(owner, statusNew, UpdateCatalogStatusSchema.parse({ isClosed: true }));
     expect(callsLike(/^UPDATE production\.job_statuses/)[0]!.values).toContain(me);
     // PD-045: turning "cần check hết dòng" on / off is an update of its own (null = unchanged).
     db.state.calls = [];
-    await updateJobStatus(contextWith(["ADMIN"]), statusNew, UpdateCatalogStatusSchema.parse({ requiresAllChecked: true }));
+    await updateJobStatus(owner, statusNew, UpdateCatalogStatusSchema.parse({ requiresAllChecked: true }));
     const update = callsLike(/^UPDATE production\.job_statuses/)[0]!;
     expect(update.text).toContain("requires_all_checked = coalesce($::boolean, requires_all_checked)");
     expect(update.values.slice(0, 4)).toEqual([null, null, null, true]);
@@ -456,7 +464,7 @@ describe("Cấu hình → Trạng thái job (PD-038)", () => {
 
   it("the last status cannot be deleted", async () => {
     db.state.handler = (call) => (call.text.includes("ORDER BY position, id FOR UPDATE") ? [catalog[0]] : undefined);
-    expect(await failure(deleteJobStatus(contextWith(["ADMIN"]), statusNew, undefined))).toMatchObject({ code: "JOB_STATUS_LAST", status: 409 });
+    expect(await failure(deleteJobStatus(owner, statusNew, undefined))).toMatchObject({ code: "JOB_STATUS_LAST", status: 409 });
     expect(callsLike(/^DELETE FROM production\.job_statuses/)).toHaveLength(0);
   });
 
@@ -466,11 +474,11 @@ describe("Cấu hình → Trạng thái job (PD-038)", () => {
       call.text.includes("ORDER BY position, id FOR UPDATE") ? catalog
       : call.text.includes("AS total") ? [usage]
       : undefined;
-    expect(await failure(deleteJobStatus(contextWith(["ADMIN"]), statusDoing, undefined))).toMatchObject({ code: "JOB_STATUS_IN_USE", status: 409 });
-    expect(await failure(deleteJobStatus(contextWith(["ADMIN"]), statusDoing, statusDoing))).toMatchObject({ code: "JOB_STATUS_REPLACEMENT_INVALID", status: 400 });
+    expect(await failure(deleteJobStatus(owner, statusDoing, undefined))).toMatchObject({ code: "JOB_STATUS_IN_USE", status: 409 });
+    expect(await failure(deleteJobStatus(owner, statusDoing, statusDoing))).toMatchObject({ code: "JOB_STATUS_REPLACEMENT_INVALID", status: 400 });
     expect(callsLike(/^(UPDATE production\.jobs|DELETE FROM production\.job_statuses)/)).toHaveLength(0);
 
-    const result = await deleteJobStatus(contextWith(["ADMIN"]), statusDoing, DeleteJobStatusQuerySchema.parse({ replacementId: statusDelivered }).replacementId);
+    const result = await deleteJobStatus(owner, statusDoing, DeleteJobStatusQuerySchema.parse({ replacementId: statusDelivered }).replacementId);
     expect(result.movedJobs).toBe(3);
     const logs = callsLike(/^INSERT INTO production\.task_logs/);
     expect(logs).toHaveLength(1);
@@ -490,7 +498,7 @@ describe("Cấu hình → Trạng thái job (PD-038)", () => {
       call.text.includes("ORDER BY position, id FOR UPDATE") ? catalog
       : call.text.includes("AS total") ? [{ total: 0, live: 0 }]
       : undefined;
-    const result = await deleteJobStatus(contextWith(["ADMIN"]), statusDoing, undefined);
+    const result = await deleteJobStatus(owner, statusDoing, undefined);
     expect(result.movedJobs).toBe(0);
     expect(callsLike(/^UPDATE production\.jobs/)).toHaveLength(0);
     expect(callsLike(/^DELETE FROM production\.job_statuses/)).toHaveLength(1);

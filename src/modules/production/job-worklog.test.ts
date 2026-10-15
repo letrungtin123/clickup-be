@@ -290,8 +290,9 @@ describe("job permission matrix (PD-036)", () => {
   it("a user's scope is the most permissive over their roles; ADMIN is always all; no role is none", () => {
     // PD-047 defaults: staff see every job and update their own tasks, but neither enter work nor delete tasks.
     expect(effectiveJobScopes(["STAFF"], defaultJobPermissions)).toEqual({ view: "all", create: "none", update: "own", delete: "none" });
-    expect(effectiveJobScopes(["QC"], defaultJobPermissions)).toEqual({ view: "own", create: "own", update: "own", delete: "own" });
-    expect(effectiveJobScopes(["STAFF", "QC"], defaultJobPermissions)).toEqual({ view: "all", create: "own", update: "own", delete: "own" });
+    // PD-051: QC people neither enter work nor delete tasks either.
+    expect(effectiveJobScopes(["QC"], defaultJobPermissions)).toEqual({ view: "own", create: "none", update: "own", delete: "none" });
+    expect(effectiveJobScopes(["STAFF", "QC"], defaultJobPermissions)).toEqual({ view: "all", create: "none", update: "own", delete: "none" });
     expect(effectiveJobScopes(["STAFF", "LEADER"], defaultJobPermissions)).toEqual({ view: "all", create: "all", update: "all", delete: "all" });
     expect(effectiveJobScopes(["STAFF"], ownStaff)).toEqual({ view: "own", create: "own", update: "own", delete: "own" });
     const strict: JobPermissionMatrix = {
@@ -810,14 +811,16 @@ describe("work-log fields (PD-035)", () => {
     expect(row).toMatchObject({ assigneeId: worker, qtyAssigned: 3, errorQty: 1, assignedAt: "2026-10-11T17:00:00.000Z" });
   });
 
-  it("a process is deleted only when nothing refers to it", async () => {
+  it("a process is deleted only when nothing refers to it (by the superadmin, PD-050)", async () => {
+    const owner = contextWith([], true);
     db.state.handler = (call) => (call.text.includes("AS found") ? [{ found: true, tasks: 3, rules: 1, entries: 0 }] : undefined);
-    expect(await failure(deleteProcess(contextWith(["ADMIN"]), processId))).toMatchObject({ code: "PROCESS_IN_USE", status: 409 });
+    expect(await failure(deleteProcess(owner, processId))).toMatchObject({ code: "PROCESS_IN_USE", status: 409 });
     expect(callsLike(/^DELETE FROM production\.processes/)).toHaveLength(0);
     db.state.handler = (call) => (call.text.includes("AS found") ? [{ found: true, tasks: 0, rules: 0, entries: 0 }] : undefined);
-    await deleteProcess(contextWith(["ADMIN"]), processId);
+    await deleteProcess(owner, processId);
     expect(callsLike(/^DELETE FROM production\.processes/)).toHaveLength(1);
     expect(await failure(deleteProcess(contextWith(["LEADER"]), processId))).toMatchObject({ status: 403 });
+    expect(await failure(deleteProcess(contextWith(["ADMIN"]), processId))).toMatchObject({ code: "FORBIDDEN", status: 403 });
   });
 
   it("the work-log export has exactly the Excel's 11 headers in order, then Trạng thái, QC, Trạng thái job and Link chia việc", () => {

@@ -14,7 +14,7 @@ import { AppError } from "../../lib/app-error.js";
 import { toIso, type QuerySql } from "../../lib/db-types.js";
 import type { AccessContext } from "../access/access-context.js";
 import { toUserRef, type UserRefJson } from "../work/mappers.js";
-import { assertProductionAdmin } from "./access.js";
+import { assertConfigEditor, assertProductionAdmin } from "./access.js";
 import { closeDaysOf, loadSettings } from "./catalog.service.js";
 import { isAlignedPeriod, parseKpiTargetCsv } from "./kpi-targets.js";
 import { effectiveVersion, periodOfDay, type KpiPeriodType } from "./scoring.js";
@@ -171,7 +171,7 @@ const memberIds = async (sql: QuerySql, organizationId: string, userIds: string[
 
 /** PUT /production/kpi-targets — sets versions (same user/type/start replaces it). */
 export const putKpiTargets = async (context: AccessContext, input: In<typeof PutKpiTargetsRequestSchema>) => {
-  assertProductionAdmin(context);
+  assertConfigEditor(context);
   const organizationId = org(context);
   const items = new Map<string, UpsertItem>();
   for (const item of input.items) {
@@ -191,7 +191,7 @@ export const putKpiTargets = async (context: AccessContext, input: In<typeof Put
 
 /** DELETE /production/kpi-targets/:id — removes one version (the previous one applies again). */
 export const deleteKpiTarget = async (context: AccessContext, targetId: string) => {
-  assertProductionAdmin(context);
+  assertConfigEditor(context);
   const rows = await getSql()`DELETE FROM production.kpi_targets WHERE organization_id = ${org(context)} AND id = ${targetId} RETURNING id`;
   if (rows.length === 0) {
     throw new AppError("KPI_TARGET_NOT_FOUND", "Không tìm thấy KPI.", 404);
@@ -205,7 +205,7 @@ export const deleteKpiTarget = async (context: AccessContext, targetId: string) 
  * Unknown emails are reported together with the format errors of the same file (PR-25), line by line.
  */
 export const importKpiTargets = async (context: AccessContext, input: In<typeof KpiTargetImportRequestSchema>): Promise<KpiTargetImportResult> => {
-  assertProductionAdmin(context);
+  assertConfigEditor(context);
   assertAligned(input.periodType, input.period);
   const organizationId = org(context);
   const { rows, errors } = parseKpiTargetCsv(input.csv);
@@ -247,7 +247,7 @@ export const importKpiTargets = async (context: AccessContext, input: In<typeof 
  * settings.kpiDefaultLeader for LEADERs, settings.kpiDefaultMember otherwise.
  */
 export const applyDefaultKpiTargets = async (context: AccessContext, period: string): Promise<ApplyDefaultKpiResult> => {
-  assertProductionAdmin(context);
+  assertConfigEditor(context);
   const organizationId = org(context);
   const sql = getSql();
   const settings = await loadSettings(sql, organizationId);

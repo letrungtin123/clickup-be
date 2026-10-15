@@ -7,7 +7,7 @@ import type { RoomAccess } from "../../realtime/room-authorizers.js";
 import type { AccessContext } from "../access/access-context.js";
 import { hasPermission } from "../access/resource-access.js";
 import { channelInfoColumnsSql, type ChannelInfoRow } from "./chat-mappers.js";
-import { computeChannelCapabilities, toSeq } from "./chat-rules.js";
+import { computeChannelCapabilities, toSeq, type DmCaller, type DmParty } from "./chat-rules.js";
 
 export type ChannelMembership = {
   id: string;
@@ -29,6 +29,42 @@ type AccessRow = ChannelInfoRow & {
   role: ChannelRole | null;
   notify_level: NotifyLevel | null;
   last_read_seq: string | null;
+};
+
+/** The caller as the DM rules see them (chat-rules `DmCaller`); the context carries effective departments. */
+export const dmCallerOf = (context: AccessContext): DmCaller => ({
+  superadmin: context.hasFullOrganizationAuthority,
+  departments: context.departments,
+  canCreateChannels: hasPermission(context, Permission.ChannelCreate)
+});
+
+/**
+ * Active organization members as DM parties (superadmin role, department rows), keyed by user id. People who are not
+ * active members (disabled, invited, removed) are missing.
+ */
+export const loadDmParties = async (sql: QuerySql, context: AccessContext, userIds: readonly string[]): Promise<Map<string, DmParty>> => {
+  if (userIds.length === 0) {
+    return new Map();
+  }
+  const rows = await sql<{ user_id: string; superadmin: boolean; departments: string[] | null }[]>`
+    SELECT om.user_id,
+      EXISTS (
+        SELECT 1 FROM public.roles r
+        WHERE r.id = om.role_id AND r.organization_id = om.organization_id AND r.key = 'superadmin'
+      ) AS superadmin,
+      ARRAY(
+        SELECT ud.department FROM public.user_departments ud
+        WHERE ud.organization_id = om.organization_id AND ud.user_id = om.user_id
+        ORDER BY ud.department
+      ) AS departments
+    FROM public.organization_memberships om
+    JOIN public.app_users au ON au.id = om.user_id AND au.deleted_at IS NULL
+    WHERE om.organization_id = ${context.organization.id}
+      AND om.user_id = ANY(${[...userIds]}::uuid[])
+      AND om.status = 'active'
+      AND om.deleted_at IS NULL
+  `;
+  return new Map(rows.map((row) => [row.user_id, { superadmin: row.superadmin, departments: row.departments ?? [] }]));
 };
 
 export const channelPermissions = (context: AccessContext) => ({

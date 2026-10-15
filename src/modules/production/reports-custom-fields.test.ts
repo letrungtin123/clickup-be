@@ -120,16 +120,15 @@ describe("custom-field dimensions and filters", () => {
     expect(reportColumns(cfConfig, fields)[0]).toEqual({ key: "cf_user:nang_luc", kind: "dimension", label: "Năng lực", format: "text" });
   });
 
-  it("permissions: USER fields are Admin data; JOB / TASK fields are personal breakdowns while scores are private", () => {
+  it("permissions: USER fields are Admin data; JOB / TASK fields are open to report users (PD-052)", () => {
     const byLevel = config({ dimensions: ["cf_user:nang_luc"], measures: ["points"] });
-    expect(errorCode(() => assertReportAllowed(contextWith(["LEADER"]), byLevel, true))).toEqual({ code: "CUSTOM_FIELDS_FORBIDDEN", status: 403 });
+    expect(errorCode(() => assertReportAllowed(contextWith(["LEADER"]), byLevel))).toEqual({ code: "CUSTOM_FIELDS_FORBIDDEN", status: 403 });
     const filtered = config({ measures: ["points"], filters: { customFields: [{ field: "cf_user:nang_luc", values: ["a"] }] } });
-    expect(errorCode(() => assertReportAllowed(contextWith(["LEADER"]), filtered, true))).toEqual({ code: "CUSTOM_FIELDS_FORBIDDEN", status: 403 });
-    expect(errorCode(() => assertReportAllowed(contextWith(["ADMIN"]), byLevel, false))).toBeNull();
+    expect(errorCode(() => assertReportAllowed(contextWith(["LEADER"]), filtered))).toEqual({ code: "CUSTOM_FIELDS_FORBIDDEN", status: 403 });
+    expect(errorCode(() => assertReportAllowed(contextWith(["ADMIN"]), byLevel))).toBeNull();
     const byOrder = config({ dimensions: ["cf_job:ma_don_hang"], measures: ["points"] });
-    expect(errorCode(() => assertReportAllowed(contextWith(["LEADER"]), byOrder, false))).toEqual({ code: "SCORES_PRIVATE", status: 403 });
-    expect(errorCode(() => assertReportAllowed(contextWith(["LEADER"]), byOrder, true))).toBeNull();
-    expect(errorCode(() => assertReportAllowed(contextWith(["LEADER"]), config({ dimensions: ["cf_client:kenh"], measures: ["points"] }), false))).toBeNull();
+    expect(errorCode(() => assertReportAllowed(contextWith(["LEADER"]), byOrder))).toBeNull();
+    expect(errorCode(() => assertReportAllowed(contextWith(["LEADER"]), config({ dimensions: ["cf_client:kenh"], measures: ["points"] })))).toBeNull();
   });
 });
 

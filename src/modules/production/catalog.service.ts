@@ -33,7 +33,7 @@ import { invalidateAccessContexts, type AccessContext } from "../access/access-c
 import { departmentMemberSql, effectiveDepartments, productionRolesNotAllowed } from "../access/departments.js";
 import { scheduleGoogleAuthUserProvisioning } from "../auth/google-auth.service.js";
 import { toColor } from "../work/mappers.js";
-import { assertProductionAdmin, assertProductionMember, assertProductionRole, isProductionAdmin, productionRolesOf } from "./access.js";
+import { assertConfigEditor, assertProductionAdmin, assertProductionMember, assertProductionRole, isProductionAdmin, productionRolesOf } from "./access.js";
 import { cachedConfig, invalidateProductionConfig } from "./catalog-cache.js";
 import { deleteCreditRuleVersion, importCreditRules, listRuleHistory, listRulesAt, setCreditRule, startNewVersion } from "./credit-rules.js";
 import { matchesCustomFieldFilters, resolveCustomFieldFilters, resolveCustomValues, setEntityTags } from "./custom-fields.js";
@@ -163,12 +163,12 @@ export const getSettings = async (context: AccessContext) => {
 };
 
 /**
- * PATCH /production/settings (ADMIN). Every key keeps who changed it last and when (production.settings updated_by /
+ * PATCH /production/settings (superadmin, PD-050). Every key keeps who changed it last and when (production.settings updated_by /
  * updated_at); the form re-sends unchanged keys, which are not touched so that trail stays the real change — e.g. who
  * switched the Khoán pay policy (PD-033). The close day also writes its history (kpi_close_days.created_by).
  */
 export const updateSettings = async (context: AccessContext, input: In<typeof UpdateProductionSettingsRequestSchema>) => {
-  assertProductionAdmin(context);
+  assertConfigEditor(context);
   const sql = getSql();
   await sql.begin(async (tx) => {
     if (input.kpiCloseDay !== undefined) {
@@ -310,7 +310,7 @@ export const updateMember = async (
   input: In<typeof UpdateProductionMemberRequestSchema>,
   inTransaction?: (tx: QuerySql) => Promise<void>
 ) => {
-  assertProductionAdmin(context);
+  assertConfigEditor(context);
   const sql = getSql();
   await sql.begin(async (tx) => {
     const current = (await selectMembers(tx, org(context), userId))[0];
@@ -384,7 +384,7 @@ export const listTeams = async (context: AccessContext) => {
 };
 
 export const upsertTeam = async (context: AccessContext, id: string | null, input: In<typeof UpsertTeamRequestSchema>) => {
-  assertProductionAdmin(context);
+  assertConfigEditor(context);
   const sql = getSql();
   if (id) {
     const rows = await sql`
@@ -431,9 +431,9 @@ export const listClients = async (context: AccessContext, query: ClientQuery = {
   };
 };
 
-/** PLAN §2: Account creates clients; Admin manages everything. */
+/** Clients are configuration (PD-050): only the superadmin writes them; Account / Leader keep reading them. */
 export const upsertClient = async (context: AccessContext, id: string | null, input: In<typeof UpsertClientRequestSchema>) => {
-  assertProductionRole(context, "ACCOUNT");
+  assertConfigEditor(context);
   const sql = getSql();
   await sql.begin(async (tx) => {
     const existing = id
@@ -506,7 +506,7 @@ export const listProjects = async (context: AccessContext) => {
 };
 
 export const upsertProject = async (context: AccessContext, id: string | null, input: In<typeof UpsertProductionProjectRequestSchema>) => {
-  assertProductionAdmin(context);
+  assertConfigEditor(context);
   const sql = getSql();
   if (input.clientId) {
     const client = await sql`SELECT 1 FROM production.clients WHERE organization_id = ${org(context)} AND id = ${input.clientId}`;
@@ -548,7 +548,7 @@ export const listProcesses = async (context: AccessContext) => {
 };
 
 export const upsertProcess = async (context: AccessContext, id: string | null, input: In<typeof UpsertProcessRequestSchema>) => {
-  assertProductionAdmin(context);
+  assertConfigEditor(context);
   const sql = getSql();
   if (id) {
     const rows = await sql`
@@ -570,11 +570,11 @@ export const upsertProcess = async (context: AccessContext, id: string | null, i
 };
 
 /**
- * DELETE /production/processes/:id (ADMIN, PD-035 "Quy trình" catalog): only a process nothing refers to — no line (also
+ * DELETE /production/processes/:id (superadmin, PD-050; PD-035 "Quy trình" catalog): only a process nothing refers to — no line (also
  * deleted ones, kept for audit), no price (credit rule) and no score entry. Otherwise 409: deactivate it instead.
  */
 export const deleteProcess = async (context: AccessContext, id: string) => {
-  assertProductionAdmin(context);
+  assertConfigEditor(context);
   const sql = getSql();
   await sql.begin(async (tx) => {
     const usage = (
@@ -621,7 +621,7 @@ export const listShifts = async (context: AccessContext) => {
 };
 
 export const upsertShift = async (context: AccessContext, id: string | null, input: In<typeof UpsertShiftRequestSchema>) => {
-  assertProductionAdmin(context);
+  assertConfigEditor(context);
   const sql = getSql();
   if (id) {
     const rows = await sql`
@@ -699,7 +699,7 @@ export const getWorkflow = async (context: AccessContext) => {
 };
 
 export const upsertStatus = async (context: AccessContext, id: string | null, input: In<typeof UpsertStatusRequestSchema>) => {
-  assertProductionAdmin(context);
+  assertConfigEditor(context);
   const sql = getSql();
   const system = new Set<string>(systemStatusCodes);
   if (id) {
@@ -731,7 +731,7 @@ export const upsertStatus = async (context: AccessContext, id: string | null, in
 };
 
 export const reorderStatuses = async (context: AccessContext, ids: string[]) => {
-  assertProductionAdmin(context);
+  assertConfigEditor(context);
   const sql = getSql();
   await sql`
     UPDATE production.statuses AS s SET sort_order = data.position
@@ -743,7 +743,7 @@ export const reorderStatuses = async (context: AccessContext, ids: string[]) => 
 };
 
 export const replaceTransitions = async (context: AccessContext, input: In<typeof ReplaceTransitionsRequestSchema>) => {
-  assertProductionAdmin(context);
+  assertConfigEditor(context);
   const sql = getSql();
   await sql.begin(async (tx) => {
     const ids = new Set(
@@ -808,7 +808,7 @@ export const listCustomFields = async (context: AccessContext, entity: string | 
 };
 
 export const upsertCustomField = async (context: AccessContext, id: string | null, input: In<typeof UpsertCustomFieldRequestSchema>) => {
-  assertProductionAdmin(context);
+  assertConfigEditor(context);
   if ((input.type === "SELECT" || input.type === "MULTISELECT") && input.options.length === 0) {
     throw new AppError("FIELD_OPTIONS_REQUIRED", "Trường chọn cần ít nhất một lựa chọn.", 400);
   }
@@ -846,7 +846,7 @@ export const listTags = async (context: AccessContext) => {
 };
 
 export const upsertTag = async (context: AccessContext, id: string | null, input: In<typeof UpsertTagRequestSchema>) => {
-  assertProductionAdmin(context);
+  assertConfigEditor(context);
   const sql = getSql();
   if (id) {
     const rows = await sql`
@@ -878,7 +878,7 @@ export const listAllowedEmails = async (context: AccessContext) => {
 
 /** Accepts text pasted from a sheet; reports added / already present / invalid entries. */
 export const addAllowedEmails = async (context: AccessContext, text: string) => {
-  assertProductionAdmin(context);
+  assertConfigEditor(context);
   const tokens = [...new Set(text.split(/[\s,;]+/).map((token) => token.trim().toLowerCase()).filter(Boolean))].slice(0, 2000);
   const valid = tokens.filter((token) => emailPattern.test(token) && token.length <= 254);
   const invalid = tokens.filter((token) => !valid.includes(token));
@@ -898,7 +898,7 @@ export const addAllowedEmails = async (context: AccessContext, text: string) => 
 };
 
 export const removeAllowedEmail = async (context: AccessContext, email: string) => {
-  assertProductionAdmin(context);
+  assertConfigEditor(context);
   await getSql()`DELETE FROM public.allowed_emails WHERE organization_id = ${org(context)} AND email = ${email.toLowerCase()}`;
   return { ok: true as const };
 };
@@ -968,7 +968,7 @@ const assertCatalogPair = async (sql: QuerySql, organizationId: string, projectI
 };
 
 export const putCreditRule = async (context: AccessContext, input: In<typeof SetCreditRuleRequestSchema>) => {
-  assertProductionAdmin(context);
+  assertConfigEditor(context);
   const sql = getSql();
   await sql.begin(async (tx) => {
     await assertCatalogPair(tx, org(context), input.projectId, input.processId);
@@ -978,13 +978,13 @@ export const putCreditRule = async (context: AccessContext, input: In<typeof Set
 };
 
 export const createCreditVersion = async (context: AccessContext, effectiveFrom: string) => {
-  assertProductionAdmin(context);
+  assertConfigEditor(context);
   const created = await getSql().begin(async (tx) => await startNewVersion(tx, org(context), effectiveFrom, context.user.id));
   return { created };
 };
 
 export const importCredits = async (context: AccessContext, input: In<typeof CreditImportRequestSchema>) => {
-  assertProductionAdmin(context);
+  assertConfigEditor(context);
   const sql = getSql();
   // A failed validation returns its errors after the transaction is rolled back, so nothing is written.
   try {
@@ -1010,7 +1010,7 @@ class ImportRejected extends Error {
 }
 
 export const removeCreditVersion = async (context: AccessContext, ruleId: string) => {
-  assertProductionAdmin(context);
+  assertConfigEditor(context);
   const pair = await getSql().begin(async (tx) => await deleteCreditRuleVersion(tx, org(context), ruleId));
   return await getCreditHistory(context, pair.projectId, pair.processId);
 };
@@ -1019,7 +1019,7 @@ const reorderTables = { processes: "processes", shifts: "shifts", customFields: 
 
 /** Bulk reorder (sort_order = position in `ids`); ids from other organizations are ignored. */
 export const reorderCatalog = async (context: AccessContext, kind: keyof typeof reorderTables, ids: string[]) => {
-  assertProductionAdmin(context);
+  assertConfigEditor(context);
   const sql = getSql();
   await sql`
     UPDATE ${sql("production")}.${sql(reorderTables[kind])} AS t SET sort_order = data.position

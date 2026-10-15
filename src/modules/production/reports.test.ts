@@ -261,38 +261,25 @@ describe("report permissions", () => {
   const pointsByTeam = config({ dimensions: ["team"], measures: ["points"] });
 
   it("money_khoan is refused for everyone but ADMIN", () => {
-    expect(errorCode(() => assertReportAllowed(contextWith(["LEADER"]), moneyConfig, true))).toEqual({ code: "MONEY_FORBIDDEN", status: 403 });
-    expect(errorCode(() => assertReportAllowed(contextWith(["ADMIN"]), moneyConfig, true))).toBeNull();
-    expect(errorCode(() => assertReportAllowed(contextWith([], true), moneyConfig, true))).toBeNull();
+    expect(errorCode(() => assertReportAllowed(contextWith(["LEADER"]), moneyConfig))).toEqual({ code: "MONEY_FORBIDDEN", status: 403 });
+    expect(errorCode(() => assertReportAllowed(contextWith(["ADMIN"]), moneyConfig))).toBeNull();
+    expect(errorCode(() => assertReportAllowed(contextWith([], true), moneyConfig))).toBeNull();
   });
 
   it("only ADMIN / LEADER run reports; non-members get 404", () => {
-    expect(errorCode(() => assertReportAllowed(contextWith(["STAFF", "QC"]), pointsByTeam, true))).toEqual({ code: "FORBIDDEN", status: 403 });
-    expect(errorCode(() => assertReportAllowed(contextWith([]), pointsByTeam, true))).toEqual({ code: "PRODUCTION_NOT_FOUND", status: 404 });
+    expect(errorCode(() => assertReportAllowed(contextWith(["STAFF", "QC"]), pointsByTeam))).toEqual({ code: "FORBIDDEN", status: 403 });
+    expect(errorCode(() => assertReportAllowed(contextWith([]), pointsByTeam))).toEqual({ code: "PRODUCTION_NOT_FOUND", status: 404 });
   });
 
-  it("private scores: no per-person points for non-admins (team totals stay)", () => {
-    expect(errorCode(() => assertReportAllowed(contextWith(["LEADER"]), pointsByUser, false))).toEqual({ code: "SCORES_PRIVATE", status: 403 });
-    expect(
-      errorCode(() => assertReportAllowed(contextWith(["LEADER"]), config({ dimensions: ["team"], measures: ["points"], filters: { user: [userA] } }), false))
-    ).toEqual({ code: "SCORES_PRIVATE", status: 403 });
-    expect(errorCode(() => assertReportAllowed(contextWith(["LEADER"]), pointsByTeam, false))).toBeNull();
-    expect(errorCode(() => assertReportAllowed(contextWith(["LEADER"]), config({ dimensions: ["user"], measures: ["task_count"] }), false))).toBeNull();
-    expect(errorCode(() => assertReportAllowed(contextWith(["ADMIN"]), pointsByUser, false))).toBeNull();
-  });
-
-  it("PR-11: private scores — no points by job either (a job is often one person), nor through job / tag filters", () => {
+  it("PD-052: points by person and by job are open to report users (settings.scoresPublic gates nothing)", () => {
     const leader = contextWith(["LEADER"]);
     const job = "55555555-5555-4555-8555-555555555555";
-    expect(errorCode(() => assertReportAllowed(leader, config({ dimensions: ["job"], measures: ["points"] }), false))).toEqual({ code: "SCORES_PRIVATE", status: 403 });
-    expect(errorCode(() => assertReportAllowed(leader, config({ dimensions: ["team"], measures: ["points_khoan"], filters: { job: [job] } }), false))).toEqual({
-      code: "SCORES_PRIVATE",
-      status: 403
-    });
-    expect(errorCode(() => assertReportAllowed(leader, config({ measures: ["points"], filters: { tag: [tag] } }), false))).toEqual({ code: "SCORES_PRIVATE", status: 403 });
-    // Public board, task measures, and Admins are unaffected.
-    expect(errorCode(() => assertReportAllowed(leader, config({ dimensions: ["job"], measures: ["points"] }), true))).toBeNull();
-    expect(errorCode(() => assertReportAllowed(leader, config({ dimensions: ["job"], measures: ["late_count"] }), false))).toBeNull();
-    expect(errorCode(() => assertReportAllowed(contextWith(["ADMIN"]), config({ dimensions: ["job"], measures: ["points"] }), false))).toBeNull();
+    expect(errorCode(() => assertReportAllowed(leader, pointsByUser))).toBeNull();
+    expect(errorCode(() => assertReportAllowed(leader, config({ dimensions: ["team"], measures: ["points"], filters: { user: [userA] } })))).toBeNull();
+    expect(errorCode(() => assertReportAllowed(leader, config({ dimensions: ["job"], measures: ["points"] })))).toBeNull();
+    expect(errorCode(() => assertReportAllowed(leader, config({ dimensions: ["team"], measures: ["points_khoan"], filters: { job: [job] } })))).toBeNull();
+    expect(errorCode(() => assertReportAllowed(leader, config({ measures: ["points"], filters: { tag: [tag] } })))).toBeNull();
+    expect(errorCode(() => assertReportAllowed(leader, pointsByTeam))).toBeNull();
+    expect(errorCode(() => assertReportAllowed(contextWith(["ADMIN"]), pointsByUser))).toBeNull();
   });
 });

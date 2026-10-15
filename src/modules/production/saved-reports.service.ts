@@ -12,7 +12,6 @@ import { toIso, type JsonObject, type QuerySql } from "../../lib/db-types.js";
 import { logger } from "../../lib/logger.js";
 import type { AccessContext } from "../access/access-context.js";
 import { assertProductionRole, isProductionAdmin } from "./access.js";
-import { loadSettings } from "./catalog.service.js";
 import { assertReportConfigUsable, usesMemberCustomFields } from "./reports.js";
 
 /**
@@ -110,9 +109,7 @@ const loadVisible = async (sql: QuerySql, context: AccessContext, reportId: stri
 };
 
 const checkConfig = async (context: AccessContext, config: ReportConfig) => {
-  const sql = getSql();
-  const settings = await loadSettings(sql, org(context));
-  await assertReportConfigUsable(sql, context, config, settings.scoresPublic);
+  await assertReportConfigUsable(getSql(), context, config);
 };
 
 const assertCanPin = (context: AccessContext) => {

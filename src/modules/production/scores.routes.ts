@@ -23,14 +23,16 @@ import {
   ScoreBoardQuerySchema,
   ScoreBoardSchema,
   ScoreForecastSchema,
-  TaskScoresSchema
+  TaskScoresSchema,
+  UserScoreForecastSchema,
+  UserScoresSchema
 } from "../../contracts/production-scores.js";
 import { withCustomFieldFilters } from "../../contracts/production-catalog.js";
 import { requireSupabaseUser } from "../../middleware/auth.js";
 import { handle, param } from "./http.js";
 import { getKpiReport, listKpiSettlementRuns, listKpiSettlements, runKpiSettlement } from "./kpi-settlement.service.js";
 import { applyDefaultKpiTargets, deleteKpiTarget, getKpiTargetMatrix, importKpiTargets, putKpiTargets } from "./kpi-targets.service.js";
-import { getMyScores, getScoreBoard, getScoreForecast, getTaskScores } from "./scores.service.js";
+import { getMyScores, getScoreBoard, getScoreForecast, getTaskScores, getUserScoreForecast, getUserScores } from "./scores.service.js";
 
 /**
  * Production scores & KPI — SPEC Phase 3 (scores, targets) and Phase 6 (settlement, KPI report). Every handler checks production roles itself (PD-011):
@@ -45,10 +47,21 @@ export const createProductionScoreRoutes = (): ExpressRouter => {
     "/production/scores/forecast",
     handle(async (context, req) => ScoreForecastSchema.parse(await getScoreForecast(context, ForecastQuerySchema.parse(req.query))))
   );
+  // "Điểm cá nhân" of any production member, for every production member (PD-052)
+  routes.get(
+    "/production/scores/user/:userId",
+    handle(async (context, req) => UserScoresSchema.parse(await getUserScores(context, param(req, "userId"), MyScoresQuerySchema.parse(req.query))))
+  );
+  routes.get(
+    "/production/scores/user/:userId/forecast",
+    handle(async (context, req) =>
+      UserScoreForecastSchema.parse(await getUserScoreForecast(context, param(req, "userId"), ForecastQuerySchema.parse(req.query)))
+    )
+  );
   routes.get("/production/scores/task/:taskId", handle(async (context, req) => TaskScoresSchema.parse(await getTaskScores(context, param(req, "taskId")))));
   routes.get("/production/scores/board", handle(async (context, req) => ScoreBoardSchema.parse(await getScoreBoard(context, ScoreBoardQuerySchema.parse(withCustomFieldFilters(req.query))))));
 
-  // KPI targets (ADMIN)
+  // KPI targets: read by ADMIN, written by the superadmin only (PD-050, like the KPI close run below)
   routes.get(
     "/production/kpi-targets",
     handle(async (context, req) => KpiTargetMatrixSchema.parse(await getKpiTargetMatrix(context, KpiTargetMatrixQuerySchema.parse(req.query))))

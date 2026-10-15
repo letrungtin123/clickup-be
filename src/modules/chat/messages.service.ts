@@ -46,7 +46,17 @@ import {
   requireReadableChannel,
   type ResolvedChannel
 } from "./chat-access.js";
-import { toUserRef, unreadCountSql, userJsonSql, type UserRefJson } from "./chat-mappers.js";
+import {
+  groupReactionRows,
+  reactorsAggSql,
+  toReactors,
+  toUserRef,
+  unreadCountSql,
+  userJsonSql,
+  type ReactionUserRow,
+  type ReactorJson,
+  type UserRefJson
+} from "./chat-mappers.js";
 import { assertChatAttachmentsEnabled } from "./chat-settings.js";
 import { consumeChatQuota } from "./chat-rate-limit.js";
 import {
@@ -634,10 +644,22 @@ export const setReaction = async (context: AccessContext, messageId: string, emo
       `;
       changed = removed.length > 0;
     }
-    const count =
-      (await tx<{ n: number }[]>`SELECT count(*)::int AS n FROM public.message_reactions WHERE message_id = ${messageId} AND emoji = ${emoji}`)[0]
-        ?.n ?? 0;
-    return { changed, count, channelId: message.channel_id, threadRootId: message.thread_root_id };
+    // The emoji's new total and first reactors in one statement (the event and the response carry both).
+    const totals = (
+      await tx<{ n: number; users: ReactorJson[] | null }[]>`
+        SELECT count(*)::int AS n, ${reactorsAggSql(tx)} AS users
+        FROM public.message_reactions mr
+        LEFT JOIN public.app_users au ON au.id = mr.user_id
+        WHERE mr.message_id = ${messageId} AND mr.emoji = ${emoji}
+      `
+    )[0];
+    return {
+      changed,
+      count: totals?.n ?? 0,
+      users: toReactors(totals?.users),
+      channelId: message.channel_id,
+      threadRootId: message.thread_root_id
+    };
   });
 
   if (outcome.changed) {
@@ -647,11 +669,12 @@ export const setReaction = async (context: AccessContext, messageId: string, emo
       threadRootId: outcome.threadRootId,
       emoji,
       count: outcome.count,
+      users: outcome.users,
       userId: context.user.id,
       added: add
     });
   }
-  return { messageId, emoji, count: outcome.count, reactedByMe: add };
+  return { messageId, emoji, count: outcome.count, reactedByMe: add, users: outcome.users };
 };
 
 /**
@@ -676,7 +699,7 @@ export const getReactionUsers = async (context: AccessContext, messageId: string
   if (base.deleted_at) {
     return { messageId, items: [] };
   }
-  const rows = await sql<{ emoji: string; user_id: string; display_name: string; avatar_url: string | null }[]>`
+  const rows = await sql<ReactionUserRow[]>`
     SELECT r.emoji, r.user_id, u.display_name, u.avatar_url,
       min(r.created_at) OVER (PARTITION BY r.emoji) AS first_at
     FROM public.message_reactions r
@@ -684,15 +707,8 @@ export const getReactionUsers = async (context: AccessContext, messageId: string
     WHERE r.organization_id = ${context.organization.id} AND r.message_id = ${messageId}
     ORDER BY first_at, r.emoji, r.created_at, r.user_id
   `;
-  const items = new Map<string, ReactionUsers["items"][number]>();
-  for (const row of rows) {
-    const item = items.get(row.emoji) ?? { emoji: row.emoji, count: 0, reactedByMe: false, users: [] };
-    item.count += 1;
-    item.reactedByMe ||= row.user_id === context.user.id;
-    item.users.push({ id: row.user_id, displayName: row.display_name, email: null, avatarUrl: row.avatar_url });
-    items.set(row.emoji, item);
-  }
-  return { messageId, items: [...items.values()] };
+  // Everyone (no preview cap): this is the full "who reacted" list.
+  return { messageId, items: groupReactionRows(rows, context.user.id, Number.POSITIVE_INFINITY) };
 };
 
 // Read state -------------------------------------------------------------------------------------

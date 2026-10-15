@@ -299,16 +299,15 @@ export const assertProductionRolesCovered = async (sql: QuerySql, context: Works
 };
 
 /**
- * PD-041: production (Photo Retouch) roles granted from outside the production module (Cài đặt › Thành viên) need a
- * production ADMIN or the organization superadmin — the people who manage production roles in the module (PD-024).
- * Holding the granted role yourself is not enough (stricter than `assertProductionRolesCovered`). Removing roles
- * stays covered by `assertProductionRolesCovered` on the target.
+ * PD-041 / PD-050: production (Photo Retouch) roles are part of "Cấu hình Photo Retouch", which only the organization
+ * superadmin edits — granting or taking away a production role (here or in Cài đặt › Thành viên, joining or leaving the
+ * Photo Retouch department included) needs the superadmin; a production ADMIN no longer may.
  */
 export const assertCanGrantProductionRoles = (context: WorkspaceContext, roles: readonly string[]) => {
-  if (roles.length === 0 || context.hasFullOrganizationAuthority || context.productionRoles.includes("ADMIN")) {
+  if (roles.length === 0 || context.hasFullOrganizationAuthority) {
     return;
   }
-  throw new AppError("PRODUCTION_ROLE_ESCALATION", "Chỉ Quản trị Photo Retouch hoặc superadmin mới gán được vai trò Photo Retouch.", 403);
+  throw new AppError("PRODUCTION_ROLE_ESCALATION", "Chỉ Siêu quản trị mới gán hoặc bỏ được vai trò Photo Retouch.", 403);
 };
 
 /** Role edits and deletions need every capability of the role (and never the caller's own role, WK-40). */

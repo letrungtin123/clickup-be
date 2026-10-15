@@ -492,10 +492,19 @@ export const TaskKeyLookupSchema = z.object({ id: Id, projectId: Id });
 
 // Directory ---------------------------------------------------------------------------------------
 
+/**
+ * People search. `purpose=dm` ("Tin nhắn mới"): open to every active member — names and avatars of the people the
+ * caller may start a direct message with (colleagues sharing a department, superadmins; anyone for callers who may
+ * create channels), e-mails only for holders of member.view. `projectId` / `channelId` are ignored with it.
+ */
+export const DirectoryPurposeSchema = z.enum(["dm"]);
+export type DirectoryPurpose = z.infer<typeof DirectoryPurposeSchema>;
+
 export const DirectoryQuerySchema = z.object({
   q: SafeSearchSchema(120).optional(),
   projectId: Id.optional(),
   channelId: Id.optional(),
+  purpose: DirectoryPurposeSchema.optional(),
   limit: z.coerce.number().int().min(1).max(50).default(20)
 });
 export const DirectoryCollectionSchema = z.object({ items: z.array(UserRefSchema) });

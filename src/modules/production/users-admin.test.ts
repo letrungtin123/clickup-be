@@ -4,7 +4,7 @@ import { CreateProductionUserRequestSchema, UpdateProductionUserRequestSchema } 
 import type { AccessContext } from "../access/access-context.js";
 
 /**
- * Production user administration (PD-024, PD-041): who may do what, and the follow-ups of a role or department change.
+ * Production user administration (PD-024, PD-041, PD-050): who may do what, and the follow-ups of a role or department change.
  * The workspace member services, the catalog update, job chats, department access effects and realtime are mocked; a
  * fake tagged-template `sql` answers the target lookups and records every statement.
  */
@@ -55,7 +55,7 @@ vi.mock("../work/department-access.js", () => ({
   publishDepartmentAccessRevoked: mocks.publishDepartmentAccessRevoked
 }));
 
-const { createProductionUser, updateProductionUser, setProductionUserActive, resetProductionUserPassword, getLedJobs } = await import(
+const { applyDepartmentChange, createProductionUser, updateProductionUser, setProductionUserActive, resetProductionUserPassword, getLedJobs } = await import(
   "./users-admin.service.js"
 );
 
@@ -157,10 +157,10 @@ beforeEach(() => {
   mocks.listOpenJobsLedBy.mockResolvedValue({ displayName: "Người A", leaderActive: false, items: [] });
 });
 
-describe("only production ADMIN (superadmins included) may administer users", () => {
-  it("STAFF / LEADER / ACCOUNT get 403 and nothing is read; non-members get 404", async () => {
-    for (const roles of [["STAFF"], ["LEADER"], ["ACCOUNT", "QC"]]) {
-      const context = contextWith(roles);
+describe("only the organization superadmin may administer users (PD-050)", () => {
+  it("production ADMIN / STAFF / LEADER / ACCOUNT get 403 and nothing is read; non-members get 404", async () => {
+    for (const roles of [["ADMIN"], ["ADMIN", "LEADER"], ["STAFF"], ["LEADER"], ["ACCOUNT", "QC"]]) {
+      const context = contextWith(roles, false, me, ["PHOTO_RETOUCH", "PRODUCTION"]);
       expect(
         await failure(
           createProductionUser(
@@ -170,12 +170,16 @@ describe("only production ADMIN (superadmins included) may administer users", ()
         )
       ).toEqual({ code: "FORBIDDEN", status: 403 });
       expect(await failure(setProductionUserActive(context, target, false))).toEqual({ code: "FORBIDDEN", status: 403 });
+      expect(await failure(setProductionUserActive(context, target, true))).toEqual({ code: "FORBIDDEN", status: 403 });
       expect(await failure(resetProductionUserPassword(context, target))).toEqual({ code: "FORBIDDEN", status: 403 });
       expect(await failure(updateProductionUser(context, target, { roles: ["STAFF"] }))).toEqual({ code: "FORBIDDEN", status: 403 });
+      expect(await failure(updateProductionUser(context, target, { teamId }))).toEqual({ code: "FORBIDDEN", status: 403 });
       expect(await failure(updateProductionUser(context, target, { departments: ["PRODUCTION"] }))).toEqual({ code: "FORBIDDEN", status: 403 });
     }
     expect(await failure(setProductionUserActive(contextWith([]), target, false))).toEqual({ code: "PRODUCTION_NOT_FOUND", status: 404 });
     expect(db.state.calls).toHaveLength(0);
+    expect(mocks.updateMember).not.toHaveBeenCalled();
+    expect(mocks.provision).not.toHaveBeenCalled();
     expect(mocks.afterMembershipStatusChange).not.toHaveBeenCalled();
   });
 
@@ -183,6 +187,7 @@ describe("only production ADMIN (superadmins included) may administer users", ()
     db.state.handler = answer({ member: memberRow(["LEADER"]) });
     mocks.listOpenJobsLedBy.mockResolvedValue({ displayName: "Người A", leaderActive: true, items: [ledJob] });
     expect(await getLedJobs(contextWith(["ACCOUNT"]), target)).toMatchObject({ userId: target, leaderActive: true, items: [ledJob] });
+    expect(await getLedJobs(admin, target)).toMatchObject({ userId: target, items: [ledJob] });
     expect(await failure(getLedJobs(contextWith(["STAFF"]), target))).toEqual({ code: "FORBIDDEN", status: 403 });
   });
 });
@@ -190,41 +195,35 @@ describe("only production ADMIN (superadmins included) may administer users", ()
 describe("escalation guards", () => {
   it("never on an organization superadmin — not even for another superadmin", async () => {
     db.state.handler = answer({ target: { status: "active", role_key: "superadmin", org_admin: true, roles: null } });
-    for (const context of [admin, superadmin]) {
-      expect(await failure(setProductionUserActive(context, target, false))).toEqual({ code: "ORG_ADMIN_PROTECTED", status: 403 });
-      expect(await failure(resetProductionUserPassword(context, target))).toEqual({ code: "ORG_ADMIN_PROTECTED", status: 403 });
-      // A superadmin implicitly belongs to every department: their departments are not edited here.
-      expect(await failure(updateProductionUser(context, target, { departments: ["PHOTO_RETOUCH"] }))).toEqual({ code: "ORG_ADMIN_PROTECTED", status: 403 });
-    }
-    expect(await failure(updateProductionUser(admin, target, { roles: ["STAFF"] }))).toEqual({ code: "ORG_ADMIN_PROTECTED", status: 403 });
+    expect(await failure(setProductionUserActive(superadmin, target, false))).toEqual({ code: "ORG_ADMIN_PROTECTED", status: 403 });
+    expect(await failure(resetProductionUserPassword(superadmin, target))).toEqual({ code: "ORG_ADMIN_PROTECTED", status: 403 });
+    // A superadmin implicitly belongs to every department: their departments are not edited here.
+    expect(await failure(updateProductionUser(superadmin, target, { departments: ["PHOTO_RETOUCH"] }))).toEqual({ code: "ORG_ADMIN_PROTECTED", status: 403 });
+    expect(await failure(updateProductionUser(superadmin, target, { roles: ["STAFF"] }))).toEqual({ code: "ORG_ADMIN_PROTECTED", status: 403 });
     expect(mocks.issueTemporaryPassword).not.toHaveBeenCalled();
     expect(mocks.updateMember).not.toHaveBeenCalled();
     expect(db.state.calls.some((call) => call.text.startsWith("UPDATE public.organization_memberships"))).toBe(false);
   });
 
-  it("organization admins (member.manage / role.*): only a superadmin may disable, reset, re-role or move them", async () => {
+  it("organization admins (member.manage / role.*): the superadmin may disable, reset, re-role or move them", async () => {
     db.state.handler = answer({ target: { status: "active", role_key: "manager", org_admin: true, roles: ["QC"] }, member: memberRow(["QC"], false) });
-    expect(await failure(setProductionUserActive(admin, target, false))).toEqual({ code: "ORG_ADMIN_PROTECTED", status: 403 });
-    expect(await failure(resetProductionUserPassword(admin, target))).toEqual({ code: "ORG_ADMIN_PROTECTED", status: 403 });
-    expect(await failure(updateProductionUser(admin, target, { roles: ["QC", "LEADER"] }))).toEqual({ code: "ORG_ADMIN_PROTECTED", status: 403 });
-    expect(await failure(updateProductionUser(admin, target, { departments: ["PHOTO_RETOUCH", "PRODUCTION"] }))).toEqual({
-      code: "ORG_ADMIN_PROTECTED",
-      status: 403
-    });
-    // Profile data (team, custom fields, tags) stays editable; resending the same departments is no change.
+    mocks.updateMember.mockResolvedValueOnce({ userId: target, roles: ["QC", "LEADER"] });
+    expect(await updateProductionUser(superadmin, target, { roles: ["QC", "LEADER"] })).toMatchObject({ orphanedJobs: [] });
     mocks.updateMember.mockResolvedValueOnce({ userId: target, roles: ["QC"] });
-    expect(await updateProductionUser(admin, target, { teamId })).toMatchObject({ orphanedJobs: [] });
+    expect(await updateProductionUser(superadmin, target, { departments: ["PHOTO_RETOUCH", "PRODUCTION"] })).toMatchObject({ orphanedJobs: [] });
+    // Profile data (team, custom fields, tags); resending the same departments is no change.
     mocks.updateMember.mockResolvedValueOnce({ userId: target, roles: ["QC"] });
-    expect(await updateProductionUser(admin, target, { departments: ["PHOTO_RETOUCH"], teamId })).toMatchObject({ orphanedJobs: [] });
-    // A superadmin may.
+    expect(await updateProductionUser(superadmin, target, { departments: ["PHOTO_RETOUCH"], teamId })).toMatchObject({ orphanedJobs: [] });
+    expect(mocks.disconnectUsers).toHaveBeenCalledTimes(2);
+    expect(await resetProductionUserPassword(superadmin, target)).toEqual({ temporaryPassword: "Temp-Password-123" });
     await setProductionUserActive(superadmin, target, false);
     expect(mocks.afterMembershipStatusChange).toHaveBeenCalledWith(target, "disabled");
   });
 
   it("not on yourself: no self-deactivation, no self-reset (use change password)", async () => {
     db.state.handler = answer({ target: plainTarget });
-    expect(await failure(setProductionUserActive(admin, me, false))).toEqual({ code: "SELF_DEACTIVATE_FORBIDDEN", status: 409 });
-    expect(await failure(resetProductionUserPassword(admin, me))).toEqual({ code: "SELF_RESET_FORBIDDEN", status: 409 });
+    expect(await failure(setProductionUserActive(superadmin, me, false))).toEqual({ code: "SELF_DEACTIVATE_FORBIDDEN", status: 409 });
+    expect(await failure(resetProductionUserPassword(superadmin, me))).toEqual({ code: "SELF_RESET_FORBIDDEN", status: 409 });
   });
 
   it("the body cannot carry an organization role or unknown fields; departments required, production roles iff PHOTO_RETOUCH", () => {
@@ -273,12 +272,12 @@ describe("create", () => {
     db.state.handler = answer({ role: { id: memberRoleId, org_admin: false }, team: true, member: memberRow(["QC", "STAFF"]) });
     const tx: Call[] = [];
     provisionRunsExtra(tx);
-    const created = await createProductionUser(admin, input);
+    const created = await createProductionUser(superadmin, input);
     expect(created).toMatchObject({
       temporaryPassword: "Temp-Password-123",
       member: { userId: target, roles: ["QC", "STAFF"], departments: ["PHOTO_RETOUCH"] }
     });
-    expect(mocks.writeMemberDepartments).toHaveBeenCalledWith(expect.anything(), admin, {
+    expect(mocks.writeMemberDepartments).toHaveBeenCalledWith(expect.anything(), superadmin, {
       userId: target,
       departments: ["PHOTO_RETOUCH"],
       productionRoles: ["STAFF", "QC"]
@@ -291,21 +290,21 @@ describe("create", () => {
     db.state.handler = answer({ role: { id: memberRoleId, org_admin: false }, member: memberRow([], true, ["PRODUCTION"]) });
     provisionRunsExtra([]);
     const productionOnly = CreateProductionUserRequestSchema.parse({ email: "p@example.test", displayName: "P", departments: ["PRODUCTION"] });
-    // The caller must belong to PRODUCTION to hand it out.
-    expect(await failure(createProductionUser(admin, productionOnly))).toEqual({ code: "DEPARTMENT_ESCALATION", status: 403 });
-    expect(mocks.provision).not.toHaveBeenCalled();
+    // A production Admin cannot create it, even one in both departments (PD-050).
     const both = contextWith(["ADMIN"], false, me, ["PHOTO_RETOUCH", "PRODUCTION"]);
-    expect(await createProductionUser(both, productionOnly)).toMatchObject({ member: { roles: [], departments: ["PRODUCTION"] } });
-    expect(mocks.writeMemberDepartments).toHaveBeenCalledWith(expect.anything(), both, { userId: target, departments: ["PRODUCTION"], productionRoles: [] });
+    expect(await failure(createProductionUser(both, productionOnly))).toEqual({ code: "FORBIDDEN", status: 403 });
+    expect(mocks.provision).not.toHaveBeenCalled();
+    expect(await createProductionUser(superadmin, productionOnly)).toMatchObject({ member: { roles: [], departments: ["PRODUCTION"] } });
+    expect(mocks.writeMemberDepartments).toHaveBeenCalledWith(expect.anything(), superadmin, { userId: target, departments: ["PRODUCTION"], productionRoles: [] });
   });
 
   it("refuses when the default role is missing or carries organization admin permissions", async () => {
     db.state.handler = answer({ role: null });
-    expect(await failure(createProductionUser(admin, input))).toEqual({ code: "DEFAULT_ROLE_MISSING", status: 409 });
+    expect(await failure(createProductionUser(superadmin, input))).toEqual({ code: "DEFAULT_ROLE_MISSING", status: 409 });
     db.state.handler = answer({ role: { id: memberRoleId, org_admin: true } });
-    expect(await failure(createProductionUser(admin, input))).toEqual({ code: "DEFAULT_ROLE_UNSAFE", status: 409 });
+    expect(await failure(createProductionUser(superadmin, input))).toEqual({ code: "DEFAULT_ROLE_UNSAFE", status: 409 });
     db.state.handler = answer({ role: { id: memberRoleId, org_admin: false }, team: false });
-    expect(await failure(createProductionUser(admin, input))).toEqual({ code: "TEAM_NOT_FOUND", status: 404 });
+    expect(await failure(createProductionUser(superadmin, input))).toEqual({ code: "TEAM_NOT_FOUND", status: 404 });
     expect(mocks.provision).not.toHaveBeenCalled();
   });
 });
@@ -315,9 +314,9 @@ describe("role changes (SEC2-04 follow-up)", () => {
     db.state.handler = answer({ target: plainTarget });
     mocks.updateMember.mockResolvedValueOnce({ userId: target, roles: ["QC"] });
     mocks.listOpenJobsLedBy.mockResolvedValueOnce({ displayName: "Người A", leaderActive: false, items: [ledJob] });
-    const result = await updateProductionUser(admin, target, { roles: ["QC"] });
+    const result = await updateProductionUser(superadmin, target, { roles: ["QC"] });
     expect(result.orphanedJobs).toEqual([ledJob]);
-    expect(mocks.syncJobChatsForMember).toHaveBeenCalledWith(admin, target);
+    expect(mocks.syncJobChatsForMember).toHaveBeenCalledWith(superadmin, target);
     expect(mocks.disconnectUsers).toHaveBeenCalledWith([target]);
     expect(mocks.enqueueDomainEvents).toHaveBeenCalledTimes(1);
     const [, events] = mocks.enqueueDomainEvents.mock.calls[0] as unknown as [unknown, { type: string; payload: Record<string, unknown> }[]];
@@ -327,9 +326,9 @@ describe("role changes (SEC2-04 follow-up)", () => {
   it("no event and no chat sync when nothing leading was removed or the roles did not change", async () => {
     db.state.handler = answer({ target: plainTarget });
     mocks.updateMember.mockResolvedValueOnce({ userId: target, roles: ["LEADER", "QC", "STAFF"] });
-    expect(await updateProductionUser(admin, target, { roles: ["LEADER", "QC", "STAFF"] })).toMatchObject({ orphanedJobs: [] });
+    expect(await updateProductionUser(superadmin, target, { roles: ["LEADER", "QC", "STAFF"] })).toMatchObject({ orphanedJobs: [] });
     mocks.updateMember.mockResolvedValueOnce({ userId: target, roles: ["LEADER", "QC"] });
-    expect(await updateProductionUser(admin, target, { roles: ["QC", "LEADER"] })).toMatchObject({ orphanedJobs: [] });
+    expect(await updateProductionUser(superadmin, target, { roles: ["QC", "LEADER"] })).toMatchObject({ orphanedJobs: [] });
     expect(mocks.syncJobChatsForMember).not.toHaveBeenCalled();
     expect(mocks.enqueueDomainEvents).not.toHaveBeenCalled();
   });
@@ -337,18 +336,18 @@ describe("role changes (SEC2-04 follow-up)", () => {
   it("deactivation ends sessions (shared flow), leaves job chats and reports the jobs still led", async () => {
     db.state.handler = answer({ target: plainTarget, member: memberRow(["LEADER", "QC"], false) });
     mocks.listOpenJobsLedBy.mockResolvedValueOnce({ displayName: "Người A", leaderActive: false, items: [ledJob] });
-    const result = await setProductionUserActive(admin, target, false);
+    const result = await setProductionUserActive(superadmin, target, false);
     expect(db.state.calls.some((call) => call.text.startsWith("UPDATE public.organization_memberships") && call.values.includes("disabled"))).toBe(true);
     expect(mocks.invalidateAccessContexts).toHaveBeenCalled();
     expect(mocks.afterMembershipStatusChange).toHaveBeenCalledWith(target, "disabled");
-    expect(mocks.syncJobChatsForMember).toHaveBeenCalledWith(admin, target);
+    expect(mocks.syncJobChatsForMember).toHaveBeenCalledWith(superadmin, target);
     expect(result).toMatchObject({ member: { active: false }, orphanedJobs: [ledJob] });
     expect(mocks.enqueueDomainEvents).toHaveBeenCalledTimes(1);
   });
 
   it("reset password issues a one-time password for an ordinary account", async () => {
     db.state.handler = answer({ target: plainTarget });
-    expect(await resetProductionUserPassword(admin, target)).toEqual({ temporaryPassword: "Temp-Password-123" });
+    expect(await resetProductionUserPassword(superadmin, target)).toEqual({ temporaryPassword: "Temp-Password-123" });
     expect(mocks.issueTemporaryPassword).toHaveBeenCalledWith(target);
   });
 });
@@ -362,19 +361,19 @@ describe("department changes (PD-041)", () => {
     updateMemberRunsHook({ userId: target, roles: [], departments: ["PRODUCTION"] });
     mocks.listOpenJobsLedBy.mockResolvedValueOnce({ displayName: "Người A", leaderActive: false, items: [ledJob] });
     mocks.revokeDepartmentAccessEffects.mockResolvedValueOnce([{ id: jobId, projectId: jobId, listId: jobId, parentTaskId: null }]);
-    const result = await updateProductionUser(admin, target, { departments: ["PRODUCTION"] });
+    const result = await updateProductionUser(superadmin, target, { departments: ["PRODUCTION"] });
 
     const departmentDelete = statements("DELETE FROM public.user_departments")[0]!;
     expect(departmentDelete.values).toContainEqual(["PHOTO_RETOUCH"]);
     const roleDelete = statements("DELETE FROM production.user_roles")[0]!;
     expect(roleDelete.values).toContainEqual(["LEADER", "QC"]);
     expect(statements("INSERT INTO production.user_roles")).toHaveLength(0);
-    expect(mocks.revokeDepartmentAccessEffects).toHaveBeenCalledWith(expect.anything(), admin, target, "PHOTO_RETOUCH");
-    expect(mocks.publishDepartmentAccessRevoked).toHaveBeenCalledWith(admin, target, "PHOTO_RETOUCH", [
+    expect(mocks.revokeDepartmentAccessEffects).toHaveBeenCalledWith(expect.anything(), superadmin, target, "PHOTO_RETOUCH");
+    expect(mocks.publishDepartmentAccessRevoked).toHaveBeenCalledWith(superadmin, target, "PHOTO_RETOUCH", [
       { id: jobId, projectId: jobId, listId: jobId, parentTaskId: null }
     ]);
     expect(mocks.disconnectUsers).toHaveBeenCalledWith([target]);
-    expect(mocks.syncJobChatsForMember).toHaveBeenCalledWith(admin, target);
+    expect(mocks.syncJobChatsForMember).toHaveBeenCalledWith(superadmin, target);
     expect(result.orphanedJobs).toEqual([ledJob]);
     expect(mocks.enqueueDomainEvents).toHaveBeenCalledTimes(1);
   });
@@ -383,39 +382,48 @@ describe("department changes (PD-041)", () => {
     const productionOnly: TargetRow = { status: "active", role_key: "member", org_admin: false, roles: null, departments: ["PRODUCTION"] };
     db.state.handler = answer({ target: productionOnly });
     updateMemberRunsHook({ userId: target, roles: [] });
-    expect(await failure(updateProductionUser(both, target, { departments: ["PHOTO_RETOUCH", "PRODUCTION"] }))).toEqual({
+    expect(await failure(updateProductionUser(superadmin, target, { departments: ["PHOTO_RETOUCH", "PRODUCTION"] }))).toEqual({
       code: "PRODUCTION_ROLES_REQUIRED",
       status: 400
     });
 
     db.state.calls = [];
     updateMemberRunsHook({ userId: target, roles: ["STAFF"] });
-    await updateProductionUser(both, target, { departments: ["PHOTO_RETOUCH", "PRODUCTION"], roles: ["STAFF"] });
+    await updateProductionUser(superadmin, target, { departments: ["PHOTO_RETOUCH", "PRODUCTION"], roles: ["STAFF"] });
     expect(statements("INSERT INTO public.user_departments")[0]!.values).toContainEqual(["PHOTO_RETOUCH"]);
     expect(statements("INSERT INTO production.user_roles")[0]!.values).toContainEqual(["STAFF"]);
     expect(statements("INSERT INTO production.member_profiles")).toHaveLength(1);
     expect(mocks.revokeDepartmentAccessEffects).not.toHaveBeenCalled();
   });
 
-  it("production roles outside PHOTO_RETOUCH are refused; only departments the caller belongs to change", async () => {
+  it("production roles outside PHOTO_RETOUCH are refused", async () => {
     db.state.handler = answer({ target: leaderInBoth });
     updateMemberRunsHook({ userId: target, roles: [] });
-    expect(await failure(updateProductionUser(admin, target, { departments: ["PRODUCTION"], roles: ["QC"] }))).toEqual({
+    expect(await failure(updateProductionUser(superadmin, target, { departments: ["PRODUCTION"], roles: ["QC"] }))).toEqual({
       code: "PRODUCTION_ROLES_NOT_ALLOWED",
       status: 400
-    });
-    // `admin` is only in PHOTO_RETOUCH: removing PRODUCTION is an escalation.
-    updateMemberRunsHook({ userId: target, roles: ["LEADER", "QC"] });
-    expect(await failure(updateProductionUser(admin, target, { departments: ["PHOTO_RETOUCH"] }))).toEqual({
-      code: "DEPARTMENT_ESCALATION",
-      status: 403
     });
     expect(statements("DELETE FROM public.user_departments")).toHaveLength(0);
   });
 
-  it("you cannot drop your own ADMIN by leaving PHOTO_RETOUCH", async () => {
-    db.state.handler = answer({ target: { status: "active", role_key: "member", org_admin: false, roles: ["ADMIN"], departments: ["PHOTO_RETOUCH", "PRODUCTION"] } });
-    updateMemberRunsHook({ userId: me, roles: [] });
-    expect(await failure(updateProductionUser(both, me, { departments: ["PRODUCTION"] }))).toEqual({ code: "SELF_ADMIN_REMOVAL", status: 409 });
+  // The shared department change also serves Cài đặt › Thành viên (organization member.manage), where a caller who is
+  // not the superadmin may still reach it: its own guards stay.
+  it("shared change: only departments the caller belongs to change; leaving PHOTO_RETOUCH (dropping its roles) needs the superadmin", async () => {
+    db.state.handler = answer({ target: leaderInBoth });
+    // `admin` is only in PHOTO_RETOUCH: removing PRODUCTION is an escalation.
+    expect(
+      await failure(
+        applyDepartmentChange(db.sql as never, admin, { userId: target, superadminBefore: false, superadminAfter: false, departments: ["PHOTO_RETOUCH"] })
+      )
+    ).toEqual({ code: "DEPARTMENT_ESCALATION", status: 403 });
+    expect(statements("DELETE FROM public.user_departments")).toHaveLength(0);
+
+    db.state.handler = answer({
+      target: { status: "active", role_key: "member", org_admin: false, roles: ["ADMIN"], departments: ["PHOTO_RETOUCH", "PRODUCTION"] }
+    });
+    expect(
+      await failure(applyDepartmentChange(db.sql as never, both, { userId: me, superadminBefore: false, superadminAfter: false, departments: ["PRODUCTION"] }))
+    ).toEqual({ code: "PRODUCTION_ROLE_ESCALATION", status: 403 });
+    expect(statements("DELETE FROM production.user_roles")).toHaveLength(0);
   });
 });

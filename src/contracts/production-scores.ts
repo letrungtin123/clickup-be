@@ -174,6 +174,41 @@ export const MyScoresSchema = z.object({
 });
 export type MyScores = z.infer<typeof MyScoresSchema>;
 
+// Another member's scores — "Điểm cá nhân" (PD-052) -------------------------------------------------------
+
+const HiddenMoney = z.number().int().nullable();
+
+/** Totals of another member: `moneyKhoanProvisional` is null while the viewer may not see that person's money. */
+export const ScoreTotalsViewSchema = ScoreTotalsSchema.extend({ moneyKhoanProvisional: HiddenMoney });
+export type ScoreTotalsView = z.infer<typeof ScoreTotalsViewSchema>;
+/** A ledger row of another member: `money` is null while hidden. */
+export const ScoreEntryViewSchema = ScoreEntrySchema.extend({ money: HiddenMoney });
+export type ScoreEntryView = z.infer<typeof ScoreEntryViewSchema>;
+
+/**
+ * GET /production/scores/user/:userId — "Điểm cá nhân" of one production member (PD-052): what GET
+ * /production/scores/me gives its owner (same query, same paging), for that person, plus who they are. Every
+ * production member may ask; a user who is not an active production member of the organization → 404
+ * SCORE_USER_NOT_FOUND. Money (`moneyKhoanProvisional` of the summary and the cards, `money` of the entries) is
+ * null unless the person is the caller, the caller is ADMIN, or settings.moneyPublic (`moneyVisible`).
+ */
+export const UserScoresSchema = MyScoresSchema.extend({
+  /** The person (e-mail only for themselves and the people who organise the work, SEC2-09). */
+  user: UserRefSchema,
+  teamId: Id.nullable(),
+  teamName: z.string().nullable(),
+  /** The caller sees this person's money. */
+  moneyVisible: z.boolean(),
+  summary: ScoreSummarySchema.extend({ moneyKhoanProvisional: HiddenMoney }),
+  cards: z.object({
+    today: ScoreTotalsViewSchema,
+    week: ScoreTotalsViewSchema,
+    period: ScoreTotalsViewSchema.extend({ period: PeriodKeySchema, from: DateOnly, to: DateOnly })
+  }),
+  entries: z.array(ScoreEntryViewSchema)
+});
+export type UserScores = z.infer<typeof UserScoresSchema>;
+
 // Forecast & KPI progress ------------------------------------------------------------------------------
 
 export const KpiProgressSchema = z.object({
@@ -225,6 +260,13 @@ export const ScoreForecastSchema = z.object({
 });
 export type ScoreForecast = z.infer<typeof ScoreForecastSchema>;
 
+/**
+ * GET /production/scores/user/:userId/forecast — the KPI forecast of one production member (PD-052, same rules as
+ * GET /production/scores/user/:userId); `moneyKhoanProvisional` is null unless the caller sees that person's money.
+ */
+export const UserScoreForecastSchema = ScoreForecastSchema.extend({ moneyKhoanProvisional: HiddenMoney });
+export type UserScoreForecast = z.infer<typeof UserScoreForecastSchema>;
+
 // Board ------------------------------------------------------------------------------------------------
 
 /**
@@ -239,9 +281,9 @@ export const ScoreBoardQuerySchema = z.object({
 });
 
 /**
- * GET /production/scores/board — public points (SPEC §5.4). `money` is null unless the row is the
- * caller's own, the caller is ADMIN, or settings.moneyPublic. The whole board is 403 when
- * settings.scoresPublic is off (ADMIN still sees it).
+ * GET /production/scores/board — public points (SPEC §5.4), open to every production member (PD-052: no longer
+ * gated by settings.scoresPublic). `money` is null unless the row is the caller's own, the caller is ADMIN, or
+ * settings.moneyPublic. Each row opens that person's "Điểm cá nhân" (GET /production/scores/user/:userId).
  */
 export const ScoreBoardSchema = z.object({
   period: PeriodKeySchema,
@@ -362,7 +404,10 @@ export type ApplyDefaultKpiResult = z.infer<typeof ApplyDefaultKpiResultSchema>;
 
 // Task scores ------------------------------------------------------------------------------------------------
 
-/** Score rows of one task (task detail). `money` is null unless the row is the caller's, the caller is ADMIN, or money is public. */
+/**
+ * Score rows of one task (task detail): everyone's rows, for whoever may see the task (PD-052). `money` is null unless
+ * the row is the caller's, the caller is ADMIN, or money is public.
+ */
 export const TaskScoreEntrySchema = ScoreEntrySchema.extend({ user: UserRefSchema, money: z.number().int().nullable() });
 export type TaskScoreEntry = z.infer<typeof TaskScoreEntrySchema>;
 
@@ -425,7 +470,7 @@ export const KpiSettlementRunSchema = z.object({
 });
 export type KpiSettlementRun = z.infer<typeof KpiSettlementRunSchema>;
 
-/** One person's settled period (SPEC §8.1). Money fields are null unless the caller is ADMIN or the owner. */
+/** One person's settled period (SPEC §8.1). Money fields are null unless the caller is ADMIN or the owner, or settings.moneyPublic. */
 export const KpiSettlementSchema = z.object({
   id: Id,
   user: UserRefSchema,
@@ -463,9 +508,12 @@ export const RunKpiSettlementRequestSchema = z
 export const KpiSettlementRunResultSchema = z.object({ run: KpiSettlementRunSchema, items: z.array(KpiSettlementSchema) });
 export type KpiSettlementRunResult = z.infer<typeof KpiSettlementRunResultSchema>;
 
-/** Default period: the latest closed one. */
-export const KpiSettlementQuerySchema = z.object({ period: PeriodKeySchema.optional() });
-/** ADMIN: every row of the period plus its current run; other members: only their own row and no run. */
+/**
+ * Default period: the latest closed one. `userId` (PD-052, "Điểm cá nhân"): only that production member's row, for
+ * any production member (404 SCORE_USER_NOT_FOUND when the user is not an active production member).
+ */
+export const KpiSettlementQuerySchema = z.object({ period: PeriodKeySchema.optional(), userId: Id.optional() });
+/** ADMIN: every row of the period plus its current run; other members: only their own row (or `userId`'s) and no run. */
 export const KpiSettlementListSchema = z.object({
   period: PeriodKeySchema,
   run: KpiSettlementRunSchema.nullable(),
@@ -484,10 +532,14 @@ export const KpiSettlementRunCollectionSchema = z.object({ items: z.array(KpiSet
 /**
  * At most 24 periods. ADMIN sees everyone (optionally one team, USER tags `tagId` and USER custom fields
  * `cf.<key>=…`); other members only themselves (tag / custom-field filters → 403 CUSTOM_FIELDS_FORBIDDEN).
+ * `userId` (PD-052, "Điểm cá nhân"): only that production member, for any production member (404
+ * SCORE_USER_NOT_FOUND when the user is not an active production member). Khoán money: ADMIN, the owner, or
+ * settings.moneyPublic.
  */
 export const KpiReportQuerySchema = z.object({
   from: PeriodKeySchema,
   to: PeriodKeySchema,
+  userId: Id.optional(),
   teamId: Id.optional(),
   tagId: IdListQuerySchema,
   cf: CustomFieldFiltersSchema

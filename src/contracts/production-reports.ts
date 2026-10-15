@@ -22,9 +22,8 @@ import { UserRefSchema } from "./work.js";
  *    late_count / task_count (late = `is_late`: not Done by its deadline).
  *  - `team` is the person's current team; `status` the task's current status; `month` the calendar
  *    month and `period` the KPI period (26 → 25 with settings.kpiCloseDay); `week` starts on Monday.
- *  - money_khoan is ADMIN only (403 otherwise). When settings.scoresPublic is off, non-admins cannot
- *    break points down by person: no `user` or `job` dimension and no `user` / `job` / `tag` filter with
- *    point measures (PR-11).
+ *  - money_khoan is ADMIN only (403 otherwise). Points by person / job are open to whoever runs reports
+ *    (PD-052 retired the settings.scoresPublic gate of PR-11).
  *  - `period` is the KPI period of the day under the CURRENT close day (like the board and the settlement),
  *    for score and task measures alike (PR-17).
  */
@@ -74,8 +73,7 @@ export type ReportMeasure = z.infer<typeof ReportMeasureSchema>;
  * MULTISELECT and TEXT fields (400 REPORT_INVALID otherwise). Row key = the stored value (option value / text),
  * `<dim>_label` = the option label; records without a value group under null ("Chưa có"). MULTISELECT groups by
  * each chosen option, so a record counts once per option (totals still count it once). USER fields are Admin data:
- * ADMIN only (403 CUSTOM_FIELDS_FORBIDDEN). With settings.scoresPublic off, job/task fields count as personal
- * breakdowns like `job` (PR-11).
+ * ADMIN only (403 CUSTOM_FIELDS_FORBIDDEN).
  */
 export const customFieldDimensionEntities = ["user", "job", "task", "client"] as const;
 export type CustomFieldDimensionEntity = (typeof customFieldDimensionEntities)[number];

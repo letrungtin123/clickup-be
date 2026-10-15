@@ -179,15 +179,16 @@ export const JobPermissionMatrixSchema = z
 export type JobPermissionMatrix = z.infer<typeof JobPermissionMatrixSchema>;
 
 const allScopes: JobScopes = { view: "all", create: "all", update: "all", delete: "all" };
-const ownScopes: JobScopes = { view: "own", create: "own", update: "own", delete: "own" };
 const noScopes: JobScopes = { view: "none", create: "none", update: "none", delete: "none" };
 /**
  * PD-047: staff see every job and update their own tasks but neither enter work ("Nhập công việc", "Chia task") nor delete
  * tasks — deleting their own subtasks before Done stays allowed whatever the delete scope (subtaskDeleteAllowed).
  */
 const staffScopes: JobScopes = { view: "all", create: "none", update: "own", delete: "none" };
-/** The owner's defaults (seeded by migration 20261013_0110; STAFF by 20261015_0200, PD-047). */
-export const defaultJobPermissions: JobPermissionMatrix = { ACCOUNT: allScopes, LEADER: allScopes, QC: ownScopes, STAFF: staffScopes };
+/** PD-051: QC people are staff too — no own work entry and no task delete; they see and update their own tasks. */
+const qcScopes: JobScopes = { view: "own", create: "none", update: "own", delete: "none" };
+/** The owner's defaults (seeded by migration 20261013_0110; STAFF by 20261015_0200, PD-047; QC by 20261015_0300, PD-051). */
+export const defaultJobPermissions: JobPermissionMatrix = { ACCOUNT: allScopes, LEADER: allScopes, QC: qcScopes, STAFF: staffScopes };
 
 const scopeRank: Record<JobPermissionScope, number> = { none: 0, own: 1, all: 2 };
 /** The more permissive of two scopes. */
@@ -260,6 +261,7 @@ export const ProductionMeSchema = z.object({
     kpiCloseDays: z.array(KpiCloseDayVersionSchema).min(1),
     /** What the next settlement does with Khoán money (PD-033); the scores pages word their hints after it. */
     khoanPayPolicy: KhoanPayPolicySchema,
+    /** Retired (PD-052): scores are always visible to every production member; kept for compatibility, gates nothing. */
     scoresPublic: z.boolean(),
     moneyPublic: z.boolean(),
     chatAttachmentsEnabled: z.boolean(),
@@ -602,7 +604,12 @@ export const ProductionSettingsSchema = z.object({
   kpiCloseDay: KpiCloseDaySchema,
   /** Read only: close-day versions, oldest first (the first has fromPeriod null). */
   kpiCloseDays: z.array(KpiCloseDayVersionSchema).min(1),
+  /**
+   * Retired (PD-052): the ranking, "Điểm cá nhân" and task scores are always visible to every production member.
+   * Still stored and accepted for compatibility; it gates nothing.
+   */
   scoresPublic: z.boolean(),
+  /** Others' Khoán money for every production member; otherwise ADMIN and the owner only. */
   moneyPublic: z.boolean(),
   kpiProrateLeave: z.boolean(),
   /** Khoán pay policy of the settlement (PD-033); applies to the next run (automatic or manual) and to provisional figures. */

@@ -516,7 +516,7 @@ export const exportJobs = async (context: AccessContext, res: Response, query: J
 
 // Score board ----------------------------------------------------------------------------------------------
 
-/** GET /production/scores/board/export — the board's own visibility rules (private board → 403, money). */
+/** GET /production/scores/board/export — the board's own visibility rules (every production member, PD-052; money). */
 export const exportScoreBoard = async (
   context: AccessContext,
   res: Response,
@@ -579,14 +579,22 @@ const peopleFilterRows = async (
 
 /**
  * GET /production/kpi/export — the Phase 6 KPI report (GET /production/kpi/report, same query and
- * visibility: ADMIN every person, others only themselves; Khoán money only for ADMIN and the owner).
+ * visibility: ADMIN every person, others only themselves, `userId` one production member (PD-052); Khoán money
+ * for ADMIN, the owner, or everyone when settings.moneyPublic).
  * One sheet per user × period, one for the quarter / year rollups (whole quarters / years, G8) and, for an
  * Admin, one with the team and organization totals per period / quarter / year.
  */
 export const exportKpi = async (
   context: AccessContext,
   res: Response,
-  query: { from: string; to: string; teamId?: string | undefined; tagId?: string[] | undefined; cf?: CustomFieldFilter[] | undefined }
+  query: {
+    from: string;
+    to: string;
+    userId?: string | undefined;
+    teamId?: string | undefined;
+    tagId?: string[] | undefined;
+    cf?: CustomFieldFilter[] | undefined;
+  }
 ) => {
   const report = await getKpiReport(context, query);
   const peopleFilters = await peopleFilterRows(context, query);

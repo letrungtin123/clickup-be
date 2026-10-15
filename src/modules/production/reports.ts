@@ -802,18 +802,12 @@ export const executeReport = async (
   };
 };
 
-const pointMeasures = new Set<ReportMeasure>(["points", "points_khoan"]);
-/** Breakdowns that single out people's points: a person, or a job / tag (often one worker, or a USER tag). */
-const personalDimensions = new Set<string>(["user", "job"]);
-const personalFilters = ["user", "job", "tag"] as const;
-
 /**
  * Who may run what: ADMIN and LEADER use reports (LEADER sees every job — PD-014). Money (money_khoan)
- * is ADMIN only — refused, never silently dropped. When settings.scoresPublic is off, non-admins cannot
- * break points down by person (PR-11): no `user` or `job` dimension and no `user` / `job` / `tag` filter
- * with point measures. Team / project / client / process / shift / time aggregates stay available.
+ * is ADMIN only — refused, never silently dropped. Members' custom fields are Admin data. Points by person / job
+ * are open (PD-052: every production member sees everyone's points, so settings.scoresPublic no longer gates PR-11).
  */
-export const assertReportAllowed = (context: AccessContext, config: Pick<ReportConfig, "dimensions" | "measures" | "filters">, scoresPublic: boolean) => {
+export const assertReportAllowed = (context: AccessContext, config: Pick<ReportConfig, "dimensions" | "measures" | "filters">) => {
   assertProductionRole(context, "LEADER");
   const admin = isProductionAdmin(context);
   if (!admin && config.measures.some((measure) => reportMeasureInfo[measure].adminOnly)) {
@@ -824,22 +818,11 @@ export const assertReportAllowed = (context: AccessContext, config: Pick<ReportC
   if (!admin && fields.some((field) => field.entity === "user")) {
     throw customFieldsForbidden();
   }
-  if (
-    !admin &&
-    !scoresPublic &&
-    config.measures.some((measure) => pointMeasures.has(measure)) &&
-    (config.dimensions.some((dimension) => personalDimensions.has(dimension)) ||
-      personalFilters.some((key) => (config.filters[key]?.length ?? 0) > 0) ||
-      // Job / task fields single out a job's work like the `job` dimension (PR-11).
-      fields.some((field) => field.entity === "job" || field.entity === "task"))
-  ) {
-    throw new AppError("SCORES_PRIVATE", "Bảng điểm đang để riêng tư; không xem được điểm theo từng người hoặc từng job.", 403);
-  }
 };
 
 /** Permissions plus the custom fields a config uses (saving a report validates it like running it). */
-export const assertReportConfigUsable = async (sql: QuerySql, context: AccessContext, config: ReportConfig, scoresPublic: boolean) => {
-  assertReportAllowed(context, config, scoresPublic);
+export const assertReportConfigUsable = async (sql: QuerySql, context: AccessContext, config: ReportConfig) => {
+  assertReportAllowed(context, config);
   await loadReportCustomFields(sql, context.organization.id, config);
 };
 
@@ -851,6 +834,6 @@ export const usesMemberCustomFields = (config: Pick<ReportConfig, "dimensions" |
 export const runReport = async (context: AccessContext, config: ReportConfig): Promise<ReportResult> => {
   const sql = getSql();
   const settings = await loadSettings(sql, context.organization.id);
-  assertReportAllowed(context, config, settings.scoresPublic);
+  assertReportAllowed(context, config);
   return await executeReport(sql, context.organization.id, config, { today: businessDay(new Date()), closeDay: closeDaysOf(settings) });
 };

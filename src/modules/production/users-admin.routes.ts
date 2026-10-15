@@ -9,7 +9,7 @@ import {
   UpdateProductionUserRequestSchema
 } from "../../contracts/users-admin.js";
 import { requireSupabaseUser } from "../../middleware/auth.js";
-import { assertProductionAdmin } from "./access.js";
+import { assertConfigEditor } from "./access.js";
 import { handle, param } from "./http.js";
 import {
   createProductionUser,
@@ -20,8 +20,9 @@ import {
 } from "./users-admin.service.js";
 
 /**
- * Production user administration (SPEC Phase 0 /admin/users, PD-024; contract in contracts/users-admin.ts).
- * The production role is checked before the body is validated (non-members 404, others 403).
+ * Production user administration (SPEC Phase 0 /admin/users, PD-024; contract in contracts/users-admin.ts). Writes are the
+ * organization superadmin's alone (PD-050), checked before the body is validated (non-members 404, others 403); the
+ * led-jobs read keeps its production roles.
  */
 export const createProductionUserAdminRoutes = (): ExpressRouter => {
   const routes = Router();
@@ -30,7 +31,7 @@ export const createProductionUserAdminRoutes = (): ExpressRouter => {
   routes.post(
     "/production/users",
     handle(async (context, req, res) => {
-      assertProductionAdmin(context); // before the body is validated (no schema hints for non-admins)
+      assertConfigEditor(context); // before the body is validated (no schema hints for anyone but the superadmin)
       res.setHeader("cache-control", "no-store");
       return CreatedProductionUserSchema.parse(await createProductionUser(context, CreateProductionUserRequestSchema.parse(req.body)));
     }, 201)
@@ -38,7 +39,7 @@ export const createProductionUserAdminRoutes = (): ExpressRouter => {
   routes.patch(
     "/production/users/:userId",
     handle(async (context, req) => {
-      assertProductionAdmin(context);
+      assertConfigEditor(context);
       return ProductionUserChangeResultSchema.parse(
         await updateProductionUser(context, param(req, "userId"), UpdateProductionUserRequestSchema.parse(req.body))
       );

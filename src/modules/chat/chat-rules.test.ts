@@ -13,8 +13,12 @@ import {
 import { AppError } from "../../lib/app-error.js";
 import { encodeCursor } from "../../lib/db-types.js";
 import {
+  areDmColleagues,
+  assertDmColleague,
   buildDmKey,
   computeChannelCapabilities,
+  dmDirectoryScope,
+  dmOpenRequirement,
   decodeNameCursor,
   decodeTimeCursor,
   encodeNameCursor,
@@ -271,5 +275,58 @@ describe("messages", () => {
     );
     expect(systemMessageText({ type: "renamed", actorId: A, name: "design" }, "Linh")).toBe('Linh renamed the channel to "design"');
     expect(systemMessageText({ type: "topic_changed", actorId: A, topic: null }, "Linh")).toBe("Linh cleared the topic");
+  });
+});
+
+describe("DM rules (staff 1:1, PD-041 departments)", () => {
+  const staff = (departments: string[]) => ({ superadmin: false, canCreateChannels: false, departments });
+  const retoucher = staff(["PHOTO_RETOUCH"]);
+  const producer = staff(["PRODUCTION"]);
+  const both = staff(["PHOTO_RETOUCH", "PRODUCTION"]);
+  const superadmin = { superadmin: true, canCreateChannels: true, departments: ["PHOTO_RETOUCH", "PRODUCTION"] };
+  const manager = { ...retoucher, canCreateChannels: true };
+  const code = (run: () => unknown) => {
+    try {
+      run();
+    } catch (error) {
+      return error instanceof AppError ? `${error.statusCode} ${error.code}` : "other";
+    }
+    return "ok";
+  };
+
+  it("colleagues share a department, or either side is the superadmin", () => {
+    expect(areDmColleagues(retoucher, both)).toBe(true);
+    expect(areDmColleagues(retoucher, producer)).toBe(false);
+    expect(areDmColleagues(retoucher, { superadmin: true, departments: [] })).toBe(true);
+    expect(areDmColleagues({ superadmin: true, departments: [] }, producer)).toBe(true);
+    expect(areDmColleagues(staff([]), staff([]))).toBe(false);
+  });
+
+  it("1:1: staff need a colleague; superadmins and channel creators may message anyone", () => {
+    expect(dmOpenRequirement(retoucher, 1)).toBe("colleague");
+    expect(dmOpenRequirement(manager, 1)).toBe("ok");
+    expect(dmOpenRequirement(superadmin, 1)).toBe("ok");
+    expect(code(() => assertDmColleague(retoucher, both))).toBe("ok");
+    expect(code(() => assertDmColleague(retoucher, { superadmin: true, departments: [] }))).toBe("ok");
+    expect(code(() => assertDmColleague(retoucher, producer))).toBe("403 CHAT_DM_NOT_COLLEAGUE");
+  });
+
+  it("group DMs need the right to create channels (superadmins always have it)", () => {
+    expect(code(() => dmOpenRequirement(retoucher, 2))).toBe("403 CHAT_DM_GROUP_FORBIDDEN");
+    expect(code(() => dmOpenRequirement({ ...retoucher, superadmin: false }, 8))).toBe("403 CHAT_DM_GROUP_FORBIDDEN");
+    expect(dmOpenRequirement(manager, 2)).toBe("ok");
+    expect(dmOpenRequirement({ ...superadmin, canCreateChannels: false }, 3)).toBe("ok");
+    try {
+      dmOpenRequirement(retoucher, 2);
+    } catch (error) {
+      expect((error as AppError).message).toBe("Bạn chỉ nhắn được 1:1; tạo nhóm cần quyền tạo kênh.");
+    }
+  });
+
+  it("directory scope for a DM: department colleagues for staff, everyone for channel creators and superadmins", () => {
+    expect(dmDirectoryScope(retoucher)).toEqual({ everyone: false, departments: ["PHOTO_RETOUCH"] });
+    expect(dmDirectoryScope(both)).toEqual({ everyone: false, departments: ["PHOTO_RETOUCH", "PRODUCTION"] });
+    expect(dmDirectoryScope(manager)).toMatchObject({ everyone: true });
+    expect(dmDirectoryScope({ ...superadmin, canCreateChannels: false })).toMatchObject({ everyone: true });
   });
 });

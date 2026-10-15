@@ -125,7 +125,9 @@ const EmailParam = z.string().trim().toLowerCase().email().max(254);
 
 /**
  * Production (Photo Retouch) catalog — SPEC Phase 0–1. Every handler checks production roles
- * itself (PD-011): non-members get 404, members without the role get 403.
+ * itself (PD-011): non-members get 404, members without the role get 403. Every write here is
+ * configuration, edited by the organization superadmin only (PD-050, `assertConfigEditor`) — except
+ * the personal notification preferences.
  */
 export const createProductionRoutes = (): ExpressRouter => {
   const routes = Router();
@@ -342,7 +344,7 @@ export const createProductionRoutes = (): ExpressRouter => {
     )
   );
 
-  // Manual job statuses (PD-038): read by every member, edited by ADMIN. "order" before ":statusId".
+  // Manual job statuses (PD-038): read by every member, edited by the superadmin (PD-050). "order" before ":statusId".
   routes.get("/production/job-statuses", handle(async (context) => JobStatusCollectionSchema.parse(await listJobStatuses(context))));
   routes.post(
     "/production/job-statuses",

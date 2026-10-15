@@ -30,17 +30,18 @@ import {
   writeMemberDepartments
 } from "../workspace/members.service.js";
 import { assertCanGrantProductionRoles } from "../workspace/workspace.service.js";
-import { assertProductionAdmin, assertProductionMember, assertProductionRole } from "./access.js";
+import { assertConfigEditor, assertProductionMember, assertProductionRole } from "./access.js";
 import { updateMember } from "./catalog.service.js";
 import { syncJobChatsForMember } from "./job-chat.service.js";
 import { listOpenJobsLedBy, type LedJob } from "./member-lookups.js";
 import { leaderRemovedEvent } from "./notifications.js";
 
 /**
- * Production user administration (SPEC Phase 0 /admin/users, PD-024). A production ADMIN who does not hold the
- * organization's `member.manage` can create accounts, enable / disable them, reset passwords and set production
- * roles + team, reusing the workspace member services. Escalation guards (see `assertAccountManageable`):
- *   - only production ADMIN (superadmins included) — checked first, before anything is read;
+ * Production user administration (SPEC Phase 0 /admin/users, PD-024). Creating accounts, enabling / disabling them,
+ * resetting passwords and setting departments, production roles + team reuse the workspace member services.
+ * Escalation guards (see `assertAccountManageable`):
+ *   - only the organization superadmin (PD-050: "Cấu hình Photo Retouch" is theirs alone; production Admins are 403)
+ *     — checked first, before anything is read;
  *   - never on an organization superadmin; on organization admins (roles holding member.manage or role.*) only
  *     when the caller is a superadmin;
  *   - no organization role is chosen: new accounts get the default "member" role, which must not be an admin role;
@@ -197,7 +198,7 @@ export const getLedJobs = async (context: AccessContext, userId: string): Promis
  * superadmin (403 DEPARTMENT_ESCALATION); production roles with PHOTO_RETOUCH only (the contract checks it too).
  */
 export const createProductionUser = async (context: AccessContext, input: CreateProductionUserRequest) => {
-  assertProductionAdmin(context);
+  assertConfigEditor(context);
   const departments = sortDepartments(input.departments);
   assertDepartmentsPresent(departments, false);
   assertDepartmentsChangeAllowed(context, [], departments);
@@ -303,7 +304,7 @@ const afterProductionRolesRemoved = async (context: AccessContext, userId: strin
  *   - invariant: outside PHOTO_RETOUCH nobody (but the superadmin) holds a production role — leaving it deletes the
  *     roles, sending some is 400 PRODUCTION_ROLES_NOT_ALLOWED; joining it without roles needs `productionRoles`
  *     (400 PRODUCTION_ROLES_REQUIRED) and gets a production profile row;
- *   - granted roles need a production ADMIN / superadmin caller (403 PRODUCTION_ROLE_ESCALATION); your own ADMIN
+ *   - granted or removed roles need the superadmin (PD-050, 403 PRODUCTION_ROLE_ESCALATION); your own ADMIN
  *     cannot go (409 SELF_ADMIN_REMOVAL);
  *   - each department the person effectively leaves runs `revokeDepartmentAccessEffects` (task assignments in its
  *     public workspace projects).
@@ -335,7 +336,8 @@ export const applyDepartmentChange: MemberDepartmentWriter = async (tx, context,
   }
   const granted = rolesAfter.filter((role) => !rolesBefore.includes(role));
   const deleted = rolesBefore.filter((role) => !rolesAfter.includes(role));
-  assertCanGrantProductionRoles(context, granted);
+  // PD-050: granting or taking away a Photo Retouch role is the superadmin's alone.
+  assertCanGrantProductionRoles(context, [...granted, ...deleted]);
   // A demoted superadmin also loses the implicit production ADMIN (PD-011).
   const removedRoles = (input.superadminBefore ? sortRoles([...rolesBefore, "ADMIN"]) : rolesBefore).filter((role) => !rolesAfter.includes(role));
   if (input.userId === context.user.id && !context.hasFullOrganizationAuthority && removedRoles.includes("ADMIN")) {
@@ -415,7 +417,7 @@ export const updateProductionUser = async (
   userId: string,
   input: UpdateProductionUserRequest
 ): Promise<ProductionUserChangeResult> => {
-  assertProductionAdmin(context);
+  assertConfigEditor(context);
   const sql = getSql();
   const organizationId = org(context);
   const target = await loadAccountTarget(sql, organizationId, userId);
@@ -466,7 +468,7 @@ export const updateProductionUser = async (
  * through their production role, and open jobs they lead come back as `orphanedJobs` (Admins are notified).
  */
 export const setProductionUserActive = async (context: AccessContext, userId: string, active: boolean): Promise<ProductionUserChangeResult> => {
-  assertProductionAdmin(context);
+  assertConfigEditor(context);
   const sql = getSql();
   const organizationId = org(context);
   if (!active && userId === context.user.id) {
@@ -500,7 +502,7 @@ export const setProductionUserActive = async (context: AccessContext, userId: st
 
 /** POST /production/users/:userId/reset-password — one-time temporary password, every session ended (PD-005). */
 export const resetProductionUserPassword = async (context: AccessContext, userId: string) => {
-  assertProductionAdmin(context);
+  assertConfigEditor(context);
   if (userId === context.user.id) {
     throw new AppError("SELF_RESET_FORBIDDEN", "Dùng “Đổi mật khẩu” cho tài khoản của chính bạn.", 409);
   }

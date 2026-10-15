@@ -11,7 +11,7 @@ import {
   SafeSearchSchema,
   textRuleMessages
 } from "./schemas.js";
-import { SignedStorageUrlSchema, UserRefSchema } from "./work.js";
+import { SignedStorageUrlSchema, UserRefSchema, type UserRef } from "./work.js";
 
 /**
  * Chat contract (PD-001 / PD-002): public & private channels, 1:1 and group DMs, messages, threads,
@@ -56,6 +56,8 @@ export const chatLimits = {
   attachmentsPerMessage: 10,
   attachmentBytesMax: 50 * 1024 * 1024,
   reactionsDistinctMax: 50,
+  /** People listed with each reaction of a message (its first reactors, oldest first); `count` stays the total. */
+  reactionUsersPreview: 20,
   emojiMaxCodePoints: 32,
   pageMax: 100,
   sidebarMax: 500,
@@ -294,10 +296,19 @@ export const ChatAttachmentSchema = z.object({
 });
 export type ChatAttachment = z.infer<typeof ChatAttachmentSchema>;
 
+/** Reactors listed with a reaction: names and avatars only (`email` is always null). */
+const ReactorListSchema = z.array(UserRefSchema).default([]);
+
 export const ReactionSummarySchema = z.object({
   emoji: z.string(),
+  /** Everyone who reacted with this emoji. */
   count: z.number().int().min(1),
-  reactedByMe: z.boolean()
+  reactedByMe: z.boolean(),
+  /**
+   * The first people who reacted with this emoji, oldest first, at most chatLimits.reactionUsersPreview (chip tooltip
+   * "An, Bình và 3 người khác đã thả 👍"). Everyone: GET /messages/:id/reactions.
+   */
+  users: ReactorListSchema
 });
 export type ReactionSummary = z.infer<typeof ReactionSummarySchema>;
 
@@ -413,7 +424,9 @@ export const ReactionResultSchema = z.object({
   messageId: Id,
   emoji: z.string(),
   count: z.number().int().min(0),
-  reactedByMe: z.boolean()
+  reactedByMe: z.boolean(),
+  /** The emoji's first reactors after the change (same rule as ReactionSummary.users). */
+  users: ReactorListSchema
 });
 export type ReactionResult = z.infer<typeof ReactionResultSchema>;
 
@@ -543,13 +556,17 @@ export type ChatMessageDeletedEvent = {
   threadRoot: ThreadRootSummary | null;
 };
 
-/** `chat:reaction` → room channel:<id>. `count` is the new total for that emoji. */
+/**
+ * `chat:reaction` → room channel:<id>. `count` is the new total for that emoji and `users` its first reactors after
+ * the change (same rule as ReactionSummary.users), so clients update "who reacted" without a refetch.
+ */
 export type ChatReactionEvent = {
   channelId: string;
   messageId: string;
   threadRootId: string | null;
   emoji: string;
   count: number;
+  users: UserRef[];
   userId: string;
   added: boolean;
 };

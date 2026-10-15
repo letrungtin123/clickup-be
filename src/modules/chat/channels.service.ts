@@ -33,6 +33,8 @@ import {
   assertNotArchived,
   channelNotFound,
   channelPermissions,
+  dmCallerOf,
+  loadDmParties,
   requireChannel,
   type ResolvedChannel
 } from "./chat-access.js";
@@ -47,9 +49,11 @@ import {
   type MemberRow
 } from "./chat-mappers.js";
 import {
+  assertDmColleague,
   buildDmKey,
   computeChannelCapabilities,
   decodeNameCursor,
+  dmOpenRequirement,
   encodeNameCursor,
   uniqueIds
 } from "./chat-rules.js";
@@ -822,8 +826,27 @@ export const updateMyMembership = async (
 // Direct messages --------------------------------------------------------------------------------
 
 /**
+ * Who may create a DM (chat-rules `dmOpenRequirement`): a group needs the right to create channels (403
+ * CHAT_DM_GROUP_FORBIDDEN); a 1:1 is open to every member with a colleague — sharing a department, or either side the
+ * superadmin (403 CHAT_DM_NOT_COLLEAGUE otherwise); superadmins and holders of channel.create may message anyone.
+ */
+const assertMayCreateDm = async (sql: QuerySql, context: AccessContext, otherIds: string[]) => {
+  const caller = dmCallerOf(context);
+  if (dmOpenRequirement(caller, otherIds.length) === "ok") {
+    return;
+  }
+  const other = otherIds[0] ? (await loadDmParties(sql, context, otherIds)).get(otherIds[0]) : undefined;
+  if (!other) {
+    throw new AppError("CHAT_MEMBER_INVALID", "Every person must be an active member of this organization.", 400);
+  }
+  assertDmColleague(caller, other);
+};
+
+/**
  * Get-or-create a 1:1 or group DM for the exact participant set (caller included). Membership of a DM
  * never changes: "adding people" to a group DM opens the conversation for the new set (Slack-like).
+ * Reopening a conversation the caller already belongs to needs nothing more; creating one follows
+ * `assertMayCreateDm`.
  */
 export const openDirectConversation = async (
   context: AccessContext,
@@ -845,6 +868,7 @@ export const openDirectConversation = async (
   if (existingId) {
     return { created: false, channel: await getChannel(context, existingId) };
   }
+  await assertMayCreateDm(sql, context, dm.otherIds);
 
   const outcome = await sql.begin(async (tx) => {
     await requireActiveOrgMembers(tx, context, dm.otherIds);

@@ -38,6 +38,56 @@ export const buildDmKey = (callerId: string, userIds: string[]): DmKey => {
   };
 };
 
+/** A person as the DM rules see them: organization superadmin (in every department, PD-041) and department rows. */
+export type DmParty = { superadmin: boolean; departments: readonly string[] };
+
+/** The caller of a DM rule: also whether they may create channels (channel.create). */
+export type DmCaller = DmParty & { canCreateChannels: boolean };
+
+/** Colleagues for a 1:1 DM: they share a department, or either one is the superadmin (who belongs to every department). */
+export const areDmColleagues = (a: DmParty, b: DmParty) =>
+  a.superadmin || b.superadmin || a.departments.some((department) => b.departments.includes(department));
+
+/** May start any conversation (groups, anyone in the organization): superadmins and holders of channel.create. */
+const startsAnyDm = (caller: DmCaller) => caller.superadmin || caller.canCreateChannels;
+
+export const dmGroupForbidden = () => new AppError("CHAT_DM_GROUP_FORBIDDEN", "Bạn chỉ nhắn được 1:1; tạo nhóm cần quyền tạo kênh.", 403);
+export const dmNotColleague = () =>
+  new AppError("CHAT_DM_NOT_COLLEAGUE", "Bạn chỉ nhắn tin 1:1 được với đồng nghiệp cùng phòng ban.", 403);
+
+/**
+ * What creating a new DM with `otherCount` other people requires:
+ * - a group (2+ others) needs the right to create channels (channel.create; superadmins) — 403 CHAT_DM_GROUP_FORBIDDEN;
+ * - 1:1: superadmins and holders of channel.create may message any active member ("ok", unchanged); every other
+ *   member only a colleague ("colleague": check the other person with `assertDmColleague`).
+ */
+export const dmOpenRequirement = (caller: DmCaller, otherCount: number): "ok" | "colleague" => {
+  if (otherCount > 1) {
+    if (!startsAnyDm(caller)) {
+      throw dmGroupForbidden();
+    }
+    return "ok";
+  }
+  return startsAnyDm(caller) ? "ok" : "colleague";
+};
+
+/** 403 CHAT_DM_NOT_COLLEAGUE unless the two share a department or either is the superadmin. */
+export const assertDmColleague = (caller: DmParty, other: DmParty) => {
+  if (!areDmColleagues(caller, other)) {
+    throw dmNotColleague();
+  }
+};
+
+/**
+ * People search for a DM (GET /directory/users?purpose=dm): who may be listed. `everyone` for callers who may start
+ * any conversation; otherwise the members of the caller's `departments` plus superadmins. (E-mails follow member.view
+ * as in every other people search, SEC-API-04.)
+ */
+export const dmDirectoryScope = (caller: DmCaller) => ({
+  everyone: startsAnyDm(caller),
+  departments: [...caller.departments]
+});
+
 // Capabilities ------------------------------------------------------------------------------------
 
 export type CapabilityInput = {

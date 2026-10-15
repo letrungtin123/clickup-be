@@ -90,7 +90,8 @@ export const assertValidNewLeave = (span: LeaveSpan, today: string) => {
     throw invalid("LEAVE_TOO_LONG", `Mỗi đơn nghỉ tối đa ${leaveLimits.maxRequestDays} ngày.`);
   }
   if (dayDiff(span.fromDate, today) > leaveLimits.maxPastDays) {
-    throw invalid("LEAVE_TOO_OLD", `Không thể xin nghỉ cho ngày đã qua quá ${leaveLimits.maxPastDays} ngày.`);
+    // PD-051: maxPastDays is 0 — never in the past.
+    throw invalid("LEAVE_TOO_OLD", "Không thể xin nghỉ cho ngày đã qua — chọn từ hôm nay trở đi.");
   }
   if (dayDiff(today, span.fromDate) > leaveLimits.maxFutureDays) {
     throw invalid("LEAVE_TOO_FAR", `Chỉ có thể xin nghỉ trước tối đa ${leaveLimits.maxFutureDays} ngày.`);

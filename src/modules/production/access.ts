@@ -59,6 +59,19 @@ export const assertProductionRole = (context: AccessContext, ...roles: Productio
 
 export const assertProductionAdmin = (context: AccessContext) => assertProductionRole(context, "ADMIN");
 
+/**
+ * Every write of "Cấu hình Photo Retouch" — settings (job permission matrix included), clients, projects, processes,
+ * shifts, credit rules, statuses / order / transitions, job statuses, custom fields, tags, teams, members' production
+ * profile, whitelist, production users, KPI targets and the KPI close run — is the organization superadmin's alone
+ * (PD-049, PD-050). Production members get 403 (reads keep their own rules); non-members still get 404.
+ */
+export const assertConfigEditor = (context: AccessContext) => {
+  assertProductionMember(context);
+  if (!context.hasFullOrganizationAuthority) {
+    throw new AppError("FORBIDDEN", "Chỉ Siêu quản trị mới sửa được Cấu hình Photo Retouch.", 403);
+  }
+};
+
 export const hasAnyProductionRole = (context: AccessContext) => productionRolesOf(context).size > 0;
 
 /** Realtime room of the organization's production module (production roles only). */

@@ -1,11 +1,13 @@
 import { Permission } from "../../contracts/permissions.js";
+import type { DirectoryPurpose } from "../../contracts/work.js";
 import { getSql } from "../../db/client.js";
 import { AppError } from "../../lib/app-error.js";
 import { escapeLike } from "../../lib/db-types.js";
 import type { AccessContext } from "../access/access-context.js";
 import { departmentMemberSql } from "../access/departments.js";
 import { getProjectAccess, hasPermission } from "../access/resource-access.js";
-import { loadChannel } from "../chat/chat-access.js";
+import { dmCallerOf, loadChannel } from "../chat/chat-access.js";
+import { dmDirectoryScope } from "../chat/chat-rules.js";
 import { toUserRef, type UserRefJson } from "./mappers.js";
 import { userJsonSql } from "./tasks.repo.js";
 
@@ -14,15 +16,40 @@ import { userJsonSql } from "./tasks.repo.js";
  * who can access that project (so pickers never suggest someone who cannot see the work);
  * without it the caller needs `member.view`. Callers without `member.view` (pickers in a project or
  * channel they can use) get names only: no e-mail addresses, and e-mails are not searchable (SEC-API-04).
+ * `purpose=dm` ("Tin nhắn mới"): every active member may search the people they may message (chat-rules
+ * `dmDirectoryScope`: colleagues sharing a department plus superadmins, or anyone for callers who may create
+ * channels); `projectId` / `channelId` do not apply.
  */
 export const searchDirectory = async (
   context: AccessContext,
-  input: { q?: string | undefined; projectId?: string | undefined; channelId?: string | undefined; limit: number }
+  input: {
+    q?: string | undefined;
+    projectId?: string | undefined;
+    channelId?: string | undefined;
+    purpose?: DirectoryPurpose | undefined;
+    limit: number;
+  }
 ) => {
   const sql = getSql();
   const canViewMembers = hasPermission(context, Permission.MemberView);
   let projectFilter = sql`TRUE`;
-  if (input.channelId) {
+  if (input.purpose === "dm") {
+    const scope = dmDirectoryScope(dmCallerOf(context));
+    if (!scope.everyone) {
+      // PD-041: shares a department with the caller, or is the superadmin (member of every department).
+      projectFilter = sql`(
+        EXISTS (
+          SELECT 1 FROM public.user_departments ud
+          WHERE ud.organization_id = om.organization_id AND ud.user_id = om.user_id
+            AND ud.department = ANY(${scope.departments}::text[])
+        )
+        OR EXISTS (
+          SELECT 1 FROM public.roles r
+          WHERE r.id = om.role_id AND r.organization_id = om.organization_id AND r.key = 'superadmin'
+        )
+      )`;
+    }
+  } else if (input.channelId) {
     // Mention pickers in private channels and DMs only offer current members.
     const resolved = await loadChannel(sql, context, input.channelId);
     if (!resolved?.caps.canRead) {

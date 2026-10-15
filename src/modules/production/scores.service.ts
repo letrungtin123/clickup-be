@@ -1,16 +1,24 @@
-import type { MyScores, ScoreBoard, ScoreEntry, ScoreForecast, TaskScores } from "../../contracts/production-scores.js";
+import type {
+  MyScores,
+  ScoreBoard,
+  ScoreEntry,
+  ScoreForecast,
+  TaskScores,
+  UserScoreForecast,
+  UserScores
+} from "../../contracts/production-scores.js";
 import { getSql } from "../../db/client.js";
 import { AppError } from "../../lib/app-error.js";
 import { toIso, type QuerySql } from "../../lib/db-types.js";
 import type { AccessContext } from "../access/access-context.js";
 import { toUserRef, type UserRefJson } from "../work/mappers.js";
-import { actsAsJobLeader, assertProductionMember, isProductionAdmin } from "./access.js";
+import { assertProductionMember, isProductionAdmin } from "./access.js";
 import { closeDaysOf, customFieldsForbidden, loadSettings } from "./catalog.service.js";
 import { matchesCustomFieldFilters, resolveCustomFieldFilters } from "./custom-fields.js";
 import { cursorInstantSql, cursorTextSql, decodeTimeCursor, encodeTimeCursor } from "./cursor.js";
 import { assertTaskVisible, loadTask } from "./jobs.repo.js";
 import { approvedLeaveDays } from "./leave.service.js";
-import type { CustomFieldFilter, CustomValues } from "../../contracts/production-catalog.js";
+import type { CustomFieldFilter, CustomValues, ProductionSettings } from "../../contracts/production-catalog.js";
 import { closeDayOfPeriod } from "../../contracts/production-scores.js";
 import {
   daysInclusive,
@@ -179,14 +187,50 @@ const selectEntryPage = (
   ORDER BY e.created_at DESC, e.id DESC
 `;
 
-/** GET /production/scores/me — own summary, fixed today/week/period cards and a page of entries with task links. */
-export const getMyScores = async (
-  context: AccessContext,
-  query: { from?: string | undefined; to?: string | undefined; cursor?: string | undefined; limit?: number | undefined }
+type ScoresQuery = { from?: string | undefined; to?: string | undefined; cursor?: string | undefined; limit?: number | undefined };
+
+// Subjects (PD-052) ---------------------------------------------------------------------------------------
+
+export type ScoreSubject = UserRefJson & { team_id: string | null; team_name: string | null };
+
+/**
+ * The person whose "Điểm cá nhân" is asked for (PD-052): an active member of the organization holding a production role
+ * (or its superadmin, production ADMIN by PD-011) — 404 SCORE_USER_NOT_FOUND otherwise, whoever asks.
+ */
+export const loadScoreSubject = async (sql: QuerySql, organizationId: string, userId: string): Promise<ScoreSubject> => {
+  const [subject] = await sql<ScoreSubject[]>`
+    SELECT au.id, au.display_name, au.email, au.avatar_url, mp.team_id, tm.name AS team_name
+    FROM public.organization_memberships om
+    JOIN public.app_users au ON au.id = om.user_id
+    LEFT JOIN production.member_profiles mp ON mp.organization_id = om.organization_id AND mp.user_id = om.user_id
+    LEFT JOIN production.teams tm ON tm.organization_id = om.organization_id AND tm.id = mp.team_id
+    WHERE om.organization_id = ${organizationId} AND om.user_id = ${userId} AND om.deleted_at IS NULL AND om.status = 'active'
+      AND (
+        EXISTS (SELECT 1 FROM production.user_roles ur WHERE ur.organization_id = om.organization_id AND ur.user_id = om.user_id)
+        OR EXISTS (SELECT 1 FROM public.roles r WHERE r.id = om.role_id AND r.organization_id = om.organization_id AND r.key = 'superadmin')
+      )
+  `;
+  if (!subject) {
+    throw new AppError("SCORE_USER_NOT_FOUND", "Không tìm thấy nhân viên này trong Photo Retouch.", 404);
+  }
+  return subject;
+};
+
+/** Khoán money of `userId` for the caller: their own, ADMIN, or settings.moneyPublic (board, task scores, KPI). */
+export const seesMoneyOf = (context: AccessContext, settings: { moneyPublic: boolean }, userId: string) =>
+  userId === context.user.id || isProductionAdmin(context) || settings.moneyPublic;
+
+/**
+ * Summary, fixed today / week / period cards and a page of entries of one person (`subjectId`) — GET /production/scores/me
+ * for the caller, GET /production/scores/user/:userId for anyone (PD-052). Money is always filled in; the callers hide it.
+ */
+const loadScores = async (
+  sql: QuerySql,
+  organizationId: string,
+  subjectId: string,
+  settings: ProductionSettings,
+  query: ScoresQuery
 ): Promise<MyScores> => {
-  assertProductionMember(context);
-  const sql = getSql();
-  const settings = await loadSettings(sql, org(context));
   const today = businessDay(new Date());
   const currentPeriod = periodOfDay(today, closeDaysOf(settings));
   const current = periodRange(currentPeriod, closeDaysOf(settings));
@@ -203,9 +247,9 @@ export const getMyScores = async (
   const cardsFrom = week < current.from ? week : current.from;
   const cardsTo = today > current.to ? today : current.to;
   const [sums, cardRows, entryRows] = await Promise.all([
-    selectSums(sql, org(context), context.user.id, from, to, true),
-    selectSums(sql, org(context), context.user.id, cardsFrom, cardsTo, false),
-    selectEntryPage(sql, org(context), context.user.id, { from, to }, { cursor, limit })
+    selectSums(sql, organizationId, subjectId, from, to, true),
+    selectSums(sql, organizationId, subjectId, cardsFrom, cardsTo, false),
+    selectEntryPage(sql, organizationId, subjectId, { from, to }, { cursor, limit })
   ]);
   const page = entryRows.slice(0, limit);
   const last = page[page.length - 1];
@@ -229,6 +273,46 @@ export const getMyScores = async (
   };
 };
 
+/** GET /production/scores/me — own summary, fixed today/week/period cards and a page of entries with task links. */
+export const getMyScores = async (context: AccessContext, query: ScoresQuery): Promise<MyScores> => {
+  assertProductionMember(context);
+  const sql = getSql();
+  const settings = await loadSettings(sql, org(context));
+  return await loadScores(sql, org(context), context.user.id, settings, query);
+};
+
+const hideTotalsMoney = <T extends { moneyKhoanProvisional: number }>(totals: T, visible: boolean) => ({
+  ...totals,
+  moneyKhoanProvisional: visible ? totals.moneyKhoanProvisional : null
+});
+
+/**
+ * GET /production/scores/user/:userId — "Điểm cá nhân" of any production member for every production member (PD-052):
+ * what /scores/me shows its owner, money hidden unless `seesMoneyOf`.
+ */
+export const getUserScores = async (context: AccessContext, userId: string, query: ScoresQuery): Promise<UserScores> => {
+  assertProductionMember(context);
+  const sql = getSql();
+  const organizationId = org(context);
+  const [settings, subject] = await Promise.all([loadSettings(sql, organizationId), loadScoreSubject(sql, organizationId, userId)]);
+  const scores = await loadScores(sql, organizationId, subject.id, settings, query);
+  const moneyVisible = seesMoneyOf(context, settings, subject.id);
+  return {
+    ...scores,
+    user: { ...toUserRef(subject)!, email: subject.id === context.user.id || isProductionAdmin(context) ? subject.email : null },
+    teamId: subject.team_id,
+    teamName: subject.team_name,
+    moneyVisible,
+    summary: hideTotalsMoney(scores.summary, moneyVisible),
+    cards: {
+      today: hideTotalsMoney(scores.cards.today, moneyVisible),
+      week: hideTotalsMoney(scores.cards.week, moneyVisible),
+      period: hideTotalsMoney(scores.cards.period, moneyVisible)
+    },
+    entries: scores.entries.map((entry) => ({ ...entry, money: moneyVisible ? entry.money : null }))
+  };
+};
+
 // Forecast ---------------------------------------------------------------------------------------------
 
 type TargetRow = { period_type: KpiPeriodType; target_points: string; effective_from: string };
@@ -241,13 +325,14 @@ export const loadTargetVersions = async (sql: QuerySql, organizationId: string, 
     `
   ).map((row) => ({ periodType: row.period_type, targetPoints: Number(row.target_points), effectiveFrom: row.effective_from }));
 
-/** GET /production/scores/forecast — own KPI forecast for a period plus % KPI by month / quarter / year. */
-export const getScoreForecast = async (context: AccessContext, query: { period?: string | undefined }): Promise<ScoreForecast> => {
-  assertProductionMember(context);
-  const sql = getSql();
-  const organizationId = org(context);
-  const userId = context.user.id;
-  const settings = await loadSettings(sql, organizationId);
+/** KPI forecast of one person (`userId`) for a period plus % KPI by month / quarter / year (money always filled in). */
+const computeForecast = async (
+  sql: QuerySql,
+  organizationId: string,
+  userId: string,
+  settings: ProductionSettings,
+  query: { period?: string | undefined }
+): Promise<ScoreForecast> => {
   const closeDay = closeDaysOf(settings);
   const today = businessDay(new Date());
   const period = query.period ?? periodOfDay(today, closeDay);
@@ -307,6 +392,28 @@ export const getScoreForecast = async (context: AccessContext, query: { period?:
   };
 };
 
+/** GET /production/scores/forecast — own KPI forecast for a period plus % KPI by month / quarter / year. */
+export const getScoreForecast = async (context: AccessContext, query: { period?: string | undefined }): Promise<ScoreForecast> => {
+  assertProductionMember(context);
+  const sql = getSql();
+  const settings = await loadSettings(sql, org(context));
+  return await computeForecast(sql, org(context), context.user.id, settings, query);
+};
+
+/** GET /production/scores/user/:userId/forecast — the KPI forecast of any production member (PD-052), money per `seesMoneyOf`. */
+export const getUserScoreForecast = async (
+  context: AccessContext,
+  userId: string,
+  query: { period?: string | undefined }
+): Promise<UserScoreForecast> => {
+  assertProductionMember(context);
+  const sql = getSql();
+  const organizationId = org(context);
+  const [settings, subject] = await Promise.all([loadSettings(sql, organizationId), loadScoreSubject(sql, organizationId, userId)]);
+  const result = await computeForecast(sql, organizationId, subject.id, settings, query);
+  return hideTotalsMoney(result, seesMoneyOf(context, settings, subject.id));
+};
+
 // Board -------------------------------------------------------------------------------------------------
 
 type BoardRow = {
@@ -326,8 +433,8 @@ type BoardRow = {
 
 /**
  * GET /production/scores/board — every production worker (STAFF/LEADER/QC) and anyone who scored in
- * the period, ranked by official points. Points are public; money only for the row's owner, ADMIN,
- * or when settings.moneyPublic. 403 for non-admins when settings.scoresPublic is off.
+ * the period, ranked by official points. Open to every production member (PD-052: settings.scoresPublic no
+ * longer hides it); money only for the row's owner, ADMIN, or when settings.moneyPublic.
  */
 export const getScoreBoard = async (
   context: AccessContext,
@@ -338,9 +445,6 @@ export const getScoreBoard = async (
   const organizationId = org(context);
   const settings = await loadSettings(sql, organizationId);
   const admin = isProductionAdmin(context);
-  if (!settings.scoresPublic && !admin) {
-    throw new AppError("SCORES_PRIVATE", "Bảng điểm chung đang để riêng tư.", 403);
-  }
   // USER tags / custom fields (e.g. "Năng lực") are Admin data: only an Admin filters the board by them.
   const tagIds = query.tagId ?? [];
   if (!admin && (tagIds.length > 0 || (query.cf?.length ?? 0) > 0)) {
@@ -419,11 +523,9 @@ export const getScoreBoard = async (
 // Task scores -------------------------------------------------------------------------------------------------
 
 /**
- * GET /production/scores/task/:taskId — the ledger rows of one task (task detail), for anyone who may
- * see the task. Points are public; money only for the row's owner, ADMIN, or when settings.moneyPublic.
- * PR-11: while settings.scoresPublic is off, other people's rows (and totals) are shown only to an ADMIN and
- * to the task's job leader (who manages its quantities); everyone else sees only their own rows — like the
- * private board, where nobody but an Admin sees colleagues' points.
+ * GET /production/scores/task/:taskId — the ledger rows of one task (task detail), everyone's, for anyone who may
+ * see the task. Points are public (PD-052 retired the settings.scoresPublic filter of PR-11, like the board and
+ * "Điểm cá nhân"); money only for the row's owner, ADMIN, or when settings.moneyPublic.
  */
 export const getTaskScores = async (context: AccessContext, taskId: string): Promise<TaskScores> => {
   assertProductionMember(context);
@@ -434,8 +536,6 @@ export const getTaskScores = async (context: AccessContext, taskId: string): Pro
   const settings = await loadSettings(sql, organizationId);
   const admin = isProductionAdmin(context);
   const moneyVisible = admin || settings.moneyPublic;
-  // SEC2-04: the job leader's view of everyone's rows ends with the LEADER role (a job without a leader: every Leader, PD-035).
-  const everyone = settings.scoresPublic || admin || actsAsJobLeader(context, task.job_leader_id);
   const rows = await sql<(EntryRow & { owner: UserRefJson })[]>`
     SELECT e.id, e.role, e.task_id, t.number::text AS task_number, (${parentNumberSql(sql)})::text AS task_parent_number,
       t.sub_seq AS task_sub_seq, e.job_id, j.code AS job_code, e.project_id, p.code AS project_code,
@@ -457,7 +557,6 @@ export const getTaskScores = async (context: AccessContext, taskId: string): Pro
         SELECT st.id FROM production.tasks st
         WHERE st.organization_id = ${organizationId} AND st.parent_task_id = ${taskId} AND st.kind = 'NORMAL' AND st.deleted_at IS NULL
       ))
-      ${everyone ? sql`` : sql`AND e.user_id = ${context.user.id}`}
     ORDER BY e.created_at, e.adjusts_entry_id NULLS FIRST, e.recorded_at, e.id
   `;
   const visible = (userId: string) => moneyVisible || userId === context.user.id;

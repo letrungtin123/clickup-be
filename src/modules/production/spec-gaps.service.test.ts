@@ -432,11 +432,13 @@ describe("G11 — history: task tag changes and job edits", () => {
 });
 
 describe("G15 — a new KPI close day applies from the next period", () => {
+  // PD-050: settings are configuration, saved by the organization superadmin only.
+  const owner = contextWith([], true);
   const next = shiftPeriod(kpiPeriodOfDay(businessDay(new Date()), 25), 1);
 
   it("writes the version for the next period and drops later ones; the current period keeps its days", async () => {
     db.state.handler = (call) => (call.text.includes("FROM production.kpi_close_days") ? [{ period: "2000-01", close_day: 25 }] : undefined);
-    await updateSettings(contextWith(["ADMIN"]), { kpiCloseDay: 20 });
+    await updateSettings(owner, { kpiCloseDay: 20 });
     const remove = callsLike(/^DELETE FROM production\.kpi_close_days/)[0];
     expect(remove?.values).toEqual([org, `${next}-01`]);
     const insert = callsLike(/^INSERT INTO production\.kpi_close_days/)[0];
@@ -446,7 +448,7 @@ describe("G15 — a new KPI close day applies from the next period", () => {
 
   it("re-sending the day already in force (settings form save) changes no version", async () => {
     db.state.handler = (call) => (call.text.includes("FROM production.kpi_close_days") ? [{ period: "2000-01", close_day: 25 }] : undefined);
-    await updateSettings(contextWith(["ADMIN"]), { kpiCloseDay: 25 });
+    await updateSettings(owner, { kpiCloseDay: 25 });
     expect(callsLike(/^DELETE FROM production\.kpi_close_days/)).toHaveLength(0);
     expect(callsLike(/^INSERT INTO production\.kpi_close_days/)).toHaveLength(0);
     db.state.calls = [];
@@ -457,7 +459,7 @@ describe("G15 — a new KPI close day applies from the next period", () => {
             { period: next, close_day: 20 }
           ]
         : undefined;
-    await updateSettings(contextWith(["ADMIN"]), { kpiCloseDay: 20 });
+    await updateSettings(owner, { kpiCloseDay: 20 });
     expect(callsLike(/kpi_close_days/).filter((call) => !call.text.startsWith("SELECT"))).toHaveLength(0);
   });
 
@@ -469,13 +471,13 @@ describe("G15 — a new KPI close day applies from the next period", () => {
             { period: next, close_day: 20 }
           ]
         : undefined;
-    await updateSettings(contextWith(["ADMIN"]), { kpiCloseDay: 25 });
+    await updateSettings(owner, { kpiCloseDay: 25 });
     expect(callsLike(/^DELETE FROM production\.kpi_close_days/)[0]?.values).toEqual([org, `${next}-01`]);
     expect(callsLike(/^INSERT INTO production\.kpi_close_days/)).toHaveLength(0);
   });
 
   it("an organization without versions gets its baseline first", async () => {
-    await updateSettings(contextWith(["ADMIN"]), { kpiCloseDay: 20 });
+    await updateSettings(owner, { kpiCloseDay: 20 });
     const inserts = callsLike(/^INSERT INTO production\.kpi_close_days/);
     expect(inserts[0]?.text).toContain("DATE '2000-01-01'");
     expect(inserts[1]?.values).toEqual([org, `${next}-01`, 20, me]);

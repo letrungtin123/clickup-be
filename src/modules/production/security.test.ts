@@ -332,12 +332,12 @@ describe("SEC2-04 — job-leader powers need the LEADER (or ADMIN) role", () => 
     expect(check.text).toContain("t.assignee_id = $ OR t.qc_id = $");
   });
 
-  it("private score mode: a demoted leader sees only their own rows of the task", async () => {
-    const task = taskRow({ job_leader_id: me, assignee_id: third, qc_id: me });
+  it("PD-052: task scores list everyone's rows for any member who sees the task, even with scoresPublic off", async () => {
+    const task = taskRow({ job_leader_id: other, assignee_id: third, qc_id: me });
     const scoreQuery = () => db.state.calls.find((call) => call.text.includes("FROM production.score_entries e"))!;
     db.state.handler = taskQueries(task);
     await getTaskScores(contextWith(["STAFF", "QC"]), taskId);
-    expect(scoreQuery().text).toContain("AND e.user_id = $");
+    expect(scoreQuery().text).not.toContain("AND e.user_id = $");
     db.state.calls = [];
     await getTaskScores(contextWith(["LEADER", "QC"]), taskId);
     expect(scoreQuery().text).not.toContain("AND e.user_id = $");

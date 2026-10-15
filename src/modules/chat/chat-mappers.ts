@@ -8,7 +8,8 @@ import type {
   ChatChannelMember,
   ChatMessage,
   ChatSystemEvent,
-  NotifyLevel
+  NotifyLevel,
+  ReactionSummary
 } from "../../contracts/chat.js";
 import { chatLimits } from "../../contracts/chat.js";
 import type { RichTextDoc } from "../../contracts/rich-text.js";
@@ -157,10 +158,81 @@ export const toMember = (row: MemberRow): ChatChannelMember => ({
   joinedAt: toIso(row.joined_at)
 });
 
+// Reactions --------------------------------------------------------------------------------------
+
+/** A reactor as aggregated in SQL (names and avatars only, never e-mails). */
+export type ReactorJson = { id: string; display_name: string; avatar_url: string | null };
+export type ReactionJson = { emoji: string; count: number; reacted_by_me: boolean; users?: (ReactorJson | null)[] | null };
+
+/**
+ * SQL: the first `cap` reactors of a group of reactions as a JSON array, oldest first (`[]` when none). Expects
+ * `mr` (message_reactions) LEFT JOIN `au` (app_users ON au.id = mr.user_id) in scope, grouped (e.g. by emoji).
+ * One aggregate per group inside the same statement: no extra query per message.
+ */
+export const reactorsAggSql = (sql: QuerySql, cap: number = chatLimits.reactionUsersPreview) => sql`
+  coalesce(to_json((
+    array_agg(json_build_object('id', au.id, 'display_name', au.display_name, 'avatar_url', au.avatar_url)
+      ORDER BY mr.created_at, mr.user_id) FILTER (WHERE au.id IS NOT NULL)
+  )[1:${cap}::int]), '[]'::json)`;
+
+/** Reactors for the API: in the given (reaction) order, de-duplicated, at most `cap`, no e-mail. */
+export const toReactors = (
+  rows: readonly (ReactorJson | null | undefined)[] | null | undefined,
+  cap: number = chatLimits.reactionUsersPreview
+): UserRef[] => {
+  const seen = new Set<string>();
+  const users: UserRef[] = [];
+  for (const row of rows ?? []) {
+    if (users.length >= cap) {
+      break;
+    }
+    if (!row?.id || seen.has(row.id)) {
+      continue;
+    }
+    seen.add(row.id);
+    users.push({ id: row.id, displayName: row.display_name, email: null, avatarUrl: row.avatar_url });
+  }
+  return users;
+};
+
+export const toReactionSummary = (row: ReactionJson): ReactionSummary => ({
+  emoji: row.emoji,
+  count: Number(row.count),
+  reactedByMe: row.reacted_by_me,
+  users: toReactors(row.users)
+});
+
+/** One reaction row (who reacted with what), rows ordered by reaction time within each emoji. */
+export type ReactionUserRow = { emoji: string; user_id: string; display_name: string; avatar_url: string | null };
+
+/**
+ * Groups reaction rows into summaries: emojis in the order they first appear, `count` = every row of the emoji,
+ * `reactedByMe` = the viewer is among them, `users` = the emoji's first `cap` reactors.
+ */
+export const groupReactionRows = (
+  rows: readonly ReactionUserRow[],
+  viewerId: string,
+  cap: number = chatLimits.reactionUsersPreview
+): ReactionSummary[] => {
+  const groups = new Map<string, { emoji: string; count: number; reactedByMe: boolean; reactors: ReactorJson[] }>();
+  for (const row of rows) {
+    const group = groups.get(row.emoji) ?? { emoji: row.emoji, count: 0, reactedByMe: false, reactors: [] };
+    group.count += 1;
+    group.reactedByMe ||= row.user_id === viewerId;
+    group.reactors.push({ id: row.user_id, display_name: row.display_name, avatar_url: row.avatar_url });
+    groups.set(row.emoji, group);
+  }
+  return [...groups.values()].map((group) => ({
+    emoji: group.emoji,
+    count: group.count,
+    reactedByMe: group.reactedByMe,
+    users: toReactors(group.reactors, cap)
+  }));
+};
+
 // Messages ---------------------------------------------------------------------------------------
 
 type AttachmentJson = { id: string; file_name: string; mime_type: string; size_bytes: string | number };
-type ReactionJson = { emoji: string; count: number; reacted_by_me: boolean };
 
 export type MessageRow = {
   id: string;
@@ -192,10 +264,13 @@ export const messageColumnsSql = (sql: QuerySql, viewerId: string) => sql`
   m.client_message_id, m.mentioned_user_ids, m.reply_count, m.last_reply_at, m.edited_at, m.deleted_at, m.created_at,
   (SELECT ${userJsonSql(sql)} FROM public.app_users au WHERE au.id = m.author_user_id) AS author,
   CASE WHEN m.deleted_at IS NOT NULL THEN '[]'::json ELSE (
-    SELECT coalesce(json_agg(json_build_object('emoji', r.emoji, 'count', r.n, 'reacted_by_me', r.mine) ORDER BY r.first_at, r.emoji), '[]'::json)
+    SELECT coalesce(json_agg(json_build_object('emoji', r.emoji, 'count', r.n, 'reacted_by_me', r.mine, 'users', r.users)
+      ORDER BY r.first_at, r.emoji), '[]'::json)
     FROM (
-      SELECT mr.emoji, count(*)::int AS n, bool_or(mr.user_id = ${viewerId}::uuid) AS mine, min(mr.created_at) AS first_at
+      SELECT mr.emoji, count(*)::int AS n, bool_or(mr.user_id = ${viewerId}::uuid) AS mine, min(mr.created_at) AS first_at,
+        ${reactorsAggSql(sql)} AS users
       FROM public.message_reactions mr
+      LEFT JOIN public.app_users au ON au.id = mr.user_id
       WHERE mr.message_id = m.id
       GROUP BY mr.emoji
     ) r
@@ -233,13 +308,7 @@ export const toMessage = (row: MessageRow): ChatMessage => {
     clientMessageId: row.client_message_id,
     mentions: deleted ? [] : (row.mentioned_user_ids ?? []),
     attachments: deleted ? [] : (row.attachments ?? []).map(toAttachment),
-    reactions: deleted
-      ? []
-      : (row.reactions ?? []).map((reaction) => ({
-          emoji: reaction.emoji,
-          count: Number(reaction.count),
-          reactedByMe: reaction.reacted_by_me
-        })),
+    reactions: deleted ? [] : (row.reactions ?? []).map(toReactionSummary),
     replyCount: Number(row.reply_count),
     lastReplyAt: toNullableIso(row.last_reply_at),
     isEdited: row.edited_at !== null,

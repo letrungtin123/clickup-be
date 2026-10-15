@@ -12,7 +12,7 @@ import { toIso, type QuerySql } from "../../lib/db-types.js";
 import type { AccessContext } from "../access/access-context.js";
 import { toColor, toUserRef, type UserRefJson } from "../work/mappers.js";
 import { userJsonSql } from "../work/tasks.repo.js";
-import { assertProductionAdmin, assertProductionMember, isProductionAdmin } from "./access.js";
+import { assertConfigEditor, assertProductionMember, isProductionAdmin } from "./access.js";
 
 /**
  * Manual job status catalog (PD-038, "Cấu hình → Trạng thái job"): the ClickUp-style status people set on a job,
@@ -103,9 +103,9 @@ export const listJobStatuses = async (context: AccessContext): Promise<JobStatus
   };
 };
 
-/** POST /production/job-statuses (ADMIN): appended after the last one. */
+/** POST /production/job-statuses (superadmin, PD-050): appended after the last one. */
 export const createJobStatus = async (context: AccessContext, input: CreateJobStatusRequest) => {
-  assertProductionAdmin(context);
+  assertConfigEditor(context);
   const sql = getSql();
   await sql.begin(async (tx) => {
     const count = (
@@ -125,11 +125,11 @@ export const createJobStatus = async (context: AccessContext, input: CreateJobSt
 };
 
 /**
- * PATCH /production/job-statuses/:id (ADMIN): rename, colour, "đóng", "cần check hết task" (requiresAllChecked, PD-045 —
+ * PATCH /production/job-statuses/:id (superadmin, PD-050): rename, colour, "đóng", "cần check hết task" (requiresAllChecked, PD-045 —
  * turning it on moves no job: jobs already in the status keep it). Jobs keep the status (they hold its id).
  */
 export const updateJobStatus = async (context: AccessContext, id: string, input: UpdateJobStatusRequest) => {
-  assertProductionAdmin(context);
+  assertConfigEditor(context);
   const sql = getSql();
   const name = input.name ?? null;
   const color = input.color ?? null;
@@ -154,9 +154,9 @@ export const updateJobStatus = async (context: AccessContext, id: string, input:
   return await listJobStatuses(context);
 };
 
-/** PUT /production/job-statuses/order (ADMIN): position = place in `ids`; ids of other organizations are ignored. */
+/** PUT /production/job-statuses/order (superadmin, PD-050): position = place in `ids`; ids of other organizations are ignored. */
 export const reorderJobStatuses = async (context: AccessContext, ids: string[]) => {
-  assertProductionAdmin(context);
+  assertConfigEditor(context);
   const sql = getSql();
   await sql`
     UPDATE production.job_statuses AS s SET position = data.position, updated_by = ${context.user.id}
@@ -167,12 +167,12 @@ export const reorderJobStatuses = async (context: AccessContext, ids: string[]) 
 };
 
 /**
- * DELETE /production/job-statuses/:id?replacementId= (ADMIN). The last status stays (409 JOB_STATUS_LAST). While jobs
+ * DELETE /production/job-statuses/:id?replacementId= (superadmin, PD-050). The last status stays (409 JOB_STATUS_LAST). While jobs
  * use it (deleted jobs included: they keep a status) a replacement is required (409 JOB_STATUS_IN_USE); every live job
  * gets a JOB history row (from → replacement, statusDeleted), then all of them move in one statement and the status goes.
  */
 export const deleteJobStatus = async (context: AccessContext, id: string, replacementId: string | undefined): Promise<DeleteJobStatusResult> => {
-  assertProductionAdmin(context);
+  assertConfigEditor(context);
   const sql = getSql();
   const organizationId = org(context);
   const movedJobs = await sql.begin(async (tx) => {

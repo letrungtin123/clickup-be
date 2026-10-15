@@ -208,7 +208,7 @@ describe("create (POST /organization/members)", () => {
     expect(CreateOrganizationMemberRequestSchema.safeParse({ ...base, departments: ["PRODUCTION"] }).success).toBe(true);
   });
 
-  it("escalation: only your own departments; production roles only from a production ADMIN or the superadmin", async () => {
+  it("escalation: only your own departments; production roles only from the superadmin (PD-050)", async () => {
     const retouchAdmin = contextWith({ departments: ["PHOTO_RETOUCH"], productionRoles: ["ADMIN"] });
     expect(await failure(createOrganizationMember(retouchAdmin, createInput({ departments: ["PRODUCTION"] })))).toEqual({
       code: "DEPARTMENT_ESCALATION",
@@ -220,8 +220,13 @@ describe("create (POST /organization/members)", () => {
       code: "PRODUCTION_ROLE_ESCALATION",
       status: 403
     });
+    // PD-050: a production ADMIN no longer grants Photo Retouch roles either — only the superadmin.
+    expect(await failure(createOrganizationMember(retouchAdmin, createInput({ departments: ["PHOTO_RETOUCH"], productionRoles: ["STAFF"] })))).toEqual({
+      code: "PRODUCTION_ROLE_ESCALATION",
+      status: 403
+    });
     expect(mocks.createAuthUser).not.toHaveBeenCalled();
-    await createOrganizationMember(retouchAdmin, createInput({ departments: ["PHOTO_RETOUCH"], productionRoles: ["STAFF"] }));
+    await createOrganizationMember(superadmin, createInput({ departments: ["PHOTO_RETOUCH"], productionRoles: ["STAFF"] }));
     expect(mocks.createAuthUser).toHaveBeenCalledTimes(1);
   });
 });
@@ -307,17 +312,19 @@ describe("update (PATCH /organization/members/:membershipId)", () => {
     expect(statements("DELETE FROM public.user_departments")).toHaveLength(0);
   });
 
-  it("escalation: only departments the caller belongs to; production roles granted only by a production ADMIN", async () => {
+  it("escalation: only departments the caller belongs to; production roles granted or removed only by the superadmin (PD-050)", async () => {
     const productionManager = contextWith({ departments: ["PRODUCTION"], productionRoles: [] });
     db.state.handler = answer({ departments: ["PHOTO_RETOUCH"] });
     expect(await failure(patch(productionManager, { departments: ["PRODUCTION"] }))).toEqual({ code: "DEPARTMENT_ESCALATION", status: 403 });
+    // Joining Photo Retouch with its roles kept (none taken away, none granted) is a plain department change.
     expect(await failure(patch(productionManager, { departments: ["PHOTO_RETOUCH", "PRODUCTION"] }))).toBeNull();
 
     const retouchLeader = contextWith({ departments: ["PHOTO_RETOUCH"], productionRoles: ["LEADER", "STAFF"] });
     db.state.handler = answer({ departments: ["PHOTO_RETOUCH"], roles: ["STAFF"] });
     expect(await failure(patch(retouchLeader, { productionRoles: ["STAFF", "LEADER"] }))).toEqual({ code: "PRODUCTION_ROLE_ESCALATION", status: 403 });
-    // Removing a role the caller covers is fine (assertProductionRolesCovered).
-    expect(await failure(patch(retouchLeader, { productionRoles: [] }))).toBeNull();
+    // PD-050: taking a Photo Retouch role away is the superadmin's alone too.
+    expect(await failure(patch(retouchLeader, { productionRoles: [] }))).toEqual({ code: "PRODUCTION_ROLE_ESCALATION", status: 403 });
+    expect(await failure(patch(superadmin, { productionRoles: ["STAFF", "LEADER"] }))).toBeNull();
   });
 });
 
