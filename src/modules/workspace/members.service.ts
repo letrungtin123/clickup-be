@@ -1,4 +1,4 @@
-import type { Department } from "../../contracts/departments.js";
+import { departmentCodes, type Department } from "../../contracts/departments.js";
 import { Permission } from "../../contracts/permissions.js";
 import type { ChangePasswordRequest, CreateOrganizationMemberRequest, WorkspaceContext } from "../../contracts/schemas.js";
 import { getSql } from "../../db/client.js";
@@ -18,6 +18,7 @@ import {
 import { assertPermission } from "../access/resource-access.js";
 import { createAuthUser, generateTemporaryPassword, setAuthUserBanned, setAuthUserPassword } from "../auth/supabase-admin.service.js";
 import { revokeTokensIssuedBefore, signInWithPassword } from "../auth/supabase-auth.service.js";
+import { publishDepartmentChannelSync, syncDepartmentChannels, type DepartmentChannelSync } from "../chat/department-channels.js";
 import {
   assertCanAssignRole,
   assertCanGrantProductionRoles,
@@ -114,11 +115,25 @@ export const createOrganizationMember = async (context: WorkspaceContext, input:
   }
   const productionRoles = superadmin ? [] : requestedRoles;
   assertCanGrantProductionRoles(context, productionRoles);
-  return await provisionOrganizationMember(
+  const captured: { channels: DepartmentChannelSync | null } = { channels: null };
+  const created = await provisionOrganizationMember(
     context,
     { email: input.email, displayName: input.displayName, jobTitle: input.jobTitle ?? null, roleId: input.roleId },
-    superadmin ? undefined : (tx, userId) => writeMemberDepartments(tx, context, { userId, departments, productionRoles })
+    async (tx, userId) => {
+      // PD-053: a superadmin (no department rows) joins the public channels of every department.
+      captured.channels = superadmin
+        ? await syncDepartmentChannels(tx, {
+            organizationId: context.organization.id,
+            userId,
+            actorUserId: context.user.id,
+            join: departmentCodes,
+            leave: []
+          })
+        : await writeMemberDepartments(tx, context, { userId, departments, productionRoles });
+    }
   );
+  await publishDepartmentChannelSync(captured.channels);
+  return created;
 };
 
 /**
@@ -126,14 +141,21 @@ export const createOrganizationMember = async (context: WorkspaceContext, input:
  * account starts from what was chosen now (other department rows and leftover production roles are removed, so nobody
  * outside PHOTO_RETOUCH keeps a production role); a Photo Retouch member gets their production profile row (the
  * production users admin sets its team afterwards). The caller has authorized departments and roles.
+ * PD-053: the account joins the public chat channels of its departments (and leaves those of rows removed); the caller
+ * publishes the returned changes after the commit (`publishDepartmentChannelSync`).
  */
 export const writeMemberDepartments = async (
   tx: QuerySql,
   context: WorkspaceContext,
   input: { userId: string; departments: readonly Department[]; productionRoles: readonly string[] }
-) => {
+): Promise<DepartmentChannelSync | null> => {
   const organizationId = context.organization.id;
-  await replaceUserDepartments(tx, { organizationId, userId: input.userId, departments: input.departments, actorUserId: context.user.id });
+  const { removed } = await replaceUserDepartments(tx, {
+    organizationId,
+    userId: input.userId,
+    departments: input.departments,
+    actorUserId: context.user.id
+  });
   const roles = input.departments.includes("PHOTO_RETOUCH") ? [...new Set(input.productionRoles)] : [];
   await tx`DELETE FROM production.user_roles WHERE organization_id = ${organizationId} AND user_id = ${input.userId}`;
   if (roles.length > 0) {
@@ -148,6 +170,14 @@ export const writeMemberDepartments = async (
       ON CONFLICT (organization_id, user_id) DO NOTHING
     `;
   }
+  // Every chosen department, not only new rows: a taken-over account may keep old rows but miss the newer channels.
+  return await syncDepartmentChannels(tx, {
+    organizationId,
+    userId: input.userId,
+    actorUserId: context.user.id,
+    join: input.departments,
+    leave: removed
+  });
 };
 
 /**

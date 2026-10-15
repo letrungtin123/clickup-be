@@ -26,6 +26,7 @@ import { escapeLike, nullableText, type QuerySql } from "../../lib/db-types.js";
 import { evictUsersFromRoom } from "../../realtime/publisher.js";
 import { purgeNotificationsFor } from "../notifications/notifications.service.js";
 import type { AccessContext } from "../access/access-context.js";
+import { assertDepartment } from "../access/departments.js";
 import { assertPermission, hasPermission } from "../access/resource-access.js";
 import { enqueueDomainEvents, type DomainEventInput } from "../events/outbox.js";
 import {
@@ -55,6 +56,7 @@ import {
   decodeNameCursor,
   dmOpenRequirement,
   encodeNameCursor,
+  resolveChannelDepartment,
   uniqueIds
 } from "./chat-rules.js";
 import {
@@ -64,8 +66,10 @@ import {
   isUniqueViolation,
   publishChannelEvent,
   publishMessages,
-  requireActiveOrgMembers
+  requireActiveOrgMembers,
+  systemActorContext
 } from "./chat.repo.js";
+import { addDepartmentMembers } from "./department-channels.js";
 
 const channelEvent = (
   context: AccessContext,
@@ -85,8 +89,9 @@ const nameTaken = () => new AppError("CHANNEL_NAME_TAKEN", "A public channel wit
 
 /**
  * Names are unique among public channels only (index channels_org_name_uidx): a clash can only ever point at
- * a channel everyone may browse, never reveal that a private channel exists (SEC-API-13). Private channels
- * may share names; an emptied private channel no longer holds its name (WK-41).
+ * a public channel (of any department since PD-053: names stay unique across the organization), never reveal that
+ * a private channel exists (SEC-API-13). Private channels may share names; an emptied private channel no longer holds
+ * its name (WK-41).
  */
 const assertNameFree = async (sql: QuerySql, context: AccessContext, name: string, kind: string, exceptId: string | null) => {
   if (kind !== "public") {
@@ -159,7 +164,9 @@ export const getChannel = async (context: AccessContext, channelId: string, sql:
     archived: row.archived_at !== null,
     member: row.access && row.role ? { access: row.access, role: row.role } : null,
     permissions: channelPermissions(context),
-    superadmin: context.hasFullOrganizationAuthority
+    superadmin: context.hasFullOrganizationAuthority,
+    department: row.department,
+    departments: context.departments
   });
   if (!capabilities) {
     throw channelNotFound();
@@ -167,11 +174,20 @@ export const getChannel = async (context: AccessContext, channelId: string, sql:
   return { ...toChannel(row), capabilities };
 };
 
-/** Joinable public channels the caller is not in (superadmins may include private ones to manage). */
+/**
+ * Joinable public channels the caller is not in — of their departments, or without department (PD-053) — (superadmins
+ * may include private ones to manage). `department` (PD-054, the switcher) narrows to that department's channels and
+ * those without department; it must be one of the caller's (403 DEPARTMENT_FORBIDDEN).
+ */
 export const browseChannels = async (context: AccessContext, query: ChannelBrowseQuery): Promise<ChannelBrowsePage> => {
   assertPermission(context, Permission.ChannelView);
+  if (query.department !== undefined) {
+    assertDepartment(context, query.department);
+  }
   const sql = getSql();
   const kinds = query.includePrivate && context.hasFullOrganizationAuthority ? ["public", "private"] : ["public"];
+  const departments = [...context.departments];
+  const selected = query.department ?? null;
   const cursor = decodeNameCursor(query.cursor);
   const q = query.q?.trim().toLowerCase() ?? "";
   const like = `%${escapeLike(q)}%`;
@@ -182,6 +198,8 @@ export const browseChannels = async (context: AccessContext, query: ChannelBrows
       AND c.kind = ANY(${kinds}::text[])
       AND c.deleted_at IS NULL
       AND c.archived_at IS NULL
+      AND (c.department IS NULL OR ${context.hasFullOrganizationAuthority} OR c.department = ANY(${departments}::text[]))
+      AND (${selected}::text IS NULL OR c.department IS NULL OR c.department = ${selected}::text)
       AND NOT EXISTS (
         SELECT 1 FROM public.channel_members cm
         WHERE cm.organization_id = c.organization_id AND cm.channel_id = c.id
@@ -203,13 +221,20 @@ export const browseChannels = async (context: AccessContext, query: ChannelBrows
 
 // Create / update --------------------------------------------------------------------------------
 
+/**
+ * POST /channels. A channel belongs to one department (public: PD-053, private: PD-054; `resolveChannelDepartment`: 403
+ * DEPARTMENT_FORBIDDEN / 400 CHANNEL_DEPARTMENT_REQUIRED). A public channel starts with every active member of it —
+ * `memberIds` is ignored; a private channel starts with the caller and `memberIds` (its department adds nobody).
+ */
 export const createChannel = async (context: AccessContext, input: CreateChannelRequest): Promise<ChatChannelDetail> => {
   assertPermission(context, Permission.ChannelCreate);
   assertPermission(context, Permission.ChannelView);
   const sql = getSql();
-  const memberIds = uniqueIds(input.memberIds).filter((id) => id !== context.user.id);
+  const isPublic = input.kind === "public";
+  const department = resolveChannelDepartment(context, input.department, input.kind);
+  const memberIds = isPublic ? [] : uniqueIds(input.memberIds).filter((id) => id !== context.user.id);
 
-  let created: { channelId: string; systemMessageIds: string[] };
+  let created: { channelId: string; addedIds: string[] };
   try {
     created = await sql.begin(async (tx) => {
       const names = await requireActiveOrgMembers(tx, context, memberIds);
@@ -217,8 +242,9 @@ export const createChannel = async (context: AccessContext, input: CreateChannel
 
       const channel = (
         await tx<{ id: string }[]>`
-          INSERT INTO public.channels (organization_id, kind, name, description, created_by)
-          VALUES (${context.organization.id}, ${input.kind}, ${input.name}, ${nullableText(input.description) ?? null}, ${context.user.id})
+          INSERT INTO public.channels (organization_id, kind, name, description, department, created_by)
+          VALUES (${context.organization.id}, ${input.kind}, ${input.name}, ${nullableText(input.description) ?? null}, ${department},
+                  ${context.user.id})
           RETURNING id
         `
       )[0];
@@ -232,31 +258,32 @@ export const createChannel = async (context: AccessContext, input: CreateChannel
                CASE WHEN u.user_id = ${context.user.id}::uuid THEN 'admin' ELSE 'member' END, ${context.user.id}::uuid
         FROM unnest(${[context.user.id, ...memberIds]}::uuid[]) AS u(user_id)
       `;
+      // PD-053: everyone of the department (the creator is in already); a private channel's department adds nobody.
+      const departmentMembers = isPublic ? await addDepartmentMembers(tx, context, channel.id, department, 0) : [];
+      const addedIds = [...memberIds, ...departmentMembers.map((member) => member.userId)];
+      const addedNames = [...memberIds.map((id) => names.get(id) ?? "someone"), ...departmentMembers.map((member) => member.displayName)];
 
-      const systemMessageIds = [
-        (await insertSystemMessage(tx, context, channel.id, { type: "created", actorId: context.user.id, name: input.name })).id
-      ];
-      if (memberIds.length > 0) {
+      await insertSystemMessage(tx, context, channel.id, { type: "created", actorId: context.user.id, name: input.name });
+      if (addedIds.length > 0) {
         const added = await insertSystemMessage(
           tx,
           context,
           channel.id,
-          { type: "members_added", actorId: context.user.id, userIds: memberIds },
-          memberIds.map((id) => names.get(id) ?? "someone")
+          { type: "members_added", actorId: context.user.id, userIds: addedIds },
+          addedNames
         );
-        systemMessageIds.push(added.id);
         // New members start caught up.
-        await advanceReadMarkers(tx, context, channel.id, memberIds, added.seq);
+        await advanceReadMarkers(tx, context, channel.id, addedIds, added.seq);
       }
 
       // Only events a consumer handles are emitted (chat.channel.member_added → inbox); see jobs/registry.ts.
       await enqueueDomainEvents(
         tx,
-        memberIds.length > 0
-          ? [channelEvent(context, "chat.channel.member_added", channel.id, { channelKind: input.kind, userIds: memberIds, addedBy: context.user.id })]
+        addedIds.length > 0
+          ? [channelEvent(context, "chat.channel.member_added", channel.id, { channelKind: input.kind, userIds: addedIds, addedBy: context.user.id })]
           : []
       );
-      return { channelId: channel.id, systemMessageIds };
+      return { channelId: channel.id, addedIds };
     });
   } catch (error) {
     if (isUniqueViolation(error, "channels_org_name_uidx")) {
@@ -270,17 +297,23 @@ export const createChannel = async (context: AccessContext, input: CreateChannel
     kind: "joined",
     channelId: created.channelId,
     channel: detail,
-    userIds: [context.user.id, ...memberIds],
+    userIds: [context.user.id, ...created.addedIds],
     actorId: context.user.id,
     toRoom: false,
-    toUsers: [context.user.id, ...memberIds]
+    toUsers: [context.user.id, ...created.addedIds]
   });
   return detail;
 };
 
+/**
+ * PATCH /channels/:id. A channel without department (created before PD-053 / PD-054) takes one when it is made public
+ * or when `department` is given (same rules as on create, channel admins); a channel's department never changes
+ * afterwards (`department` is ignored then). Making a channel public — or giving a public channel its department —
+ * adds every active member of its department (PD-053). Making it private keeps its department and its members (PD-054).
+ */
 export const updateChannel = async (context: AccessContext, channelId: string, input: UpdateChannelRequest): Promise<ChatChannelDetail> => {
   const sql = getSql();
-  let outcome: { systemMessageIds: string[]; changed: boolean; madePrivate: boolean };
+  let outcome: { systemMessageIds: string[]; changed: boolean; madePrivate: boolean; addedIds: string[] };
   try {
     outcome = await sql.begin(async (tx) => {
       const resolved = await requireChannel(tx, context, channelId, { lock: true });
@@ -290,27 +323,41 @@ export const updateChannel = async (context: AccessContext, channelId: string, i
       if (wantsMetadata) {
         assertCapability(resolved.caps.canUpdate);
       }
-      if (input.kind !== undefined && input.kind !== channel.kind) {
+      const kind = input.kind ?? channel.kind;
+      // PD-053 / PD-054: a channel without department takes one when it becomes public or when one is given.
+      const assignsDepartment =
+        channel.department === null && (input.department !== undefined || (kind === "public" && channel.kind !== "public"));
+      if (kind !== channel.kind || assignsDepartment) {
         assertCapability(resolved.caps.canChangeKind, "Only channel admins can change who can find this channel.");
       }
       assertNotArchived(resolved);
+      const department = assignsDepartment
+        ? resolveChannelDepartment(context, input.department, kind === "public" ? "public" : "private")
+        : channel.department;
+      // Everyone of the department joins a channel made public, or a public channel given its department (PD-053).
+      const addsDepartmentMembers = kind === "public" && (channel.kind !== "public" || assignsDepartment);
 
       const nextName = input.name ?? channel.name;
       const renamed = nextName !== channel.name;
       const description = input.description === undefined ? channel.description : (nullableText(input.description) ?? null);
       const topic = input.topic === undefined ? channel.topic : (nullableText(input.topic) ?? null);
-      const kind = input.kind ?? channel.kind;
       if ((renamed || kind !== channel.kind) && nextName !== null) {
         await assertNameFree(tx, context, nextName, kind, channelId);
       }
       // A save that changes nothing writes nothing and notifies nobody (WK-42).
-      if (!renamed && description === channel.description && topic === channel.topic && kind === channel.kind) {
-        return { systemMessageIds: [], changed: false, madePrivate: false };
+      if (
+        !renamed &&
+        description === channel.description &&
+        topic === channel.topic &&
+        kind === channel.kind &&
+        department === channel.department
+      ) {
+        return { systemMessageIds: [], changed: false, madePrivate: false, addedIds: [] };
       }
 
       await tx`
         UPDATE public.channels
-        SET name = ${nextName}, description = ${description}, topic = ${topic}, kind = ${kind}
+        SET name = ${nextName}, description = ${description}, topic = ${topic}, kind = ${kind}, department = ${department}
         WHERE organization_id = ${context.organization.id} AND id = ${channelId}
       `;
 
@@ -329,6 +376,24 @@ export const updateChannel = async (context: AccessContext, channelId: string, i
         ids.push((await insertSystemMessage(tx, context, channelId, event)).id);
       }
 
+      // PD-053: everyone of the department joins (caught up), with the usual "added" message and inbox notice.
+      const added = addsDepartmentMembers && department ? await addDepartmentMembers(tx, context, channelId, department, 0) : [];
+      const addedIds = added.map((member) => member.userId);
+      if (addedIds.length > 0) {
+        const message = await insertSystemMessage(
+          tx,
+          context,
+          channelId,
+          { type: "members_added", actorId: context.user.id, userIds: addedIds },
+          added.map((member) => member.displayName)
+        );
+        ids.push(message.id);
+        await advanceReadMarkers(tx, context, channelId, addedIds, message.seq);
+        await enqueueDomainEvents(tx, [
+          channelEvent(context, "chat.channel.member_added", channelId, { channelKind: kind, userIds: addedIds, addedBy: context.user.id })
+        ]);
+      }
+
       const madePrivate = channel.kind === "public" && kind === "private";
       if (madePrivate) {
         // Non-members lose the channel: their inbox entries quoting it go too (BUG-WK-04).
@@ -342,7 +407,7 @@ export const updateChannel = async (context: AccessContext, channelId: string, i
             )
         `;
       }
-      return { systemMessageIds: ids, changed: true, madePrivate };
+      return { systemMessageIds: ids, changed: true, madePrivate, addedIds };
     });
   } catch (error) {
     if (isUniqueViolation(error, "channels_org_name_uidx")) {
@@ -357,6 +422,17 @@ export const updateChannel = async (context: AccessContext, channelId: string, i
   }
   await publishMessages(sql, context, channelId, outcome.systemMessageIds);
   publishChannelEvent({ kind: "updated", channelId, channel: detail, actorId: context.user.id, toRoom: true });
+  if (outcome.addedIds.length > 0) {
+    publishChannelEvent({
+      kind: "joined",
+      channelId,
+      channel: detail,
+      userIds: outcome.addedIds,
+      actorId: context.user.id,
+      toRoom: true,
+      toUsers: outcome.addedIds
+    });
+  }
   return detail;
 };
 
@@ -918,31 +994,6 @@ export const openDirectConversation = async (
 };
 
 // System-level membership --------------------------------------------------------------------------
-
-/** Acts as `actorId` for system-initiated changes: names system messages and events, grants nothing. */
-const systemActorContext = async (sql: QuerySql, organizationId: string, actorId: string): Promise<AccessContext> => {
-  const row = (
-    await sql<{ display_name: string; email: string | null; slug: string; name: string }[]>`
-      SELECT au.display_name, au.email, o.slug, o.name
-      FROM public.app_users au
-      JOIN public.organizations o ON o.id = ${organizationId}
-      WHERE au.id = ${actorId}
-    `
-  )[0];
-  if (!row) {
-    throw new AppError("CHAT_SYSTEM_ACTOR_INVALID", "Người thực hiện không hợp lệ.", 400);
-  }
-  return {
-    user: { id: actorId, displayName: row.display_name, email: row.email },
-    organization: { id: organizationId, slug: row.slug, name: row.name },
-    role: { id: actorId, organizationId, key: "system", name: "system", permissions: [] },
-    hasFullOrganizationAuthority: false,
-    mustChangePassword: false,
-    productionRoles: [],
-    departments: [],
-    canSwitchDepartment: false
-  };
-};
 
 /**
  * System-level membership sync for channels owned by another module (e.g. production job chats follow the

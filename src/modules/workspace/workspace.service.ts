@@ -794,9 +794,10 @@ export const updateOrganizationMember = async (
   const superadminBefore = current.role_key === "superadmin";
   const superadminAfter = nextRoleKey === "superadmin";
   // A demoted superadmin leaves the implicit "every department": their departments are checked (and the lost ones
-  // revoked) even when the request carries none.
+  // revoked) even when the request carries none. A promoted one enters every department: they join its public chat
+  // channels (PD-053).
   const departmentsTouched =
-    input.departments !== undefined || input.productionRoles !== undefined || (superadminBefore && !superadminAfter);
+    input.departments !== undefined || input.productionRoles !== undefined || superadminBefore !== superadminAfter;
 
   const departmentChange = await sql.begin(async (tx) => {
     await tx`

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  ChannelBrowseQuerySchema,
   ChannelNameSchema,
   CreateChannelRequestSchema,
   isValidReactionEmoji,
@@ -10,10 +11,13 @@ import {
   SendMessageRequestSchema,
   UpdateChannelRequestSchema
 } from "../../contracts/chat.js";
+import type { Department } from "../../contracts/departments.js";
+import { DirectoryQuerySchema } from "../../contracts/work.js";
 import { AppError } from "../../lib/app-error.js";
 import { encodeCursor } from "../../lib/db-types.js";
 import {
   areDmColleagues,
+  audienceDepartments,
   assertDmColleague,
   buildDmKey,
   computeChannelCapabilities,
@@ -25,9 +29,11 @@ import {
   encodeTimeCursor,
   findInvalidMentions,
   hasMessageContent,
+  inChannelDepartment,
   mentionRecipients,
   mentionScope,
   nextReadSeq,
+  resolveChannelDepartment,
   resolveHistoryWindow,
   systemMessageText,
   toSeq,
@@ -51,6 +57,8 @@ const caps = (overrides: Partial<CapabilityInput>) =>
     member: null,
     permissions: viewOnly,
     superadmin: false,
+    department: null,
+    departments: ["PHOTO_RETOUCH"],
     ...overrides
   });
 
@@ -140,14 +148,141 @@ describe("computeChannelCapabilities", () => {
     expect(caps({ kind: "private", permissions: allPerms, superadmin: true })).toMatchObject({ canManageAdmins: true });
     expect(caps({ kind: "dm", member: { access: "submit", role: "member" }, permissions: allPerms })).toMatchObject({ canManageAdmins: false });
   });
+
+  it("opens a department's public channel to that department only (PD-053)", () => {
+    // In the department: preview and join as before.
+    expect(caps({ department: "PHOTO_RETOUCH" })).toMatchObject({ canRead: true, canPost: false, canJoin: true, canLeave: false });
+    // Another department: invisible (404), even with every global channel permission — like a private channel.
+    expect(caps({ department: "PRODUCTION" })).toBeNull();
+    expect(caps({ department: "PRODUCTION", permissions: allPerms })).toBeNull();
+    expect(caps({ department: "PRODUCTION", departments: [] })).toBeNull();
+    // The superadmin belongs to every department.
+    expect(caps({ department: "PRODUCTION", departments: [], superadmin: true })).toMatchObject({ canRead: true, canJoin: true });
+    // Without department (before PD-053): organization-wide.
+    expect(caps({ department: null, departments: [] })).toMatchObject({ canRead: true, canJoin: true });
+  });
+
+  it("keeps a department channel for its members, who may leave and rejoin (PD-053)", () => {
+    // Added by a channel admin although outside the department: a member sees it.
+    expect(caps({ department: "PRODUCTION", member: { access: "submit", role: "member" } })).toMatchObject({
+      canRead: true,
+      canPost: true,
+      canLeave: true,
+      canJoin: false
+    });
+    expect(caps({ department: "PHOTO_RETOUCH", member: { access: "submit", role: "member" } })).toMatchObject({ canLeave: true });
+    expect(caps({ department: "PHOTO_RETOUCH", archived: true })).toMatchObject({ canRead: true, canJoin: false });
+  });
+});
+
+describe("department channels (PD-053)", () => {
+  const caller = (departments: Department[], superadmin = false) => ({ hasFullOrganizationAuthority: superadmin, departments });
+  const code = (run: () => unknown) => {
+    try {
+      return run();
+    } catch (error) {
+      return error instanceof AppError ? `${error.statusCode} ${error.code} ${error.message}` : "other";
+    }
+  };
+
+  it("audience: the department's members and the superadmin; no department = everyone", () => {
+    expect(inChannelDepartment("PHOTO_RETOUCH", { superadmin: false, departments: ["PHOTO_RETOUCH"] })).toBe(true);
+    expect(inChannelDepartment("PRODUCTION", { superadmin: false, departments: ["PHOTO_RETOUCH"] })).toBe(false);
+    expect(inChannelDepartment("PRODUCTION", { superadmin: true, departments: [] })).toBe(true);
+    expect(inChannelDepartment(null, { superadmin: false, departments: [] })).toBe(true);
+  });
+
+  it("a new public channel takes the requested department, which must be the caller's", () => {
+    expect(code(() => resolveChannelDepartment(caller(["PHOTO_RETOUCH", "PRODUCTION"]), "PRODUCTION"))).toBe("PRODUCTION");
+    expect(code(() => resolveChannelDepartment(caller(["PHOTO_RETOUCH"]), "PRODUCTION"))).toBe(
+      "403 DEPARTMENT_FORBIDDEN Bạn không thuộc phòng ban này."
+    );
+    // The superadmin may pick any department.
+    expect(code(() => resolveChannelDepartment(caller(["PHOTO_RETOUCH", "PRODUCTION"], true), "PRODUCTION"))).toBe("PRODUCTION");
+  });
+
+  it("without a choice: the caller's only department, otherwise 400 CHANNEL_DEPARTMENT_REQUIRED", () => {
+    expect(code(() => resolveChannelDepartment(caller(["PRODUCTION"]), undefined))).toBe("PRODUCTION");
+    expect(code(() => resolveChannelDepartment(caller(["PHOTO_RETOUCH", "PRODUCTION"]), undefined))).toBe(
+      "400 CHANNEL_DEPARTMENT_REQUIRED Chọn phòng ban cho kênh public."
+    );
+    expect(code(() => resolveChannelDepartment(caller(["PHOTO_RETOUCH", "PRODUCTION"], true), undefined))).toBe(
+      "400 CHANNEL_DEPARTMENT_REQUIRED Chọn phòng ban cho kênh public."
+    );
+    expect(code(() => resolveChannelDepartment(caller([]), undefined))).toBe("400 CHANNEL_DEPARTMENT_REQUIRED Chọn phòng ban cho kênh public.");
+  });
+
+  it("the contract carries the department on create and update", () => {
+    expect(CreateChannelRequestSchema.parse({ name: "chung", department: "PRODUCTION" })).toMatchObject({ kind: "public", department: "PRODUCTION" });
+    expect(CreateChannelRequestSchema.parse({ name: "chung" }).department).toBeUndefined();
+    expect(CreateChannelRequestSchema.safeParse({ name: "chung", department: "SALES" }).success).toBe(false);
+    expect(UpdateChannelRequestSchema.parse({ kind: "public", department: "PHOTO_RETOUCH" })).toEqual({ kind: "public", department: "PHOTO_RETOUCH" });
+    expect(UpdateChannelRequestSchema.safeParse({ department: "nope" }).success).toBe(false);
+  });
+});
+
+describe("chat follows the department switcher (PD-054)", () => {
+  const caller = (departments: Department[], superadmin = false) => ({ hasFullOrganizationAuthority: superadmin, departments });
+  const code = (run: () => unknown) => {
+    try {
+      return run();
+    } catch (error) {
+      return error instanceof AppError ? `${error.statusCode} ${error.code} ${error.message}` : "other";
+    }
+  };
+
+  it("a private channel resolves its department like a public one, with its own wording", () => {
+    expect(code(() => resolveChannelDepartment(caller(["PRODUCTION"]), undefined, "private"))).toBe("PRODUCTION");
+    expect(code(() => resolveChannelDepartment(caller(["PHOTO_RETOUCH"]), "PRODUCTION", "private"))).toBe(
+      "403 DEPARTMENT_FORBIDDEN Bạn không thuộc phòng ban này."
+    );
+    expect(code(() => resolveChannelDepartment(caller(["PHOTO_RETOUCH", "PRODUCTION"], true), undefined, "private"))).toBe(
+      "400 CHANNEL_DEPARTMENT_REQUIRED Chọn phòng ban cho kênh riêng tư."
+    );
+    expect(CreateChannelRequestSchema.parse({ kind: "private", name: "nhom", department: "PRODUCTION" })).toMatchObject({
+      kind: "private",
+      department: "PRODUCTION"
+    });
+  });
+
+  it("a channel is shown in its department; without one, in every department", () => {
+    expect(audienceDepartments("public", "PRODUCTION", null)).toEqual(["PRODUCTION"]);
+    expect(audienceDepartments("private", "PHOTO_RETOUCH", null)).toEqual(["PHOTO_RETOUCH"]);
+    expect(audienceDepartments("public", null, null)).toEqual(["PHOTO_RETOUCH", "PRODUCTION"]);
+    expect(audienceDepartments("private", null, undefined)).toEqual(["PHOTO_RETOUCH", "PRODUCTION"]);
+    // A named channel follows its own department, never its members'.
+    expect(audienceDepartments("private", "PRODUCTION", ["PHOTO_RETOUCH"])).toEqual(["PRODUCTION"]);
+  });
+
+  it("a DM is shown in every department of the other participants (stable order); none → everywhere", () => {
+    expect(audienceDepartments("dm", null, ["PRODUCTION"])).toEqual(["PRODUCTION"]);
+    expect(audienceDepartments("dm", null, ["PRODUCTION", "PHOTO_RETOUCH"])).toEqual(["PHOTO_RETOUCH", "PRODUCTION"]);
+    expect(audienceDepartments("group_dm", null, ["PRODUCTION", "PRODUCTION", "PHOTO_RETOUCH"])).toEqual(["PHOTO_RETOUCH", "PRODUCTION"]);
+    expect(audienceDepartments("dm", null, [])).toEqual(["PHOTO_RETOUCH", "PRODUCTION"]);
+    expect(audienceDepartments("group_dm", null, null)).toEqual(["PHOTO_RETOUCH", "PRODUCTION"]);
+    expect(audienceDepartments("dm", null, ["SALES"])).toEqual(["PHOTO_RETOUCH", "PRODUCTION"]);
+  });
+
+  it("browse and the people search take an optional department", () => {
+    expect(ChannelBrowseQuerySchema.parse({ department: "PRODUCTION" }).department).toBe("PRODUCTION");
+    expect(ChannelBrowseQuerySchema.parse({}).department).toBeUndefined();
+    expect(ChannelBrowseQuerySchema.safeParse({ department: "SALES" }).success).toBe(false);
+    expect(DirectoryQuerySchema.parse({ purpose: "dm", department: "PHOTO_RETOUCH" })).toMatchObject({ purpose: "dm", department: "PHOTO_RETOUCH" });
+    expect(DirectoryQuerySchema.safeParse({ department: "sales" }).success).toBe(false);
+  });
 });
 
 describe("mentions", () => {
-  it("uses organization scope only for public channels", () => {
-    expect(mentionScope("public")).toBe("organization");
-    expect(mentionScope("private")).toBe("members");
-    expect(mentionScope("dm")).toBe("members");
-    expect(mentionScope("group_dm")).toBe("members");
+  it("uses organization scope only for public channels without department", () => {
+    expect(mentionScope("public", null)).toBe("organization");
+    expect(mentionScope("private", null)).toBe("members");
+    expect(mentionScope("dm", null)).toBe("members");
+    expect(mentionScope("group_dm", null)).toBe("members");
+  });
+
+  it("a department's public channel: its members plus the department (PD-053)", () => {
+    expect(mentionScope("public", "PHOTO_RETOUCH")).toBe("department");
+    expect(mentionScope("public", "PRODUCTION")).toBe("department");
   });
 
   it("reports ineligible mentions case-insensitively", () => {

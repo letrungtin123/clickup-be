@@ -109,6 +109,31 @@ export const insertSystemMessage = async (
 
 // Organization members ---------------------------------------------------------------------------
 
+/** Acts as `actorId` for system-initiated changes: names system messages and events, grants nothing. */
+export const systemActorContext = async (sql: QuerySql, organizationId: string, actorId: string): Promise<AccessContext> => {
+  const row = (
+    await sql<{ display_name: string; email: string | null; slug: string; name: string }[]>`
+      SELECT au.display_name, au.email, o.slug, o.name
+      FROM public.app_users au
+      JOIN public.organizations o ON o.id = ${organizationId}
+      WHERE au.id = ${actorId}
+    `
+  )[0];
+  if (!row) {
+    throw new AppError("CHAT_SYSTEM_ACTOR_INVALID", "Người thực hiện không hợp lệ.", 400);
+  }
+  return {
+    user: { id: actorId, displayName: row.display_name, email: row.email },
+    organization: { id: organizationId, slug: row.slug, name: row.name },
+    role: { id: actorId, organizationId, key: "system", name: "system", permissions: [] },
+    hasFullOrganizationAuthority: false,
+    mustChangePassword: false,
+    productionRoles: [],
+    departments: [],
+    canSwitchDepartment: false
+  };
+};
+
 /** Validates that every id is an active member of the caller's organization; returns display names. */
 export const requireActiveOrgMembers = async (sql: QuerySql, context: AccessContext, userIds: string[]) => {
   const ids = uniqueIds(userIds);

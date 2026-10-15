@@ -170,6 +170,56 @@ describe("people search for a DM (purpose=dm)", () => {
   });
 });
 
+describe("people search follows the department switcher (PD-054)", () => {
+  const people = () => fakeSql(() => []);
+  const departmentFilter = "AND public.is_department_member(om.organization_id, om.user_id, $::text)";
+  const both = contextWith(["PHOTO_RETOUCH", "PRODUCTION"]);
+
+  it("a DM search with a department: colleagues of that department only, on top of the usual scope", async () => {
+    const { calls } = people();
+    await searchDirectory(staff, { purpose: "dm", department: "PHOTO_RETOUCH", limit: 20 });
+    const query = calls.at(-1)!;
+    expect(query.text).toContain("public.user_departments ud");
+    expect(query.text).toContain(departmentFilter);
+    expect(query.values).toContain("PHOTO_RETOUCH");
+
+    // Callers who may message anyone are narrowed to the department too (the superadmin is in every department).
+    for (const [context, department] of [
+      [manager, "PHOTO_RETOUCH"],
+      [superadmin, "PRODUCTION"]
+    ] as const) {
+      const { calls: wide } = people();
+      await searchDirectory(context, { purpose: "dm", department, limit: 20 });
+      expect(wide.at(-1)!.text).toContain(departmentFilter);
+      expect(wide.at(-1)!.text).not.toContain("user_departments ud");
+      expect(wide.at(-1)!.values).toContain(department);
+    }
+  });
+
+  it("refuses a department the caller is not in: 403 DEPARTMENT_FORBIDDEN, before any query", async () => {
+    for (const purpose of ["dm" as const, undefined]) {
+      const { calls } = people();
+      expect(await failure(() => searchDirectory(manager, { purpose, department: "PRODUCTION", limit: 20 }))).toBe("403 DEPARTMENT_FORBIDDEN");
+      expect(calls).toHaveLength(0);
+    }
+    people();
+    expect(await failure(() => searchDirectory(both, { purpose: "dm", department: "PRODUCTION", limit: 20 }))).toBe("ok");
+  });
+
+  it("the member picker takes the department too; without one nothing changes", async () => {
+    const { calls } = people();
+    await searchDirectory(manager, { department: "PHOTO_RETOUCH", limit: 20 });
+    expect(calls.at(-1)!.text).toContain(departmentFilter);
+
+    const plain = people();
+    await searchDirectory(manager, { purpose: "dm", limit: 20 });
+    expect(plain.calls.at(-1)!.text).not.toContain("is_department_member");
+    // Still no organization-wide search without member.view.
+    people();
+    expect(await failure(() => searchDirectory(staff, { department: "PHOTO_RETOUCH", limit: 20 }))).toBe("403 FORBIDDEN");
+  });
+});
+
 describe("opening a DM (POST /dms)", () => {
   /** No existing conversation; the parties' departments; stops at the INSERT (the rules let it through). */
   const dmSql = (parties: Record<string, { superadmin: boolean; departments: string[] }>) =>

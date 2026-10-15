@@ -180,6 +180,10 @@ describe("create (POST /organization/members)", () => {
     expect(statements("INSERT INTO production.user_roles")[0]!.values).toContainEqual(["STAFF", "QC"]);
     expect(statements("INSERT INTO production.member_profiles")).toHaveLength(1);
     expect(mocks.invalidateAccessContexts).toHaveBeenCalled();
+    // PD-053: the new member joins the public chat channels of their departments, in the same transaction.
+    const channels = texts.findIndex((text) => text.startsWith("INSERT INTO public.channel_members"));
+    expect(channels).toBeGreaterThan(departments);
+    expect(db.state.calls[channels]!.values).toContainEqual(["PHOTO_RETOUCH"]);
   });
 
   it("a Production-only member gets no production role (leftover roles of a taken-over account are removed)", async () => {
@@ -197,6 +201,8 @@ describe("create (POST /organization/members)", () => {
     expect(mocks.createAuthUser).toHaveBeenCalledTimes(1);
     expect(statements("INSERT INTO public.user_departments")).toHaveLength(0);
     expect(statements("INSERT INTO production.user_roles")).toHaveLength(0);
+    // PD-053: a superadmin joins the public channels of every department.
+    expect(statements("INSERT INTO public.channel_members")[0]!.values).toContainEqual(["PHOTO_RETOUCH", "PRODUCTION"]);
   });
 
   it("the contract enforces production roles iff PHOTO_RETOUCH", () => {
@@ -247,6 +253,9 @@ describe("update (PATCH /organization/members/:membershipId)", () => {
     expect(statements("DELETE FROM public.user_departments")[0]!.values).toContainEqual(["PHOTO_RETOUCH"]);
     expect(statements("DELETE FROM production.user_roles")[0]!.values).toContainEqual(["LEADER", "STAFF"]);
     expect(mocks.revokeDepartmentAccessEffects).toHaveBeenCalledWith(expect.anything(), superadmin, target, "PHOTO_RETOUCH");
+    // PD-053: they leave the department's public chat channels (none here, so nothing to publish).
+    expect(statements("UPDATE public.channel_members cm SET deleted_at")[0]!.values).toContainEqual(["PHOTO_RETOUCH"]);
+    expect(statements("INSERT INTO public.channel_members")).toHaveLength(0);
     // The membership row is updated first, in the same transaction.
     const texts = db.state.calls.map((call) => call.text);
     expect(texts.findIndex((text) => text.startsWith("UPDATE public.organization_memberships"))).toBeLessThan(
@@ -304,12 +313,14 @@ describe("update (PATCH /organization/members/:membershipId)", () => {
     const { departmentChange } = await patch(superadmin, { roleId: memberRoleId, departments: ["PRODUCTION"] });
     expect(departmentChange).toMatchObject({ departments: ["PRODUCTION"], removed: ["PHOTO_RETOUCH"], removedRoles: ["ADMIN"], changed: true });
     expect(mocks.revokeDepartmentAccessEffects).toHaveBeenCalledWith(expect.anything(), superadmin, target, "PHOTO_RETOUCH");
-    // Promoting to superadmin needs no department: every department implicitly, rows left as they are.
+    // Promoting to superadmin needs no department: every department implicitly, rows left as they are; the departments
+    // gained count as a change (PD-053: their public chat channels are joined).
     db.state.handler = answer({ departments: ["PRODUCTION"] });
     db.state.calls = [];
     const promoted = await patch(superadmin, { roleId: superRoleId });
-    expect(promoted.departmentChange).toBeNull();
+    expect(promoted.departmentChange).toMatchObject({ added: ["PHOTO_RETOUCH"], removed: [], removedRoles: [], changed: true });
     expect(statements("DELETE FROM public.user_departments")).toHaveLength(0);
+    expect(statements("INSERT INTO public.channel_members")[0]!.values).toContainEqual(["PHOTO_RETOUCH"]);
   });
 
   it("escalation: only departments the caller belongs to; production roles granted or removed only by the superadmin (PD-050)", async () => {

@@ -496,6 +496,9 @@ export const TaskKeyLookupSchema = z.object({ id: Id, projectId: Id });
  * People search. `purpose=dm` ("Tin nhắn mới"): open to every active member — names and avatars of the people the
  * caller may start a direct message with (colleagues sharing a department, superadmins; anyone for callers who may
  * create channels), e-mails only for holders of member.view. `projectId` / `channelId` are ignored with it.
+ * `department` (PD-054, the department switcher): only members of that department (the superadmin included), on top of
+ * every other scope; it must be one of the caller's departments (403 DEPARTMENT_FORBIDDEN). Mention pickers
+ * (`channelId` without `purpose`) ignore it.
  */
 export const DirectoryPurposeSchema = z.enum(["dm"]);
 export type DirectoryPurpose = z.infer<typeof DirectoryPurposeSchema>;
@@ -505,6 +508,7 @@ export const DirectoryQuerySchema = z.object({
   projectId: Id.optional(),
   channelId: Id.optional(),
   purpose: DirectoryPurposeSchema.optional(),
+  department: DepartmentSchema.optional(),
   limit: z.coerce.number().int().min(1).max(50).default(20)
 });
 export const DirectoryCollectionSchema = z.object({ items: z.array(UserRefSchema) });

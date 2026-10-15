@@ -36,6 +36,7 @@ import { sanitizeWithMentionLabels } from "../../lib/mentions.js";
 import { removeObjects } from "../../lib/storage.js";
 import { publishToRoom, publishToUsers } from "../../realtime/publisher.js";
 import type { AccessContext } from "../access/access-context.js";
+import { departmentMemberSql } from "../access/departments.js";
 import { hasPermission } from "../access/resource-access.js";
 import { enqueueDomainEvents } from "../events/outbox.js";
 import {
@@ -91,8 +92,10 @@ const validateMentions = async (tx: QuerySql, context: AccessContext, resolved: 
   if (ids.length === 0) {
     return ids;
   }
+  const { kind, department } = resolved.channel;
+  const scope = mentionScope(kind, department);
   const eligible =
-    mentionScope(resolved.channel.kind) === "organization"
+    scope === "organization"
       ? await tx<{ user_id: string }[]>`
           SELECT user_id FROM public.organization_memberships
           WHERE organization_id = ${context.organization.id} AND user_id = ANY(${ids}::uuid[])
@@ -102,6 +105,17 @@ const validateMentions = async (tx: QuerySql, context: AccessContext, resolved: 
           SELECT user_id FROM public.channel_members
           WHERE organization_id = ${context.organization.id} AND channel_id = ${resolved.channel.id}
             AND user_id = ANY(${ids}::uuid[]) AND deleted_at IS NULL
+          ${
+            scope === "department" && department
+              ? tx`
+                  UNION
+                  SELECT om.user_id FROM public.organization_memberships om
+                  WHERE om.organization_id = ${context.organization.id} AND om.user_id = ANY(${ids}::uuid[])
+                    AND om.status = 'active' AND om.deleted_at IS NULL
+                    AND ${departmentMemberSql(tx, tx`om.organization_id`, tx`om.user_id`, department)}
+                `
+              : tx``
+          }
         `;
   if (findInvalidMentions(ids, eligible.map((row) => row.user_id)).length > 0) {
     throw new AppError("CHAT_MENTION_INVALID", "You can only mention people who can see this conversation.", 400);
@@ -839,7 +853,7 @@ export const searchMessages = async (context: AccessContext, query: ChatSearchQu
   return hitPage(rows, query.limit, (row) => row.id);
 };
 
-/** "Mentions of me", newest first: conversations the caller is still in, plus public channels. */
+/** "Mentions of me", newest first: conversations the caller is still in, plus the public channels they may preview (PD-053). */
 export const listMyMentions = async (context: AccessContext, query: ChatMentionsQuery): Promise<ChatSearchPage> => {
   const sql = getSql();
   const cursor = decodeTimeCursor(query.cursor);
@@ -860,7 +874,10 @@ export const listMyMentions = async (context: AccessContext, query: ChatMentions
             AND cm.user_id = ${context.user.id} AND cm.deleted_at IS NULL
             AND (c.kind IN ('dm', 'group_dm') OR ${canViewChannels})
         )
-        OR (c.kind = 'public' AND ${canViewChannels})
+        OR (
+          c.kind = 'public' AND ${canViewChannels}
+          AND (c.department IS NULL OR ${context.hasFullOrganizationAuthority} OR c.department = ANY(${[...context.departments]}::text[]))
+        )
       )
       ${cursor ? sql`AND (mm.created_at, mm.message_id) < (${timestampParamSql(sql, cursor.at)}, ${cursor.id}::uuid)` : sql``}
     ORDER BY mm.created_at DESC, mm.message_id DESC

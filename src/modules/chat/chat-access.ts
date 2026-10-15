@@ -120,7 +120,9 @@ export const loadChannel = async (
     archived: row.archived_at !== null,
     member,
     permissions: channelPermissions(context),
-    superadmin: context.hasFullOrganizationAuthority
+    superadmin: context.hasFullOrganizationAuthority,
+    department: row.department,
+    departments: context.departments
   });
   if (!caps) {
     return null;

@@ -1,13 +1,14 @@
+import type { Department } from "../../contracts/departments.js";
 import { Permission } from "../../contracts/permissions.js";
 import type { DirectoryPurpose } from "../../contracts/work.js";
 import { getSql } from "../../db/client.js";
 import { AppError } from "../../lib/app-error.js";
 import { escapeLike } from "../../lib/db-types.js";
 import type { AccessContext } from "../access/access-context.js";
-import { departmentMemberSql } from "../access/departments.js";
+import { assertDepartment, departmentMemberSql } from "../access/departments.js";
 import { getProjectAccess, hasPermission } from "../access/resource-access.js";
 import { dmCallerOf, loadChannel } from "../chat/chat-access.js";
-import { dmDirectoryScope } from "../chat/chat-rules.js";
+import { dmDirectoryScope, mentionScope } from "../chat/chat-rules.js";
 import { toUserRef, type UserRefJson } from "./mappers.js";
 import { userJsonSql } from "./tasks.repo.js";
 
@@ -19,6 +20,9 @@ import { userJsonSql } from "./tasks.repo.js";
  * `purpose=dm` ("Tin nhắn mới"): every active member may search the people they may message (chat-rules
  * `dmDirectoryScope`: colleagues sharing a department plus superadmins, or anyone for callers who may create
  * channels); `projectId` / `channelId` do not apply.
+ * `department` (PD-054, the department switcher): on top of every other scope, only members of that department (the
+ * superadmin included, public.is_department_member); it must be one of the caller's (403 DEPARTMENT_FORBIDDEN).
+ * Mention pickers (`channelId` without `purpose`) follow the channel only and ignore it.
  */
 export const searchDirectory = async (
   context: AccessContext,
@@ -27,11 +31,16 @@ export const searchDirectory = async (
     projectId?: string | undefined;
     channelId?: string | undefined;
     purpose?: DirectoryPurpose | undefined;
+    department?: Department | undefined;
     limit: number;
   }
 ) => {
   const sql = getSql();
   const canViewMembers = hasPermission(context, Permission.MemberView);
+  const department = input.purpose === "dm" || !input.channelId ? (input.department ?? null) : null;
+  if (department) {
+    assertDepartment(context, department);
+  }
   let projectFilter = sql`TRUE`;
   if (input.purpose === "dm") {
     const scope = dmDirectoryScope(dmCallerOf(context));
@@ -50,17 +59,25 @@ export const searchDirectory = async (
       )`;
     }
   } else if (input.channelId) {
-    // Mention pickers in private channels and DMs only offer current members.
+    // Mention pickers follow the channel's mention scope (chat-rules `mentionScope`): private channels and DMs offer
+    // their current members, a department's public channel its members plus the department (PD-053, superadmin
+    // included), a public channel without department the whole organization.
     const resolved = await loadChannel(sql, context, input.channelId);
     if (!resolved?.caps.canRead) {
       throw new AppError("CHANNEL_NOT_FOUND", "Channel was not found.", 404);
     }
-    if (resolved.channel.kind !== "public") {
-      projectFilter = sql`EXISTS (
+    const { kind, department } = resolved.channel;
+    const scope = mentionScope(kind, department);
+    if (scope !== "organization") {
+      const channelMember = sql`EXISTS (
         SELECT 1 FROM public.channel_members cm
         WHERE cm.organization_id = om.organization_id AND cm.channel_id = ${input.channelId}
           AND cm.user_id = om.user_id AND cm.deleted_at IS NULL
       )`;
+      projectFilter =
+        scope === "department" && department
+          ? sql`(${channelMember} OR ${departmentMemberSql(sql, sql`om.organization_id`, sql`om.user_id`, department)})`
+          : channelMember;
     }
   } else if (input.projectId) {
     const access = await getProjectAccess(context, input.projectId, sql);
@@ -91,6 +108,7 @@ export const searchDirectory = async (
       AND om.status = 'active'
       AND om.deleted_at IS NULL
       AND ${projectFilter}
+      ${department ? sql`AND ${departmentMemberSql(sql, sql`om.organization_id`, sql`om.user_id`, department)}` : sql``}
       AND (
         ${q.length === 0}
         OR public.immutable_unaccent(lower(au.display_name)) LIKE public.immutable_unaccent(${like})

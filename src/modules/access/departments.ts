@@ -3,6 +3,7 @@ import type postgres from "postgres";
 import { departmentCodes, sortDepartments, type Department, type memberProductionRoleCodes } from "../../contracts/departments.js";
 import { AppError } from "../../lib/app-error.js";
 import type { QuerySql } from "../../lib/db-types.js";
+import type { DepartmentChannelSync } from "../chat/department-channels.js";
 import type { DepartmentRevokedTask } from "../work/department-access.js";
 import type { AccessContext } from "./access-context.js";
 
@@ -150,6 +151,8 @@ export type MemberDepartmentChange = {
   rolesAfter: MemberProductionRole[];
   /** Production roles the person lost (a demoted superadmin also loses the implicit ADMIN). */
   removedRoles: MemberProductionRole[];
+  /** Department public channels joined / left (PD-053), published after the commit (`publishDepartmentChannelSync`). */
+  channels: DepartmentChannelSync | null;
   /** Anything effective changed: caches, sockets and the PD-024 follow-ups must run after the commit. */
   changed: boolean;
 };

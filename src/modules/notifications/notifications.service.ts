@@ -87,7 +87,8 @@ const notificationColumns = (sql: QuerySql) => sql`
  * from the recipient (alias `n`), so the API and the worker's unread pushes agree.
  * Departments (PD-041): a public project counts only for members of its department (explicit project members and
  * the superadmin always), and production module entries only while the recipient is in Photo Retouch — they come
- * back if the department is given back.
+ * back if the department is given back. A public channel with a department (PD-053) counts for non-members only
+ * while they belong to that department.
  */
 const recipientCanSeeSql = (sql: QuerySql) => sql`
   (n.type NOT LIKE 'production.%' OR public.is_department_member(n.organization_id, n.recipient_user_id, 'PHOTO_RETOUCH'))
@@ -133,7 +134,14 @@ const recipientCanSeeSql = (sql: QuerySql) => sql`
           WHERE vmem.organization_id = vc.organization_id AND vmem.channel_id = vc.id
             AND vmem.user_id = n.recipient_user_id AND vmem.deleted_at IS NULL
         )
-        OR vc.kind = 'public'
+        OR (vc.kind = 'public' AND (
+          vc.department IS NULL
+          OR vcr.key = 'superadmin'
+          OR EXISTS (
+            SELECT 1 FROM public.user_departments vcud
+            WHERE vcud.organization_id = vc.organization_id AND vcud.user_id = n.recipient_user_id AND vcud.department = vc.department
+          )
+        ))
       )
       AND (
         vc.kind IN ('dm', 'group_dm')

@@ -4,11 +4,15 @@ import type {
   ChannelKind,
   ChannelRole,
   ChatSystemEvent,
-  MessageHistoryQuery
+  MessageHistoryQuery,
+  NamedChannelKind
 } from "../../contracts/chat.js";
 import { chatLimits, isDirectKind } from "../../contracts/chat.js";
+import { departmentCodes, sortDepartments, type Department } from "../../contracts/departments.js";
 import { AppError } from "../../lib/app-error.js";
 import { decodeCursor, decodeTimeCursor, encodeCursor, encodeTimeCursor, invalidCursor, isUuid } from "../../lib/db-types.js";
+import type { AccessContext } from "../access/access-context.js";
+import { assertDepartment } from "../access/departments.js";
 
 /** Pure chat rules (no I/O) so they can be unit tested in isolation. */
 
@@ -88,6 +92,62 @@ export const dmDirectoryScope = (caller: DmCaller) => ({
   departments: [...caller.departments]
 });
 
+// Department channels (PD-053) --------------------------------------------------------------------
+
+/**
+ * A public channel's audience: the members of its department (the superadmin belongs to every department); a public
+ * channel without department (created before PD-053) is organization-wide.
+ */
+export const inChannelDepartment = (department: string | null, caller: { superadmin: boolean; departments: readonly string[] }) =>
+  department === null || caller.superadmin || caller.departments.includes(department);
+
+export const channelDepartmentRequired = (kind: NamedChannelKind = "public") =>
+  new AppError("CHANNEL_DEPARTMENT_REQUIRED", kind === "public" ? "Chọn phòng ban cho kênh public." : "Chọn phòng ban cho kênh riêng tư.", 400);
+
+/**
+ * The department of a new channel (create, private → public, a channel without department given one; public and
+ * private since PD-054): the requested one, which must be one of the caller's (403 DEPARTMENT_FORBIDDEN); none
+ * requested → the caller's only department, or 400 CHANNEL_DEPARTMENT_REQUIRED when they belong to several (the
+ * superadmin: all) or none.
+ */
+export const resolveChannelDepartment = (
+  context: Pick<AccessContext, "hasFullOrganizationAuthority" | "departments">,
+  requested: Department | undefined,
+  kind: NamedChannelKind = "public"
+): Department => {
+  if (requested !== undefined) {
+    assertDepartment(context, requested);
+    return requested;
+  }
+  const only = context.departments.length === 1 ? context.departments[0] : undefined;
+  if (!only) {
+    throw channelDepartmentRequired(kind);
+  }
+  return only;
+};
+
+// Department switcher (PD-054) --------------------------------------------------------------------
+
+/**
+ * Departments in which a conversation is shown to the viewer (`ChatChannel.audienceDepartments`), stable order:
+ * - public / private channel: its department; without one (created before PD-053 / PD-054) every department;
+ * - dm / group_dm: `otherDepartments` = the effective departments of the other participants as the sidebar query
+ *   gathers them (department rows, every department for a superadmin); none → every department (nobody to follow).
+ * Unknown codes are dropped.
+ */
+export const audienceDepartments = (
+  kind: ChannelKind,
+  department: string | null,
+  otherDepartments: readonly string[] | null | undefined
+): Department[] => {
+  const known = sortDepartments(
+    (isDirectKind(kind) ? (otherDepartments ?? []) : department === null ? [] : [department]).filter((code): code is Department =>
+      (departmentCodes as readonly string[]).includes(code)
+    )
+  );
+  return known.length > 0 ? known : [...departmentCodes];
+};
+
 // Capabilities ------------------------------------------------------------------------------------
 
 export type CapabilityInput = {
@@ -97,6 +157,10 @@ export type CapabilityInput = {
   permissions: { view: boolean; update: boolean; delete: boolean; manageMembers: boolean };
   /** context.hasFullOrganizationAuthority */
   superadmin: boolean;
+  /** The channel's department (public channels, PD-053); null = none. */
+  department: string | null;
+  /** The caller's effective departments (context.departments: every department for a superadmin). */
+  departments: readonly string[];
 };
 
 /**
@@ -104,8 +168,9 @@ export type CapabilityInput = {
  * be invisible to the caller (callers answer 404).
  *
  * - dm / group_dm: participants only — never visible to anyone else, superadmins included.
- * - public: visible to holders of channel.view; reading is allowed to non-members (preview), posting
- *   requires membership with submit access.
+ * - public: visible to holders of channel.view in its department (PD-053; organization-wide without department);
+ *   reading is allowed to non-members of it (preview), posting requires membership with submit access. Anyone else
+ *   sees it only as a member (a channel admin added them), like a private channel.
  * - private: visible to members; superadmins can see and manage it (membership, settings) but must
  *   add themselves as a member (visible to everyone) before reading messages — no silent reads.
  * - Channel admins manage their channel without global permissions; global channel.update /
@@ -137,12 +202,14 @@ export const computeChannelCapabilities = (input: CapabilityInput): ChannelCapab
     return null;
   }
   const isMember = member !== null;
-  if (!isMember && kind !== "public" && !superadmin) {
+  // Open to non-members: public channels, for the members of their department (PD-053).
+  const open = kind === "public" && inChannelDepartment(input.department, { superadmin, departments: input.departments });
+  if (!isMember && !open && !superadmin) {
     return null;
   }
 
   const elevated = member?.role === "admin" || superadmin;
-  const canRead = isMember || kind === "public";
+  const canRead = isMember || open;
   const canManageMembers = elevated || permissions.manageMembers;
   const canUpdate = elevated || permissions.update;
   return {
@@ -157,7 +224,7 @@ export const computeChannelCapabilities = (input: CapabilityInput): ChannelCapab
     // superadmin: channel.manage_members alone must not self-promote (SEC-API-02).
     canManageAdmins: elevated,
     canModerate: canRead && canManageMembers,
-    canJoin: !isMember && kind === "public" && !archived,
+    canJoin: !isMember && open && !archived,
     canLeave: isMember
   };
 };
@@ -165,10 +232,18 @@ export const computeChannelCapabilities = (input: CapabilityInput): ChannelCapab
 // Mentions ----------------------------------------------------------------------------------------
 
 /**
- * Who may be mentioned: in public channels any active organization member (they are notified even
- * if they have not joined); in private channels and DMs only current members.
+ * Who may be mentioned (they are notified even if they are not in the channel):
+ * - "department": a public channel of a department (PD-053) — its members plus the active members of the department
+ *   (the superadmin included);
+ * - "organization": a public channel without department (before PD-053) — any active organization member;
+ * - "members": private channels and DMs — current members only.
  */
-export const mentionScope = (kind: ChannelKind): "organization" | "members" => (kind === "public" ? "organization" : "members");
+export const mentionScope = (kind: ChannelKind, department: string | null): "organization" | "department" | "members" => {
+  if (kind !== "public") {
+    return "members";
+  }
+  return department === null ? "organization" : "department";
+};
 
 /** Mentioned ids that are not eligible (order preserved, de-duplicated). */
 export const findInvalidMentions = (mentionIds: string[], eligibleIds: Iterable<string>) => {

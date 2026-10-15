@@ -224,7 +224,9 @@ export const openJobChat = async (context: AccessContext, jobId: string): Promis
         kind: "private",
         name: attempt === 0 ? base : `${base} (${attempt + 1})`,
         description: `Nhóm chat của job ${job.code}`.slice(0, 1000),
-        memberIds: members.filter((id) => id !== context.user.id)
+        memberIds: members.filter((id) => id !== context.user.id),
+        // PD-054: a job chat is Photo Retouch work (shown under that department of the switcher).
+        department: "PHOTO_RETOUCH"
       });
     } catch (error) {
       if (!(error instanceof AppError) || error.statusCode !== 409) {

@@ -8,6 +8,7 @@ import { getSql } from "../../db/client.js";
 import { AppError } from "../../lib/app-error.js";
 import { logger } from "../../lib/logger.js";
 import { invalidateAccessContexts } from "../access/access-context.js";
+import { publishDepartmentChannelSync, syncDepartmentChannels } from "../chat/department-channels.js";
 import { insertOrganizationMemberRecords } from "../workspace/members.service.js";
 import {
   decideGoogleAccess,
@@ -112,7 +113,7 @@ const provisionMember = async (input: { userId: string; email: string; displayNa
     logger.warn({ organizationId: input.organizationId }, "Google sign-in: organization has no default member role");
     return false;
   }
-  await sql.begin(async (tx) => {
+  const channels = await sql.begin(async (tx) => {
     await insertOrganizationMemberRecords(tx, {
       organizationId: input.organizationId,
       userId: input.userId,
@@ -136,8 +137,17 @@ const provisionMember = async (input: { userId: string; email: string; displayNa
       VALUES (${input.organizationId}, ${input.userId}, ${defaultDepartment})
       ON CONFLICT DO NOTHING
     `;
+    // PD-053: and its public chat channels ("<name> joined").
+    return await syncDepartmentChannels(tx, {
+      organizationId: input.organizationId,
+      userId: input.userId,
+      actorUserId: input.userId,
+      join: [defaultDepartment],
+      leave: []
+    });
   });
   await invalidateAccessContexts();
+  await publishDepartmentChannelSync(channels);
   return true;
 };
 

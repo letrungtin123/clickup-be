@@ -12,11 +12,12 @@ import type {
   ReactionSummary
 } from "../../contracts/chat.js";
 import { chatLimits } from "../../contracts/chat.js";
+import { departmentCodes, type Department } from "../../contracts/departments.js";
 import type { RichTextDoc } from "../../contracts/rich-text.js";
 import type { UserRef } from "../../contracts/work.js";
 import { toIso, toNullableIso, type QuerySql, type SqlFragment } from "../../lib/db-types.js";
 import { inlineImageTypes } from "../../lib/storage.js";
-import { toSeq, unreadCount } from "./chat-rules.js";
+import { audienceDepartments, toSeq, unreadCount } from "./chat-rules.js";
 
 export type UserRefJson = { id: string; display_name: string; email: string | null; avatar_url: string | null };
 
@@ -42,12 +43,13 @@ export type ChannelInfoRow = {
   last_message_seq: string | number;
   last_message_at: Date | null;
   member_count: number;
+  department: Department | null;
 };
 
 /** Columns for ChannelInfoRow; expects `c` (channels) in scope. */
 export const channelInfoColumnsSql = (sql: QuerySql) => sql`
   c.id, c.kind, c.name, c.description, c.topic, c.created_by, c.created_at, c.updated_at, c.archived_at,
-  c.last_message_seq, c.last_message_at, c.member_count
+  c.last_message_seq, c.last_message_at, c.member_count, c.department
 `;
 
 export const toChannelInfo = (row: ChannelInfoRow): ChatChannelInfo => ({
@@ -62,7 +64,8 @@ export const toChannelInfo = (row: ChannelInfoRow): ChatChannelInfo => ({
   archivedAt: toNullableIso(row.archived_at),
   memberCount: Number(row.member_count),
   lastMessageSeq: toSeq(row.last_message_seq),
-  lastMessageAt: toNullableIso(row.last_message_at)
+  lastMessageAt: toNullableIso(row.last_message_at),
+  department: row.department
 });
 
 /** Strips viewer-specific fields so a caller's view of a channel can be broadcast safely. */
@@ -78,7 +81,8 @@ export const pickChannelInfo = (channel: ChatChannelInfo): ChatChannelInfo => ({
   archivedAt: channel.archivedAt,
   memberCount: channel.memberCount,
   lastMessageSeq: channel.lastMessageSeq,
-  lastMessageAt: channel.lastMessageAt
+  lastMessageAt: channel.lastMessageAt,
+  department: channel.department
 });
 
 export type ChannelViewRow = ChannelInfoRow & {
@@ -89,6 +93,8 @@ export type ChannelViewRow = ChannelInfoRow & {
   mention_count: number;
   unread_count: number;
   participants: UserRefJson[] | null;
+  /** dm / group_dm: departments of the other participants (`audienceDepartmentsSql`); null for channels. */
+  audience_departments?: string[] | null;
 };
 
 /** Unread top-level messages after a read marker, deleted ones excluded (WK-45), capped. */
@@ -107,8 +113,35 @@ export const unreadCountSql = (
 )`;
 
 /**
- * Viewer columns (membership, unread mentions capped, DM participants); expects `c` (channels) and
- * `cm` (the caller's active channel_members row, possibly NULL via LEFT JOIN) in scope.
+ * Departments a DM is shown in (PD-054): the department rows of the other active participants, every department when
+ * one of them is the organization superadmin (same rule as public.is_department_member); NULL when there are none (the
+ * mapper then shows it everywhere) and for named channels (the mapper uses their department). One aggregate per row
+ * of the same statement, like `participants`: no extra query per conversation. Expects `c` (channels) in scope.
+ */
+export const audienceDepartmentsSql = (sql: QuerySql, userId: string) => sql`
+  CASE WHEN c.kind IN ('dm', 'group_dm') THEN (
+    SELECT array_agg(DISTINCT deps.department ORDER BY deps.department)
+    FROM public.channel_members ap
+    CROSS JOIN LATERAL (
+      SELECT ud.department FROM public.user_departments ud
+      WHERE ud.organization_id = ap.organization_id AND ud.user_id = ap.user_id
+      UNION ALL
+      SELECT code FROM unnest(${[...departmentCodes]}::text[]) AS code
+      WHERE EXISTS (
+        SELECT 1 FROM public.organization_memberships aom
+        JOIN public.roles ar ON ar.id = aom.role_id AND ar.organization_id = aom.organization_id
+        WHERE aom.organization_id = ap.organization_id AND aom.user_id = ap.user_id AND aom.deleted_at IS NULL
+          AND ar.key = 'superadmin'
+      )
+    ) AS deps(department)
+    WHERE ap.organization_id = c.organization_id AND ap.channel_id = c.id
+      AND ap.deleted_at IS NULL AND ap.user_id <> ${userId}
+  ) END AS audience_departments
+`;
+
+/**
+ * Viewer columns (membership, unread mentions capped, DM participants, departments shown in); expects `c` (channels)
+ * and `cm` (the caller's active channel_members row, possibly NULL via LEFT JOIN) in scope.
  */
 export const channelViewerColumnsSql = (sql: QuerySql, userId: string, mentionCap: number) => sql`
   cm.access, cm.role, cm.notify_level, cm.last_read_seq,
@@ -127,7 +160,8 @@ export const channelViewerColumnsSql = (sql: QuerySql, userId: string, mentionCa
     JOIN public.app_users au ON au.id = pm.user_id
     WHERE pm.organization_id = c.organization_id AND pm.channel_id = c.id
       AND pm.deleted_at IS NULL AND pm.user_id <> ${userId}
-  ) ELSE '[]'::json END AS participants
+  ) ELSE '[]'::json END AS participants,
+  ${audienceDepartmentsSql(sql, userId)}
 `;
 
 export const toChannel = (row: ChannelViewRow): ChatChannel => {
@@ -143,7 +177,8 @@ export const toChannel = (row: ChannelViewRow): ChatChannel => {
     lastReadSeq,
     unreadCount: lastReadSeq === null ? 0 : Math.min(Number(row.unread_count), unreadCount(info.lastMessageSeq, lastReadSeq)),
     mentionCount: isMember ? Number(row.mention_count) : 0,
-    participants: (row.participants ?? []).map((user) => toUserRef(user)!)
+    participants: (row.participants ?? []).map((user) => toUserRef(user)!),
+    audienceDepartments: audienceDepartments(row.kind, row.department, row.audience_departments)
   };
 };
 

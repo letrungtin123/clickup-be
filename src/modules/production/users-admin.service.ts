@@ -9,6 +9,7 @@ import type { QuerySql } from "../../lib/db-types.js";
 import { logger } from "../../lib/logger.js";
 import { disconnectUsers } from "../../realtime/publisher.js";
 import { invalidateAccessContexts, type AccessContext } from "../access/access-context.js";
+import { publishDepartmentChannelSync, syncDepartmentChannels, type DepartmentChannelSync } from "../chat/department-channels.js";
 import {
   assertDepartmentsChangeAllowed,
   assertDepartmentsPresent,
@@ -237,12 +238,13 @@ export const createProductionUser = async (context: AccessContext, input: Create
     }
   }
 
+  const captured: { channels: DepartmentChannelSync | null } = { channels: null };
   const created = await provisionOrganizationMember(
     context,
     { email: input.email, displayName: input.displayName, jobTitle: input.jobTitle ?? null, roleId: role.id },
     async (tx, userId) => {
       // A taken-over account (membership removed earlier) starts from the departments and roles chosen now.
-      await writeMemberDepartments(tx, context, { userId, departments, productionRoles: roles });
+      captured.channels = await writeMemberDepartments(tx, context, { userId, departments, productionRoles: roles });
       await tx`
         INSERT INTO production.member_profiles (organization_id, user_id, team_id)
         VALUES (${organizationId}, ${userId}, ${input.teamId ?? null})
@@ -257,6 +259,8 @@ export const createProductionUser = async (context: AccessContext, input: Create
       }
     }
   );
+  // PD-053: the department channels they joined.
+  await publishDepartmentChannelSync(captured.channels);
   logger.info({ actorId: context.user.id, userId: created.member.user.id, roles, departments }, "Production user created");
   return { member: await loadProductionMember(sql, organizationId, created.member.user.id), temporaryPassword: created.temporaryPassword };
 };
@@ -307,7 +311,9 @@ const afterProductionRolesRemoved = async (context: AccessContext, userId: strin
  *   - granted or removed roles need the superadmin (PD-050, 403 PRODUCTION_ROLE_ESCALATION); your own ADMIN
  *     cannot go (409 SELF_ADMIN_REMOVAL);
  *   - each department the person effectively leaves runs `revokeDepartmentAccessEffects` (task assignments in its
- *     public workspace projects).
+ *     public workspace projects);
+ *   - PD-053: they join the public chat channels of each department gained and leave those of each department lost
+ *     (`syncDepartmentChannels`, a promotion to superadmin included).
  * A resulting superadmin belongs to every department implicitly: rows and roles are left untouched. After the commit
  * call `afterDepartmentChange` (or the equivalent follow-ups, as `updateProductionUser` does).
  */
@@ -319,7 +325,8 @@ export const applyDepartmentChange: MemberDepartmentWriter = async (tx, context,
   if (input.superadminAfter) {
     const departments = effectiveDepartments(true, rows);
     const added = departments.filter((department) => !before.includes(department));
-    return { departments, added, removed: [], revoked: [], rolesBefore, rolesAfter: rolesBefore, removedRoles: [], changed: added.length > 0 };
+    const channels = await syncDepartmentChannels(tx, { organizationId, userId: input.userId, actorUserId: context.user.id, join: added, leave: [] });
+    return { departments, added, removed: [], revoked: [], rolesBefore, rolesAfter: rolesBefore, removedRoles: [], channels, changed: added.length > 0 };
   }
   const next = input.departments ? sortDepartments(input.departments) : rows;
   assertDepartmentsPresent(next, false);
@@ -373,6 +380,8 @@ export const applyDepartmentChange: MemberDepartmentWriter = async (tx, context,
   for (const department of removed) {
     revoked.push({ department, tasks: await revokeDepartmentAccessEffects(tx, context, input.userId, department) });
   }
+  // PD-053: they join the public channels of the departments gained and leave those of the departments lost.
+  const channels = await syncDepartmentChannels(tx, { organizationId, userId: input.userId, actorUserId: context.user.id, join: added, leave: removed });
   return {
     departments: next,
     added,
@@ -381,6 +390,7 @@ export const applyDepartmentChange: MemberDepartmentWriter = async (tx, context,
     rolesBefore,
     rolesAfter,
     removedRoles,
+    channels,
     changed: added.length > 0 || removed.length > 0 || granted.length > 0 || deleted.length > 0
   };
 };
@@ -398,6 +408,7 @@ export const afterDepartmentChange = async (context: AccessContext, userId: stri
     await publishDepartmentAccessRevoked(context, userId, department, tasks);
   }
   await invalidateAccessContexts();
+  await publishDepartmentChannelSync(change.channels);
   // The reconnect re-authorizes every room (the production room too when PHOTO_RETOUCH went).
   disconnectUsers([userId]);
   return await afterProductionRolesRemoved(context, userId, change.removedRoles);
@@ -457,6 +468,7 @@ export const updateProductionUser = async (
   for (const { department, tasks } of captured.change?.revoked ?? []) {
     await publishDepartmentAccessRevoked(context, userId, department, tasks);
   }
+  await publishDepartmentChannelSync(captured.change?.channels);
   disconnectUsers([userId]);
   const removed = target.roles.filter((role) => !member.roles.includes(role));
   return { member, orphanedJobs: await afterProductionRolesRemoved(context, userId, removed) };
