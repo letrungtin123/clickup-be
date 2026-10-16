@@ -26,6 +26,7 @@ import {
   loadJobScopes,
   ownJobsSql,
   qtyAssignedEditAllowed,
+  qtyFillAllowed,
   subtaskDeleteAllowed,
   subtaskManageAllowed
 } from "./job-permissions.js";
@@ -144,7 +145,8 @@ export type TaskRow = {
   shift_name: string;
   pay_mode: "POINTS" | "MONEY_IF_KPI";
   requires_ot_hours: boolean;
-  qty_assigned: number;
+  /** null: no quantity yet ("chưa có số lượng", PD-058); never null once done_at is set. */
+  qty_assigned: number | null;
   qty_done: number | null;
   error_qty: number | null;
   ot_hours: string | null;
@@ -200,7 +202,8 @@ export type SubtaskJson = {
   sub_seq: number | null;
   process_id: string;
   process_name: string;
-  qty_assigned: number;
+  /** null: no quantity yet (PD-058). */
+  qty_assigned: number | null;
   qty_done: number | null;
   reason: string | null;
   created_by: UserRefJson | null;
@@ -226,11 +229,11 @@ export type QtyRequestJson = {
 /** PD-044: a subtask (NORMAL row with a parent line) — it follows its line's status, people, shift and dates. */
 export const isSubtaskRow = (row: Pick<TaskRow, "kind" | "parent_task_id">) => isSubtask({ kind: row.kind, parentTaskId: row.parent_task_id });
 
-/** Sum of a line's subtask quantities (0 without subtasks). */
-export const subtaskQtySum = (row: Pick<TaskRow, "subtasks">) => (row.subtasks ?? []).reduce((sum, subtask) => sum + subtask.qty_assigned, 0);
+/** Sum of a line's known subtask quantities (0 without subtasks; PD-058: a subtask without a quantity counts 0). */
+export const subtaskQtySum = (row: Pick<TaskRow, "subtasks">) => (row.subtasks ?? []).reduce((sum, subtask) => sum + (subtask.qty_assigned ?? 0), 0);
 
-/** "Số lượng Leader giao" (PD-044): a line's own quantity plus its subtasks'; a subtask's own. */
-export const allocatedQtyOf = (row: Pick<TaskRow, "qty_assigned" | "subtasks">) => row.qty_assigned + subtaskQtySum(row);
+/** "Số lượng Leader giao" (PD-044): a line's own quantity plus its subtasks'; a subtask's own. PD-058: known numbers only. */
+export const allocatedQtyOf = (row: Pick<TaskRow, "qty_assigned" | "subtasks">) => (row.qty_assigned ?? 0) + subtaskQtySum(row);
 
 /** Not a subtask, on the task alias `t` (lists of lines: Việc của tôi, Hàng chờ QC, lateness scans). */
 export const notSubtaskSql = (sql: QuerySql) => sql`NOT (t.kind = 'NORMAL' AND t.parent_task_id IS NOT NULL)`;
@@ -449,7 +452,16 @@ export const toProductionTasks = async (sql: QuerySql, context: AccessContext, w
 
 type CapabilityRow = Pick<
   TaskRow,
-  "assignee_id" | "job_archived" | "done_at" | "checked_at" | "kind" | "parent_task_id" | "process_is_qc" | "created_by" | "pending_qty_request"
+  | "assignee_id"
+  | "job_archived"
+  | "done_at"
+  | "checked_at"
+  | "kind"
+  | "parent_task_id"
+  | "process_is_qc"
+  | "created_by"
+  | "pending_qty_request"
+  | "qty_assigned"
 >;
 
 /**
@@ -458,7 +470,8 @@ type CapabilityRow = Pick<
  * "all", before Done) and delete it. PD-044: correct the Done quantity after Done ("update: all" any time, the worker
  * until "Đã check"), change "Số lượng giao" directly or ask the Leader for it, decide a request, split subtasks. A subtask
  * (`leads` = the caller acts as the job's leader) is managed by its worker, the Leader or "update: all"; it follows its
- * line's people, so it is never assigned on its own.
+ * line's people, so it is never assigned on its own. PD-058: a task without a quantity is filled in directly — by its
+ * assignee too (qtyFillAllowed) — and never through a request.
  */
 export const taskCapabilities = (row: CapabilityRow, access: TaskAccess, leads = false) => {
   const live = !row.job_archived;
@@ -467,10 +480,8 @@ export const taskCapabilities = (row: CapabilityRow, access: TaskAccess, leads =
   const beforeDone = row.done_at === null;
   const manages = subtaskManageAllowed({ leads, updateScope: access.scopes.update, mine });
   const canEdit = live && (subtask ? manages : lineAllowed(access.scopes.update, mine));
-  const canEditQtyAssigned =
-    live &&
-    beforeDone &&
-    qtyAssignedEditAllowed({ leads, updateScope: access.scopes.update, mine, createdByMe: row.created_by === access.userId, subtask });
+  const qtyRights = { leads, updateScope: access.scopes.update, mine, createdByMe: row.created_by === access.userId, subtask };
+  const canEditQtyAssigned = live && beforeDone && (row.qty_assigned === null ? qtyFillAllowed(qtyRights) : qtyAssignedEditAllowed(qtyRights));
   const workLine = row.kind === "NORMAL" && !subtask;
   return {
     canEdit,
@@ -478,7 +489,8 @@ export const taskCapabilities = (row: CapabilityRow, access: TaskAccess, leads =
     canChangeAssignee: canEdit && !subtask && access.scopes.update === "all" && beforeDone,
     canEditQty: live && doneQtyEditAllowed({ updateScope: access.scopes.update, mine, done: !beforeDone, checked: row.checked_at !== null }),
     canEditQtyAssigned,
-    canRequestQty: live && mine && workLine && beforeDone && !canEditQtyAssigned && row.pending_qty_request === null,
+    canRequestQty:
+      live && mine && workLine && beforeDone && row.qty_assigned !== null && !canEditQtyAssigned && row.pending_qty_request === null,
     canDecideQtyRequest: live && row.pending_qty_request !== null && (leads || access.scopes.update === "all"),
     canCreateSubtask: live && workLine && !row.process_is_qc && beforeDone && manages,
     canDelete:
@@ -570,7 +582,7 @@ export const toProductionTask = (row: TaskRow, workflow: Workflow, relation: Tas
     isSubtask: subtask,
     splitReason: row.split_reason,
     subtasks: subtask ? [] : (row.subtasks ?? []).map((item) => toSubtask(item, row.number)),
-    allocatedQty: subtask ? row.qty_assigned : allocatedQtyOf(row),
+    allocatedQty: subtask ? (row.qty_assigned ?? 0) : allocatedQtyOf(row),
     pendingQtyRequest: row.pending_qty_request ? toTaskQtyRequest(row.pending_qty_request) : null,
     feedbackId: row.feedback_id,
     note: row.note,
@@ -645,6 +657,8 @@ export type JobRow = {
   late_task_count: number;
   /** PD-045: live lines not finished yet (lineFinishedSql). */
   unchecked_task_count: number;
+  /** PD-058: live tasks (subtasks and Checking lines included) without a quantity yet. */
+  tasks_without_qty: number;
   open_feedback_count: number;
   /** Distinct task assignees, most images first (null: no task). */
   workers: { user: UserRefJson; qty: number; task_count: number }[] | null;
@@ -679,6 +693,7 @@ export const jobSelectSql = (sql: QuerySql, finish: LineFinishStatusIds, personI
     coalesce(agg.qty_assigned, 0)::int AS qty_assigned, coalesce(agg.qty_done, 0)::int AS qty_done,
     coalesce(agg.qty_checked, 0)::int AS qty_checked, coalesce(agg.task_count, 0)::int AS task_count,
     coalesce(agg.late_task_count, 0)::int AS late_task_count, coalesce(agg.unchecked_task_count, 0)::int AS unchecked_task_count,
+    coalesce(agg.tasks_without_qty, 0)::int AS tasks_without_qty,
     (SELECT count(*)::int FROM production.feedbacks f WHERE f.organization_id = j.organization_id AND f.job_id = j.id AND f.status <> 'RESOLVED') AS open_feedback_count,
     people.workers, people.qc_people, people.process_totals,
     ${personId ? sql`mine.person_share` : sql`NULL::json AS person_share`},
@@ -695,7 +710,9 @@ export const jobSelectSql = (sql: QuerySql, finish: LineFinishStatusIds, personI
   LEFT JOIN LATERAL (
     -- Image totals compare with total_images, so feedback redo tasks (FB_*) and Checking lines (they check the same
     -- images) are not counted. Checked = lines checked by their QC, or Checking lines that are Done (PD-037).
+    -- PD-058: sum() skips tasks without a quantity (known numbers only); tasks_without_qty counts them (every live task).
     SELECT sum(t.qty_assigned) FILTER (WHERE t.kind = 'NORMAL' AND NOT tp.is_qc) AS qty_assigned,
+      count(*) FILTER (WHERE t.qty_assigned IS NULL) AS tasks_without_qty,
       sum(coalesce(t.qty_done, 0)) FILTER (WHERE t.done_at IS NOT NULL AND t.kind = 'NORMAL' AND NOT tp.is_qc) AS qty_done,
       sum(coalesce(t.qty_done, 0)) FILTER (WHERE t.kind = 'NORMAL' AND (t.checked_at IS NOT NULL OR (tp.is_qc AND t.done_at IS NOT NULL))) AS qty_checked,
       -- Lines: a subtask (PD-044) is part of its line, not a line of its own (its images are in the sums above).
@@ -713,7 +730,7 @@ export const jobSelectSql = (sql: QuerySql, finish: LineFinishStatusIds, personI
     SELECT
       (SELECT json_agg(json_build_object('user', ${userJsonSql(sql)}, 'qty', w.qty, 'task_count', w.task_count) ORDER BY w.qty DESC, au.display_name, au.id)
         FROM (
-          SELECT t.assignee_id, sum(t.qty_assigned)::int AS qty, count(*) FILTER (WHERE ${notSubtaskSql(sql)})::int AS task_count
+          SELECT t.assignee_id, coalesce(sum(t.qty_assigned), 0)::int AS qty, count(*) FILTER (WHERE ${notSubtaskSql(sql)})::int AS task_count
           FROM production.tasks t WHERE t.organization_id = j.organization_id AND t.job_id = j.id AND t.deleted_at IS NULL
           GROUP BY t.assignee_id
         ) w
@@ -726,13 +743,14 @@ export const jobSelectSql = (sql: QuerySql, finish: LineFinishStatusIds, personI
         ) q
         JOIN public.app_users au ON au.id = q.qc_id) AS qc_people,
       -- PD-048 "Tổng tấm" per process: the same tasks as qty_assigned (NORMAL, not Checking), subtasks under their own
-      -- process; largest first, then by name.
+      -- process; largest first, then by name. PD-058: known numbers only (a process with none known is not listed).
       (SELECT json_agg(json_build_object('id', pt.id, 'name', pt.name, 'qty', pt.qty) ORDER BY pt.qty DESC, pt.name, pt.id)
         FROM (
           SELECT pr.id, pr.name, sum(t.qty_assigned)::int AS qty
           FROM production.tasks t
           JOIN production.processes pr ON pr.organization_id = t.organization_id AND pr.id = t.process_id
           WHERE t.organization_id = j.organization_id AND t.job_id = j.id AND t.deleted_at IS NULL AND t.kind = 'NORMAL' AND NOT pr.is_qc
+            AND t.qty_assigned IS NOT NULL
           GROUP BY pr.id, pr.name
         ) pt) AS process_totals
   ) people ON true
@@ -812,6 +830,7 @@ export const toJobSummary = (row: JobRow): JobSummary => ({
   qtyDone: row.qty_done,
   qtyChecked: row.qty_checked,
   uncheckedTaskCount: row.unchecked_task_count,
+  tasksWithoutQty: row.tasks_without_qty,
   processTotals: (row.process_totals ?? []).map((item) => ({ process: { id: item.id, name: item.name }, qty: Number(item.qty) })),
   taskCount: row.task_count,
   lateTaskCount: row.late_task_count,

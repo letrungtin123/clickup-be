@@ -112,10 +112,20 @@ export class RichTextError extends Error {
   }
 }
 
+/**
+ * @all (PD-061): the mention node `{ type: "mention", attrs: { id: MENTION_ALL_ID, label: "all" } }` mentions everyone in
+ * the conversation. Kept only with `SanitizeOptions.allowMentionAll` (chat channels and group DMs); anywhere else it is
+ * the plain text "@all". Never part of `SanitizeResult.mentions` (user ids only): see `mentionsAll`.
+ */
+export const MENTION_ALL_ID = "all";
+
 export type SanitizeResult = {
   doc: RichTextDoc;
   text: string;
+  /** Mentioned user ids (never MENTION_ALL_ID). */
   mentions: string[];
+  /** The document keeps an @all mention (only possible with `allowMentionAll`). */
+  mentionsAll: boolean;
   /** "knowledge" profile only: attachment ids of the images, unique, in document order. */
   images?: string[];
 };
@@ -128,6 +138,11 @@ export type SanitizeOptions = {
   mentionLabels?: ReadonlyMap<string, string>;
   /** "knowledge" also keeps tables and images (knowledge item bodies only). Default: the shared schema. */
   profile?: RichTextProfile;
+  /**
+   * Keep @all mentions (PD-061, chat channels and group DMs): the node keeps id MENTION_ALL_ID with the label forced to
+   * "all" and `mentionsAll` is true. Without it an @all mention becomes the plain text "@all".
+   */
+  allowMentionAll?: boolean;
 };
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
@@ -163,6 +178,7 @@ export const sanitizeRichText = (input: unknown, limits: SanitizeLimits, options
   let textLength = 0;
   let tableCount = 0;
   const mentions = new Set<string>();
+  let mentionsAll = false;
   const images = new Set<string>();
   const textParts: string[] = [];
 
@@ -341,6 +357,17 @@ export const sanitizeRichText = (input: unknown, limits: SanitizeLimits, options
     if (type === "mention") {
       const attrs = isRecord(raw.attrs) ? raw.attrs : {};
       const id = typeof attrs.id === "string" ? attrs.id : "";
+      if (id === MENTION_ALL_ID) {
+        // @all (PD-061): the label is always "all"; where it is not allowed it stays the text the user typed.
+        const text = `@${MENTION_ALL_ID}`;
+        textLength += text.length;
+        textParts.push(text);
+        if (!options.allowMentionAll) {
+          return { type: "text", text };
+        }
+        mentionsAll = true;
+        return { type, attrs: { id: MENTION_ALL_ID, label: MENTION_ALL_ID } };
+      }
       if (!uuidPattern.test(id)) {
         return null;
       }
@@ -528,7 +555,7 @@ export const sanitizeRichText = (input: unknown, limits: SanitizeLimits, options
     throw new RichTextError("Nội dung quá dài.");
   }
 
-  const result: SanitizeResult = { doc: { type: "doc", content }, text, mentions: [...mentions] };
+  const result: SanitizeResult = { doc: { type: "doc", content }, text, mentions: [...mentions], mentionsAll };
   if (knowledge) {
     result.images = [...images];
   }

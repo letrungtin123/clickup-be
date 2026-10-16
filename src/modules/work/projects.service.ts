@@ -18,6 +18,7 @@ import { logger } from "../../lib/logger.js";
 import { evictUsersFromRoom, publishToRoom, publishToUsers, resetRoom } from "../../realtime/publisher.js";
 import type { AccessContext } from "../access/access-context.js";
 import { assertDepartment, departmentMemberSql } from "../access/departments.js";
+import { visibleUserSql } from "../access/test-accounts.js";
 import {
   assertPermission,
   assertProjectAccess,
@@ -490,6 +491,7 @@ const toMember = (row: MemberRow): ProjectMember => ({
 const userJson = (sql: QuerySql) =>
   sql`json_build_object('id', au.id, 'display_name', au.display_name, 'email', au.email, 'avatar_url', au.avatar_url)`;
 
+/** Explicit project members. Temporary QA test accounts are left out for a viewer who is not one (PD-063). */
 export const listProjectMembers = async (context: AccessContext, projectId: string) => {
   const sql = getSql();
   await assertProjectAccess(context, projectId, "view", sql);
@@ -503,6 +505,7 @@ export const listProjectMembers = async (context: AccessContext, projectId: stri
       AND pm.project_id = ${projectId}
       AND pm.status = 'active'
       AND pm.deleted_at IS NULL
+      AND ${visibleUserSql(sql, context)}
     ORDER BY CASE pm.access_level WHEN 'manage' THEN 1 WHEN 'submit' THEN 2 ELSE 3 END, au.display_name, au.id
     LIMIT 1000
   `;

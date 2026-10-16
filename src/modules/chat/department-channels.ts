@@ -1,6 +1,6 @@
 import type { Department } from "../../contracts/departments.js";
 import { getSql } from "../../db/client.js";
-import type { QuerySql } from "../../lib/db-types.js";
+import type { QuerySql, SqlFragment } from "../../lib/db-types.js";
 import { logger } from "../../lib/logger.js";
 import { evictUsersFromRoom } from "../../realtime/publisher.js";
 import type { AccessContext } from "../access/access-context.js";
@@ -25,7 +25,19 @@ import {
  *     caller of `replaceUserDepartments`, account creation, a promotion to / demotion from superadmin), published after
  *     the commit. Quiet: system messages and realtime hints, no inbox notification. Private channels and DMs never
  *     change. Disabled accounts keep their channels like before (existing behaviour); they are not added to new ones.
+ * PD-063: temporary QA test accounts and real accounts never meet through this: a public channel created by a test
+ * account takes only the department's test accounts, any other one only its real accounts (`sameWorldAsChannelSql`).
  */
+
+/**
+ * The person (`isTestAccount`, a boolean SQL expression) is on the same side as the channel `channelId`: test accounts
+ * with channels a test account created, real accounts with every other channel (creator real or removed).
+ */
+const sameWorldAsChannelSql = (sql: QuerySql, channelId: SqlFragment, isTestAccount: SqlFragment) =>
+  sql`${isTestAccount} = coalesce((
+    SELECT creator.is_test_account FROM public.channels ch JOIN public.app_users creator ON creator.id = ch.created_by
+    WHERE ch.id = ${channelId}
+  ), false)`;
 
 /** Someone added to a channel: id and display name (for the "X added …" system message). */
 export type AddedMember = { userId: string; displayName: string };
@@ -51,6 +63,7 @@ export const addDepartmentMembers = async (
         AND om.status = 'active'
         AND om.deleted_at IS NULL
         AND ${departmentMemberSql(tx, tx`om.organization_id`, tx`om.user_id`, department)}
+        AND ${sameWorldAsChannelSql(tx, tx`${channelId}::uuid`, tx`au.is_test_account`)}
       ON CONFLICT (organization_id, channel_id, user_id) WHERE deleted_at IS NULL DO NOTHING
       RETURNING user_id
     )
@@ -118,6 +131,11 @@ export const syncDepartmentChannels = async (
           FROM public.channels c
           WHERE c.organization_id = ${organizationId} AND c.kind = 'public' AND c.department = ANY(${join}::text[])
             AND c.deleted_at IS NULL AND c.archived_at IS NULL
+            AND ${sameWorldAsChannelSql(
+              tx,
+              tx`c.id`,
+              tx`coalesce((SELECT person.is_test_account FROM public.app_users person WHERE person.id = ${userId}::uuid), false)`
+            )}
           ORDER BY c.id
           ON CONFLICT (organization_id, channel_id, user_id) WHERE deleted_at IS NULL DO NOTHING
           RETURNING channel_id

@@ -11,6 +11,7 @@ import { getSql } from "../../db/client.js";
 import { AppError } from "../../lib/app-error.js";
 import { toIso } from "../../lib/db-types.js";
 import type { AccessContext } from "../access/access-context.js";
+import { viewerIsTestAccount, visibleUserIdSql, visibleUserSql } from "../access/test-accounts.js";
 import { assertProductionAdmin, assertProductionRole, isProductionAdmin } from "./access.js";
 import { closeDaysOf, loadSettings } from "./catalog.service.js";
 import { loadWorkflowModel, notSubtaskSql } from "./jobs.repo.js";
@@ -40,7 +41,8 @@ type OpenTaskRow = {
   status_code: string;
   status_name: string;
   status_color: string;
-  qty_assigned: number;
+  /** null: no quantity yet (PD-058). */
+  qty_assigned: number | null;
   deadline: Date;
 };
 
@@ -60,6 +62,7 @@ const toDashboardTask = (row: OpenTaskRow, now: number): DashboardTask => ({
  * GET /production/dashboard/leader — LEADER: open tasks of the jobs they lead that are late (red) or due
  * within settings.dueSoonHours (amber); today's workload of every worker (all jobs, so the leader can
  * pick who to give work to); team points per week. ADMIN sees every job, or one leader's with leaderId.
+ * PD-063: for a viewer who is not a temporary QA test account, test accounts and the jobs they created are left out.
  */
 export const getLeaderDashboard = async (context: AccessContext, query: { leaderId?: string | undefined }): Promise<LeaderDashboard> => {
   assertProductionRole(context, "LEADER");
@@ -79,7 +82,8 @@ export const getLeaderDashboard = async (context: AccessContext, query: { leader
   const tomorrowStart = startOfBusinessDay(addDays(today, 1));
 
   // The jobs they lead and the jobs without a leader (every Leader leads those, PD-035).
-  const scope = leaderId ? sql`AND (j.leader_id = ${leaderId} OR j.leader_id IS NULL)` : sql``;
+  const scope = sql`${leaderId ? sql`AND (j.leader_id = ${leaderId} OR j.leader_id IS NULL)` : sql``} AND ${visibleUserIdSql(sql, context, sql`j.created_by`)}`;
+  const hideTestAccounts = !viewerIsTestAccount(context);
   // Lines only: a subtask follows its line and is shown inside it (PD-044); its images still count as workload.
   const openTasks = (window: ReturnType<typeof sql>) => sql<OpenTaskRow[]>`
     SELECT t.id, t.number::text AS number, t.job_id, j.code AS job_code,
@@ -95,6 +99,7 @@ export const getLeaderDashboard = async (context: AccessContext, query: { leader
     WHERE t.organization_id = ${organizationId} AND t.deleted_at IS NULL AND t.done_at IS NULL AND t.closed_at IS NULL ${window}
       AND ${notSubtaskSql(sql)}
       AND j.archived_at IS NULL ${scope}
+      AND ${visibleUserSql(sql, context, sql`ua`)}
     ORDER BY t.deadline, t.number
     LIMIT ${taskListLimit}
   `;
@@ -173,6 +178,7 @@ export const getLeaderDashboard = async (context: AccessContext, query: { leader
       LEFT JOIN leave_today lv ON lv.user_id = w.user_id
       LEFT JOIN production.member_profiles mp ON mp.organization_id = ${organizationId} AND mp.user_id = w.user_id
       LEFT JOIN production.teams tm ON tm.organization_id = ${organizationId} AND tm.id = mp.team_id
+      WHERE ${visibleUserSql(sql, context)}
       ORDER BY au.display_name, au.id
       LIMIT 1000
     `
@@ -185,7 +191,7 @@ export const getLeaderDashboard = async (context: AccessContext, query: { leader
     sql,
     organizationId,
     ReportConfigSchema.parse({ dimensions: ["team", "week"], measures: ["points", "points_khoan"], from: weeks[0], to: addDays(lastWeek, 6) }),
-    { today, closeDay: closeDaysOf(settings) }
+    { today, closeDay: closeDaysOf(settings), hideTestAccounts }
   );
   const series = new Map<string, { teamId: string | null; teamName: string; points: number[]; pointsKhoan: number[] }>();
   for (const row of teamReport.rows) {
@@ -282,7 +288,10 @@ const kpiBuckets = [
   { key: "MET", label: "Đạt từ 100%", max: Number.POSITIVE_INFINITY }
 ] as const;
 
-/** GET /production/dashboard/admin — the 6 SPEC cards plus the pinned saved reports. ADMIN only. */
+/**
+ * GET /production/dashboard/admin — the 6 SPEC cards plus the pinned saved reports. ADMIN only. PD-063: temporary QA
+ * test accounts and their jobs are left out for a viewer who is not one.
+ */
 export const getAdminDashboard = async (context: AccessContext): Promise<AdminDashboard> => {
   assertProductionAdmin(context);
   const sql = getSql();
@@ -295,7 +304,7 @@ export const getAdminDashboard = async (context: AccessContext): Promise<AdminDa
   const configs = adminCardConfigs(today);
   const lateFrom = startOfBusinessDay(configs.lateJobs.from!);
   const lateTo = startOfBusinessDay(addDays(configs.lateJobs.to!, 1));
-  const run = (cardConfig: ReportConfig) => executeReport(sql, organizationId, cardConfig, { today, closeDay });
+  const run = (cardConfig: ReportConfig) => executeReport(sql, organizationId, cardConfig, { today, closeDay, hideTestAccounts: !viewerIsTestAccount(context) });
 
   const [pointsToday, fbRateByUser, fbRateByClient, productivityByShift, lateJobs, kpi, pinned] = await Promise.all([
     run(configs.pointsToday),
@@ -327,13 +336,14 @@ export const getAdminDashboard = async (context: AccessContext): Promise<AdminDa
       LEFT JOIN public.app_users u ON u.id = j.leader_id
       WHERE t.organization_id = ${organizationId} AND t.deleted_at IS NULL AND t.is_late AND t.done_at IS NULL AND t.closed_at IS NULL
         AND t.deadline >= ${lateFrom} AND t.deadline < ${lateTo} AND j.archived_at IS NULL
+        AND ${visibleUserIdSql(sql, context, sql`j.created_by`)}
       GROUP BY j.id, p.code, u.id
       ORDER BY min(t.deadline), j.code
       LIMIT 50
     `,
     // Phase 6 KPI report (settled figures, or what a settlement would give now): % = total points / target.
     getKpiReport(context, { from: period, to: period }, { rollups: false }),
-    listPinnedReports(sql, organizationId)
+    listPinnedReports(sql, organizationId, context)
   ]);
 
   const kpiRows = kpi.rows.filter((row) => row.period === period);

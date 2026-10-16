@@ -65,6 +65,13 @@ export const taskQtyEvent = (organizationId: string, taskId: string, actorId: st
   event(organizationId, "production.task.qty_changed", taskId, actorId, { taskId, from, to, note });
 
 /**
+ * PD-058: `actorId` filled in the quantity of a task that had none — directly (PATCH, `atDone` false) or when moving it to
+ * Done (`atDone` true). One event per task (a subtask too); the handler tells the job's Leader.
+ */
+export const taskQtyFilledEvent = (organizationId: string, taskId: string, actorId: string | null, qty: number, atDone: boolean) =>
+  event(organizationId, "production.task.qty_filled", taskId, actorId, { taskId, qty, atDone });
+
+/**
  * PD-044 "Số lượng giao": a worker asked to change it (`requested`, → the job's Leader) or the request was decided
  * (`decided`, → the worker). The handler reads the request itself, so the payload only names it.
  */
@@ -155,6 +162,12 @@ export const productionRecipients = {
   /** QTY_CHANGE_DECIDED (PD-044) → the worker who asked. */
   qtyChangeDecided: (requesterId: string) => distinct([requesterId]),
   /**
+   * QTY_FILLED (PD-058) → the job's (still active) Leader; without one the production Admins (like a quantity request).
+   * Never the person who filled it in (a Leader filling it in tells nobody).
+   */
+  qtyFilled: (task: TaskPeople, adminIds: readonly string[], actorId: string | null) =>
+    task.leaderId ? distinct([task.leaderId], [actorId]) : distinct(adminIds, [actorId]),
+  /**
    * JOB_STATUS_CHANGED (PD-045) → the job's (still active) Leader and every production Account / Admin (organization
    * superadmins included in `accountAdminIds`), never the person who changed it.
    */
@@ -176,7 +189,7 @@ export const productionRecipients = {
    */
   jobComment: (job: JobPeople, writerId: string | null, mentionedIds: readonly string[] = []) =>
     distinct([job.leaderId, job.creatorId, ...job.workerIds], [writerId, ...mentionedIds]),
-  /** LEAVE_REQUESTED → the requester's team Leaders (every Leader without a team) + Admins, never the requester. */
+  /** LEAVE_REQUESTED → the approvers: production Admins incl. organization superadmins (PD-057: no Leaders), never the requester. */
   leaveRequested: (approverIds: readonly string[], requesterId: string) => distinct(approverIds, [requesterId]),
   /** LEAVE_DECIDED → the requester. */
   leaveDecided: (requesterId: string) => distinct([requesterId]),
@@ -234,7 +247,8 @@ type TaskInfo = {
   assignee_id: string;
   qc_id: string | null;
   process_name: string;
-  qty_assigned: number;
+  /** null: no quantity yet (PD-058). */
+  qty_assigned: number | null;
   qty_done: number | null;
   deadline: Date;
   /** PD-045 subtask letter index and its line's number (null for lines): the task's display code. */
@@ -269,6 +283,12 @@ const peopleOf = (task: TaskInfo): TaskPeople => ({
 /** "1216" for a line, "1216a" for a subtask (PD-045). */
 const codeOf = (task: TaskInfo) => taskCode({ number: task.number, subSeq: task.sub_seq, parentNumber: task.parent_number });
 
+/** The task's images for a notification: Done quantity, else "Số lượng giao"; null while it has none (PD-058). */
+const qtyOf = (task: Pick<TaskInfo, "qty_done" | "qty_assigned">) => task.qty_done ?? task.qty_assigned;
+
+/** "#1216 · Retouch · 20 tấm" (without "· N tấm" while the task has no quantity, PD-058). */
+const taskLine = (task: TaskInfo, qty: number | null) => [`#${codeOf(task)}`, task.process_name, ...(qty === null ? [] : [`${qty} tấm`])].join(" · ");
+
 const taskPayload = (task: TaskInfo, extra: Record<string, unknown> = {}) => ({
   productionTaskId: task.id,
   jobId: task.job_id,
@@ -277,7 +297,8 @@ const taskPayload = (task: TaskInfo, extra: Record<string, unknown> = {}) => ({
   /** PD-045 display code ("#" + code): the inbox and the e-mails show it instead of the number. */
   taskCode: codeOf(task),
   processName: task.process_name,
-  qty: task.qty_done ?? task.qty_assigned,
+  /** null while the task has no quantity (PD-058). */
+  qty: qtyOf(task),
   deadline: task.deadline.toISOString(),
   ...extra
 });
@@ -296,7 +317,7 @@ const notifyTask = async (
     type,
     actorUserId: envelope.actorUserId,
     title: task.job_code,
-    body: body ?? `#${codeOf(task)} · ${task.process_name} · ${task.qty_done ?? task.qty_assigned} tấm`,
+    body: body ?? taskLine(task, qtyOf(task)),
     payload: taskPayload(task, extra),
     dedupeKey: `evt:${envelope.id}:${type}`
   });
@@ -497,6 +518,29 @@ export const productionNotificationHandlers: Record<string, (event: DomainEventE
     );
   },
 
+  /**
+   * PD-058: someone filled in a task's empty quantity (directly or at Done) → the job's active Leader, else the production
+   * Admins; never the person who filled it in. Body "#1286 · Retouch · 120 tấm" with the number filled in (the event's);
+   * payload: the task's + { filledQty, atDone }. A task deleted before the worker ran tells nobody.
+   */
+  "production.task.qty_filled": async (envelope) => {
+    const task = await loadTaskInfo(envelope.organizationId, str(envelope.payload.taskId) ?? "");
+    const filled = typeof envelope.payload.qty === "number" ? envelope.payload.qty : null;
+    if (!task || filled === null) {
+      return;
+    }
+    const people = peopleOf(task);
+    const adminIds = people.leaderId ? [] : await loadProductionAdminIds(getSql(), envelope.organizationId);
+    await notifyTask(
+      envelope,
+      task,
+      "production.qty_filled",
+      productionRecipients.qtyFilled(people, adminIds, envelope.actorUserId),
+      { filledQty: filled, atDone: envelope.payload.atDone === true },
+      taskLine(task, filled)
+    );
+  },
+
   /** PD-044: the request was approved or rejected → the worker who asked (the decider never: they are the actor). */
   "production.task.qty_change_decided": async (envelope) => {
     const loaded = await loadQtyRequest(envelope);
@@ -623,19 +667,54 @@ export const productionNotificationHandlers: Record<string, (event: DomainEventE
   }
 };
 
-type LeaveInfo = { user_id: string; display_name: string; from_date: string; to_date: string; part: string; status: string; decision_note: string | null; team_id: string | null };
+type LeaveInfo = {
+  user_id: string;
+  display_name: string;
+  from_date: string;
+  to_date: string;
+  part: string;
+  status: string;
+  /** The requester's reason ("Lý do nghỉ", required since PD-057; older requests may have none). */
+  note: string | null;
+  decision_note: string | null;
+};
 
 const loadLeave = async (organizationId: string, leaveId: string) =>
   (
     await getSql()<LeaveInfo[]>`
       SELECT lr.user_id, au.display_name, to_char(lr.from_date, 'YYYY-MM-DD') AS from_date, to_char(lr.to_date, 'YYYY-MM-DD') AS to_date,
-        lr.part, lr.status, lr.decision_note, mp.team_id
+        lr.part, lr.status, lr.note, lr.decision_note
       FROM production.leave_requests lr
       JOIN public.app_users au ON au.id = lr.user_id
-      LEFT JOIN production.member_profiles mp ON mp.organization_id = lr.organization_id AND mp.user_id = lr.user_id
       WHERE lr.organization_id = ${organizationId} AND lr.id = ${leaveId}
     `
   )[0] ?? null;
+
+/** Longest reason quoted in a leave notification (body and payload), in characters. */
+export const leaveReasonExcerptLength = 200;
+
+/** The reason on one line, cut to `leaveReasonExcerptLength` characters with "…"; null when there is none. */
+export const leaveReasonExcerpt = (note: string | null | undefined) => {
+  const flat = (note ?? "").replace(/\s+/g, " ").trim();
+  if (!flat) {
+    return null;
+  }
+  const chars = [...flat];
+  return chars.length > leaveReasonExcerptLength ? `${chars.slice(0, leaveReasonExcerptLength - 1).join("").trimEnd()}…` : flat;
+};
+
+const leavePartPhrases: Record<string, string> = { FULL_DAY: "Nghỉ cả ngày", MORNING: "Nghỉ buổi sáng", AFTERNOON: "Nghỉ buổi chiều" };
+const shortDay = (day: string) => `${day.slice(8, 10)}/${day.slice(5, 7)}`;
+
+/**
+ * Body of the "new leave request" notification (PD-057): what, when and why for the approver —
+ * "Nghỉ cả ngày 20/10 – 21/10: Việc gia đình", "Nghỉ buổi sáng 20/10: Khám bệnh" (no ": …" without a reason).
+ */
+export const leaveRequestedBody = (leave: { from_date: string; to_date: string; part: string; note: string | null }) => {
+  const span = leave.from_date === leave.to_date ? shortDay(leave.from_date) : `${shortDay(leave.from_date)} – ${shortDay(leave.to_date)}`;
+  const reason = leaveReasonExcerpt(leave.note);
+  return `${leavePartPhrases[leave.part] ?? "Nghỉ"} ${span}${reason ? `: ${reason}` : ""}`;
+};
 
 const leavePayload = (leaveId: string, leave: LeaveInfo) => ({
   leaveId,
@@ -644,14 +723,17 @@ const leavePayload = (leaveId: string, leave: LeaveInfo) => ({
   toDate: leave.to_date,
   part: leave.part,
   status: leave.status,
+  /** The requester's reason, cut like the body (PD-057). */
+  reason: leaveReasonExcerpt(leave.note),
+  /** The approver's decision note. */
   note: leave.decision_note
 });
 
 Object.assign(productionNotificationHandlers, {
   /**
-   * SPEC §6.3: new leave request → the Leaders of the requester's team and the production Admins
-   * (organization superadmins included). Requester without a team (PR-14, decided): every production
-   * Leader and Admin.
+   * New leave request → the people who can approve it: active production Admins and organization superadmins
+   * (PD-057 — only Quản trị decides; Leaders are no longer notified, they still see pending requests in the
+   * calendar). Never the requester. The body says what, when and why (`leaveRequestedBody`).
    */
   "production.leave.requested": async (envelope: DomainEventEnvelope) => {
     const leaveId = str(envelope.payload.leaveId);
@@ -659,27 +741,14 @@ Object.assign(productionNotificationHandlers, {
     if (!leaveId || !leave) {
       return;
     }
-    const approvers = await getSql()<{ user_id: string }[]>`
-      SELECT ur.user_id FROM production.user_roles ur
-      LEFT JOIN production.member_profiles mp ON mp.organization_id = ur.organization_id AND mp.user_id = ur.user_id
-      WHERE ur.organization_id = ${envelope.organizationId}
-        AND (ur.role_code = 'ADMIN'
-          OR (ur.role_code = 'LEADER' AND (${leave.team_id}::uuid IS NULL OR mp.team_id = ${leave.team_id}::uuid)))
-      UNION
-      SELECT om.user_id FROM public.organization_memberships om
-      JOIN public.roles r ON r.id = om.role_id AND r.key = 'superadmin'
-      WHERE om.organization_id = ${envelope.organizationId} AND om.deleted_at IS NULL AND om.status = 'active'
-    `;
+    const approverIds = await loadProductionAdminIds(getSql(), envelope.organizationId);
     await deliverNotifications({
       organizationId: envelope.organizationId,
-      recipientIds: productionRecipients.leaveRequested(
-        approvers.map((row) => row.user_id),
-        leave.user_id
-      ),
+      recipientIds: productionRecipients.leaveRequested(approverIds, leave.user_id),
       type: "production.leave_requested",
       actorUserId: envelope.actorUserId,
       title: leave.display_name,
-      body: leave.from_date === leave.to_date ? leave.from_date : `${leave.from_date} → ${leave.to_date}`,
+      body: leaveRequestedBody(leave),
       payload: leavePayload(leaveId, leave),
       dedupeKey: `evt:${envelope.id}`
     });
@@ -748,7 +817,7 @@ const deliverDeadline = (kind: "production.task_late" | "production.task_due_soo
     type: kind,
     actorUserId: null,
     title: task.job_code,
-    body: `#${codeOf(task)} · ${task.process_name} · ${task.qty_assigned} tấm`,
+    body: taskLine(task, task.qty_assigned),
     payload: taskPayload(task),
     dedupeKey: `${kind}:${task.id}:${task.deadline.toISOString()}`
   });

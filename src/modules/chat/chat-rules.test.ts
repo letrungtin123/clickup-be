@@ -12,6 +12,7 @@ import {
   UpdateChannelRequestSchema
 } from "../../contracts/chat.js";
 import type { Department } from "../../contracts/departments.js";
+import { messageLimits, sanitizeRichText } from "../../contracts/rich-text.js";
 import { DirectoryQuerySchema } from "../../contracts/work.js";
 import { AppError } from "../../lib/app-error.js";
 import { encodeCursor } from "../../lib/db-types.js";
@@ -30,7 +31,11 @@ import {
   findInvalidMentions,
   hasMessageContent,
   inChannelDepartment,
+  allowsMentionAll,
+  applyMentionAllPolicy,
   mentionRecipients,
+  mentionRowRecipients,
+  splitMentionNotifications,
   mentionScope,
   nextReadSeq,
   resolveChannelDepartment,
@@ -463,5 +468,56 @@ describe("DM rules (staff 1:1, PD-041 departments)", () => {
     expect(dmDirectoryScope(both)).toEqual({ everyone: false, departments: ["PHOTO_RETOUCH", "PRODUCTION"] });
     expect(dmDirectoryScope(manager)).toMatchObject({ everyone: true });
     expect(dmDirectoryScope({ ...superadmin, canCreateChannels: false })).toMatchObject({ everyone: true });
+  });
+});
+
+describe("@all (PD-061)", () => {
+  const body = sanitizeRichText(
+    {
+      type: "doc",
+      content: [
+        {
+          type: "paragraph",
+          content: [{ type: "mention", attrs: { id: "all", label: "all" } }, { type: "text", text: " " }, { type: "mention", attrs: { id: B, label: "Bình" } }]
+        }
+      ]
+    },
+    messageLimits,
+    { allowMentionAll: true }
+  );
+
+  it("exists in channels and group DMs, not in 1:1 DMs", () => {
+    expect(allowsMentionAll("public")).toBe(true);
+    expect(allowsMentionAll("private")).toBe(true);
+    expect(allowsMentionAll("group_dm")).toBe(true);
+    expect(allowsMentionAll("dm")).toBe(false);
+  });
+
+  it("a 1:1 DM keeps @all as plain text, no error; named mentions keep their labels", () => {
+    const dm = applyMentionAllPolicy(body, "dm", messageLimits);
+    expect(dm.mentionsAll).toBe(false);
+    expect(dm.mentions).toEqual([B]);
+    expect(dm.text).toBe(body.text);
+    expect(dm.doc.content?.[0]?.content).toEqual([
+      { type: "text", text: "@all" },
+      { type: "text", text: " " },
+      { type: "mention", attrs: { id: B, label: "Bình" } }
+    ]);
+    for (const kind of ["public", "private", "group_dm"] as const) {
+      expect(applyMentionAllPolicy(body, kind, messageLimits)).toBe(body);
+    }
+  });
+
+  it("mention rows: named people plus every member with @all, never the author, each once", () => {
+    expect(mentionRowRecipients([B], null, A)).toEqual([B]);
+    expect(mentionRowRecipients([B, C], [A, B, D], A)).toEqual([B, C, D]);
+    expect(mentionRowRecipients([], [A], A)).toEqual([]);
+  });
+
+  it("one notification per person: named people keep the personal one, the other members get the @all one", () => {
+    // B named (passed the notify-level rules), C muted ("none") so not in `named`, D only a member; A is the author.
+    expect(splitMentionNotifications([B], [A, B, C, D], A)).toEqual({ named: [B], all: [C, D] });
+    expect(splitMentionNotifications([B, A], [], A)).toEqual({ named: [B], all: [] });
+    expect(splitMentionNotifications([], [B, B, C], null)).toEqual({ named: [], all: [B, C] });
   });
 });

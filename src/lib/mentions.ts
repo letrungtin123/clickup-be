@@ -1,4 +1,4 @@
-import { sanitizeRichText, type SanitizeLimits, type SanitizeResult } from "../contracts/rich-text.js";
+import { sanitizeRichText, type SanitizeLimits, type SanitizeOptions, type SanitizeResult } from "../contracts/rich-text.js";
 import type { QuerySql } from "./db-types.js";
 
 /** Current display names of the given people in the organization (memberships not deleted). */
@@ -18,18 +18,19 @@ export const loadMentionLabels = async (sql: QuerySql, organizationId: string, u
 /**
  * Sanitizes a rich text document whose mention labels are server-derived (SEC-API-10): every mention shows
  * the person's current display name, mentions of ids outside the organization become plain text.
- * Throws RichTextError like `sanitizeRichText`.
+ * Throws RichTextError like `sanitizeRichText`. `allowMentionAll` keeps @all mentions (PD-061, chat only).
  */
 export const sanitizeWithMentionLabels = async (
   sql: QuerySql,
   organizationId: string,
   doc: unknown,
-  limits: SanitizeLimits
+  limits: SanitizeLimits,
+  options: Pick<SanitizeOptions, "allowMentionAll"> = {}
 ): Promise<SanitizeResult> => {
-  const first = sanitizeRichText(doc, limits);
+  const first = sanitizeRichText(doc, limits, options);
   if (first.mentions.length === 0) {
     return first;
   }
   const labels = await loadMentionLabels(sql, organizationId, first.mentions);
-  return sanitizeRichText(first.doc, limits, { mentionLabels: labels });
+  return sanitizeRichText(first.doc, limits, { ...options, mentionLabels: labels });
 };

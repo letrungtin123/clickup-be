@@ -148,8 +148,13 @@ describe("templates", () => {
     const leave = { leaveId: ids.task, requesterName: "Minh", fromDate: "2026-10-12", toDate: "2026-10-13", part: "FULL_DAY", status: "PENDING", note: null };
     expect(renderNotificationSection(make({ type: "production.leave_requested", title: "Minh", payload: leave }), base)).toMatchObject({
       headline: "Minh xin nghỉ phép 12/10/2026 – 13/10/2026",
+      excerpt: null,
       link: `${base}/production/leave`
     });
+    // PD-057: the approver sees the requester's reason.
+    expect(
+      renderNotificationSection(make({ type: "production.leave_requested", title: "Minh", payload: { ...leave, reason: "Việc gia đình" } }), base).excerpt
+    ).toBe("Việc gia đình");
     const decided = renderNotificationSection(
       make({ type: "production.leave_decided", actorName: "Leader A", payload: { ...leave, status: "REJECTED", note: "Trùng lịch giao hàng" } }),
       base
@@ -176,6 +181,18 @@ describe("templates", () => {
       base
     );
     expect(rejected).toMatchObject({ headline: "Leader A đã từ chối sửa số lượng giao task JOB-2026-001 #3: 20 → 25 tấm", excerpt: "Đã đủ ảnh" });
+  });
+
+  it("PD-058: an empty quantity filled in (directly or at Done) is told to the Leader with the number", () => {
+    const filled = renderNotificationSection(
+      make({ type: "production.qty_filled", actorName: "Người A", payload: { ...productionPayload, qty: 120, filledQty: 120, atDone: false } }),
+      base
+    );
+    expect(filled).toMatchObject({ headline: "Người A đã điền số lượng 120 tấm cho task JOB-2026-001 #3", link: `${base}/production/tasks/${ids.productionTask}` });
+    expect(
+      renderNotificationSection(make({ type: "production.qty_filled", actorName: "Người A", payload: { ...productionPayload, filledQty: 30, atDone: true } }), base)
+        .headline
+    ).toBe("Người A đã điền số lượng 30 tấm cho task JOB-2026-001 #3 khi chuyển Done");
   });
 
   it("PD-045: a subtask is named by its code (#1216a) in the headline, the subject and the facts", () => {

@@ -66,7 +66,8 @@ export const createWorkEntry = async (context: AccessContext, input: CreateWorkE
           assigneeId,
           processId: input.processId,
           shiftId: input.shiftId,
-          qtyAssigned: input.qtyAssigned,
+          // PD-058: optional (null = "chưa có số lượng").
+          qtyAssigned: input.qtyAssigned ?? null,
           qcId: input.qcId ?? null,
           assignedAt: input.assignedAt,
           deadline: input.deadline,

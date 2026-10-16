@@ -315,6 +315,14 @@ const templates = {
       excerpt: text(n.payload.decisionNote)
     };
   },
+  // PD-058: the worker (or someone else) filled in a task's empty quantity → the job's Leader.
+  "production.qty_filled": (n, c) => {
+    const qty = num(n.payload.filledQty) ?? num(n.payload.qty);
+    return {
+      headline: `${c.actor} đã điền số lượng${qty !== null ? ` ${qty} tấm` : ""} cho task ${c.taskRef}${n.payload.atDone === true ? " khi chuyển Done" : ""}`,
+      facts: c.productionFacts
+    };
+  },
   // PD-045: the job's status (the manual chip) changed → its Leader and the production Account / Admin people.
   "production.job_status_changed": (n, c) => {
     const from = jobStatusName(n.payload.from);
@@ -355,7 +363,8 @@ const templates = {
         ["Người xin nghỉ", requester],
         ...leaveFacts(n)
       ],
-      excerpt: c.note
+      // PD-057: the requester's reason (payload.reason; payload.note is the decision note, empty here).
+      excerpt: text(n.payload.reason) ?? c.note
     };
   },
   "production.leave_decided": (n, c) => {

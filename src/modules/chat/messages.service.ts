@@ -61,9 +61,11 @@ import {
 import { assertChatAttachmentsEnabled } from "./chat-settings.js";
 import { consumeChatQuota } from "./chat-rate-limit.js";
 import {
+  applyMentionAllPolicy,
   findInvalidMentions,
   hasMessageContent,
   mentionRecipients,
+  mentionRowRecipients,
   mentionScope,
   resolveHistoryWindow,
   toSeq,
@@ -74,10 +76,13 @@ import { channelRoom, isUniqueViolation, selectMessageById, selectMessages } fro
 
 const messageNotFound = () => new AppError("CHAT_MESSAGE_NOT_FOUND", "Message was not found.", 404);
 
-/** Sanitized body; mention labels are the people's current display names (SEC-API-10 / WK-44). */
+/**
+ * Sanitized body; mention labels are the people's current display names (SEC-API-10 / WK-44). @all is kept here and
+ * dropped once the conversation is known where it is not allowed (`applyMentionAllPolicy`, PD-061).
+ */
 const sanitizeBody = async (sql: QuerySql, context: AccessContext, body: unknown) => {
   try {
-    return await sanitizeWithMentionLabels(sql, context.organization.id, body, messageLimits);
+    return await sanitizeWithMentionLabels(sql, context.organization.id, body, messageLimits, { allowMentionAll: true });
   } catch (error) {
     if (error instanceof RichTextError) {
       throw new AppError("INVALID_RICH_TEXT", error.message, 400);
@@ -122,6 +127,18 @@ const validateMentions = async (tx: QuerySql, context: AccessContext, resolved: 
   }
   return ids;
 };
+
+/** @all (PD-061): the current active members of the conversation (active in the organization too). */
+const conversationMemberIds = async (tx: QuerySql, context: AccessContext, channelId: string) =>
+  (
+    await tx<{ user_id: string }[]>`
+      SELECT cm.user_id
+      FROM public.channel_members cm
+      JOIN public.organization_memberships om
+        ON om.organization_id = cm.organization_id AND om.user_id = cm.user_id AND om.status = 'active' AND om.deleted_at IS NULL
+      WHERE cm.organization_id = ${context.organization.id} AND cm.channel_id = ${channelId} AND cm.deleted_at IS NULL
+    `
+  ).map((row) => row.user_id);
 
 const insertMentions = async (
   tx: QuerySql,
@@ -291,17 +308,18 @@ export const sendMessage = async (
         seq = toSeq(row?.last_message_seq);
       }
 
-      const mentions = await validateMentions(tx, context, resolved, sanitized.mentions);
+      const body = applyMentionAllPolicy(sanitized, resolved.channel.kind, messageLimits);
+      const mentions = await validateMentions(tx, context, resolved, body.mentions);
       const messageId = randomUUID();
       await tx`
         INSERT INTO public.messages (
           id, organization_id, channel_id, seq, thread_root_id, author_user_id, kind,
-          body_json, body_text, client_message_id, mentioned_user_ids, attachment_count
+          body_json, body_text, client_message_id, mentioned_user_ids, mentions_all, attachment_count
         )
         VALUES (
           ${messageId}, ${context.organization.id}, ${channelId}, ${seq}, ${threadRootId}, ${context.user.id}, 'user',
-          ${tx.json(sanitized.doc)}, ${sanitized.text}, ${input.clientMessageId},
-          ${mentions}::uuid[], ${attachmentIds.length}
+          ${tx.json(body.doc)}, ${body.text}, ${input.clientMessageId},
+          ${mentions}::uuid[], ${body.mentionsAll}, ${attachmentIds.length}
         )
       `;
 
@@ -319,8 +337,16 @@ export const sendMessage = async (
         }
       }
 
+      // @all (PD-061): every current member gets a mention row too, so badges and "mentions of me" work as for names.
       const recipients = mentionRecipients(mentions, context.user.id);
-      await insertMentions(tx, context, { messageId, channelId, seq, threadRootId, userIds: recipients });
+      const allMembers = body.mentionsAll ? await conversationMemberIds(tx, context, channelId) : null;
+      await insertMentions(tx, context, {
+        messageId,
+        channelId,
+        seq,
+        threadRootId,
+        userIds: mentionRowRecipients(mentions, allMembers, context.user.id)
+      });
 
       if (seq !== null && resolved.member) {
         // The author has read their own message.
@@ -344,7 +370,9 @@ export const sendMessage = async (
             authorId: context.user.id,
             threadRootId,
             seq,
-            mentionedUserIds: recipients
+            // People mentioned by name; @all members are resolved by the notification handler (PD-061).
+            mentionedUserIds: recipients,
+            mentionsAll: body.mentionsAll
           }
         }
       ]);
@@ -376,6 +404,7 @@ type LockedMessage = {
   seq: string | null;
   attachment_count: number;
   mentioned_user_ids: string[] | null;
+  mentions_all: boolean;
   deleted_at: Date | null;
 };
 
@@ -383,7 +412,7 @@ type LockedMessage = {
 const lockMessage = async (tx: QuerySql, context: AccessContext, messageId: string) => {
   const message = (
     await tx<LockedMessage[]>`
-      SELECT id, channel_id, author_user_id, kind, thread_root_id, seq, attachment_count, mentioned_user_ids, deleted_at
+      SELECT id, channel_id, author_user_id, kind, thread_root_id, seq, attachment_count, mentioned_user_ids, mentions_all, deleted_at
       FROM public.messages
       WHERE organization_id = ${context.organization.id} AND id = ${messageId}
       FOR UPDATE
@@ -416,27 +445,44 @@ export const editMessage = async (context: AccessContext, messageId: string, bod
       throw new AppError("CHAT_MESSAGE_EMPTY", "A message cannot be empty. Delete it instead.", 400);
     }
 
-    const mentions = await validateMentions(tx, context, resolved, sanitized.mentions);
+    const edited = applyMentionAllPolicy(sanitized, resolved.channel.kind, messageLimits);
+    const mentions = await validateMentions(tx, context, resolved, edited.mentions);
+    // Who the previous version already mentioned: by name, and every member it reached with @all (its mention rows).
+    const previous = new Set([
+      ...mentionRecipients(message.mentioned_user_ids ?? [], context.user.id),
+      ...(message.mentions_all
+        ? (await tx<{ user_id: string }[]>`SELECT user_id FROM public.message_mentions WHERE message_id = ${messageId}`).map(
+            (row) => row.user_id
+          )
+        : [])
+    ]);
     const editedAt = (
       await tx<{ edited_at: Date }[]>`
         UPDATE public.messages
-        SET body_json = ${tx.json(sanitized.doc)}, body_text = ${sanitized.text},
-            mentioned_user_ids = ${mentions}::uuid[], edited_at = now()
+        SET body_json = ${tx.json(edited.doc)}, body_text = ${edited.text},
+            mentioned_user_ids = ${mentions}::uuid[], mentions_all = ${edited.mentionsAll}, edited_at = now()
         WHERE id = ${messageId} AND organization_id = ${context.organization.id}
         RETURNING edited_at
       `
     )[0]!.edited_at;
 
-    const previous = new Set(mentionRecipients(message.mentioned_user_ids ?? [], context.user.id));
+    // Mention rows follow the new version: removing @all drops the members' rows (named people keep theirs), adding it
+    // adds them (PD-061).
     const recipients = mentionRecipients(mentions, context.user.id);
-    await tx`DELETE FROM public.message_mentions WHERE message_id = ${messageId} AND NOT (user_id = ANY(${recipients}::uuid[]))`;
+    const rows = mentionRowRecipients(
+      mentions,
+      edited.mentionsAll ? await conversationMemberIds(tx, context, message.channel_id) : null,
+      context.user.id
+    );
+    await tx`DELETE FROM public.message_mentions WHERE message_id = ${messageId} AND NOT (user_id = ANY(${rows}::uuid[]))`;
     await insertMentions(tx, context, {
       messageId,
       channelId: message.channel_id,
       seq: message.seq === null ? null : toSeq(message.seq),
       threadRootId: message.thread_root_id,
-      userIds: recipients
+      userIds: rows
     });
+    const mentionsAllAdded = edited.mentionsAll && !message.mentions_all;
 
     await enqueueDomainEvents(tx, [
       {
@@ -450,7 +496,11 @@ export const editMessage = async (context: AccessContext, messageId: string, bod
           channelKind: resolved.channel.kind,
           messageId,
           threadRootId: message.thread_root_id,
-          addedMentionUserIds: recipients.filter((id) => !previous.has(id))
+          addedMentionUserIds: recipients.filter((id) => !previous.has(id)),
+          // @all turned on by this edit (PD-061): the handler notifies the members the previous version did not mention
+          // (by name: `previousMentionUserIds`, at most messageLimits.maxMentions ids).
+          mentionsAllAdded,
+          ...(mentionsAllAdded ? { previousMentionUserIds: [...previous] } : {})
         }
       }
     ]);
@@ -471,6 +521,7 @@ export const editMessage = async (context: AccessContext, messageId: string, bod
     body: outcome.message.body,
     text: outcome.message.text,
     mentions: outcome.mentions,
+    mentionsAll: outcome.message.mentionsAll,
     editedAt: outcome.editedAt
   });
   return outcome.message;

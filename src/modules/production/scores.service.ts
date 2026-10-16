@@ -11,6 +11,7 @@ import { getSql } from "../../db/client.js";
 import { AppError } from "../../lib/app-error.js";
 import { toIso, type QuerySql } from "../../lib/db-types.js";
 import type { AccessContext } from "../access/access-context.js";
+import { visibleUserSql } from "../access/test-accounts.js";
 import { toUserRef, type UserRefJson } from "../work/mappers.js";
 import { assertProductionMember, isProductionAdmin } from "./access.js";
 import { closeDaysOf, customFieldsForbidden, loadSettings } from "./catalog.service.js";
@@ -434,7 +435,8 @@ type BoardRow = {
 /**
  * GET /production/scores/board — every production worker (STAFF/LEADER/QC) and anyone who scored in
  * the period, ranked by official points. Open to every production member (PD-052: settings.scoresPublic no
- * longer hides it); money only for the row's owner, ADMIN, or when settings.moneyPublic.
+ * longer hides it); money only for the row's owner, ADMIN, or when settings.moneyPublic. Temporary QA test accounts
+ * are left out for a viewer who is not one (PD-063).
  */
 export const getScoreBoard = async (
   context: AccessContext,
@@ -487,7 +489,8 @@ export const getScoreBoard = async (
     LEFT JOIN sums s ON s.user_id = pe.user_id
     LEFT JOIN production.member_profiles mp ON mp.organization_id = ${organizationId} AND mp.user_id = pe.user_id
     LEFT JOIN production.teams tm ON tm.organization_id = ${organizationId} AND tm.id = mp.team_id
-    WHERE ${teamId}::uuid IS NULL OR mp.team_id = ${teamId}::uuid
+    WHERE (${teamId}::uuid IS NULL OR mp.team_id = ${teamId}::uuid)
+      AND ${visibleUserSql(sql, context)}
     LIMIT 5000
   `;
 

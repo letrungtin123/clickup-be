@@ -86,6 +86,7 @@ describe("reactors (who reacted)", () => {
       system_event: null,
       client_message_id: null,
       mentioned_user_ids: [],
+      mentions_all: false,
       reply_count: 0,
       last_reply_at: null,
       edited_at: null,
@@ -107,5 +108,32 @@ describe("reactors (who reacted)", () => {
       }
     ]);
     expect(toMessage({ ...base, deleted_at: new Date("2026-10-15T02:00:00Z") }).reactions).toEqual([]);
+  });
+
+  it("maps @all (PD-061): mentionsAll from the column, false once deleted", () => {
+    const base: MessageRow = {
+      id: id(100),
+      channel_id: id(200),
+      seq: 3,
+      thread_root_id: null,
+      kind: "user",
+      body_json: null,
+      body_text: "@all họp lúc 9h",
+      system_event: null,
+      client_message_id: null,
+      mentioned_user_ids: [id(5)],
+      mentions_all: true,
+      reply_count: 0,
+      last_reply_at: null,
+      edited_at: null,
+      deleted_at: null,
+      created_at: new Date("2026-10-15T01:00:00Z"),
+      author: null,
+      reactions: [],
+      attachments: []
+    };
+    expect(toMessage(base)).toMatchObject({ mentions: [id(5)], mentionsAll: true });
+    expect(toMessage({ ...base, mentions_all: false }).mentionsAll).toBe(false);
+    expect(toMessage({ ...base, deleted_at: new Date("2026-10-15T02:00:00Z") })).toMatchObject({ mentions: [], mentionsAll: false });
   });
 });

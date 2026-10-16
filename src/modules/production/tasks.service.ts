@@ -51,7 +51,7 @@ import {
   toProductionTasks,
   type TaskRow
 } from "./jobs.repo.js";
-import { enqueueProductionEvents, taskAssignedEvent, taskQtyEvent, taskStatusEvent } from "./notifications.js";
+import { enqueueProductionEvents, taskAssignedEvent, taskQtyEvent, taskQtyFilledEvent, taskStatusEvent } from "./notifications.js";
 import { publishProductionChange } from "./realtime.js";
 import {
   assertLinesCreatable,
@@ -59,6 +59,7 @@ import {
   forbidden,
   lineAllowed,
   qtyAssignedEditAllowed,
+  qtyFillAllowed,
   subtaskDeleteAllowed,
   subtaskManageAllowed
 } from "./job-permissions.js";
@@ -80,6 +81,8 @@ import {
   subtaskQtyProblem,
   systemFollowUp,
   taskLineErrors,
+  taskQtyRequiredError,
+  tasksMissingDoneQty,
   type TaskLineRules,
   type Workflow,
   type WorkflowStatus
@@ -190,6 +193,11 @@ const lockSubtasksOf = async (tx: QuerySql, organizationId: string, tasks: reado
  * each records its own score entry at the first Done, with its Done quantity from `subtaskQtyDone`); they raise no
  * notification and never count as a QC fail (the line does). Back into Done before QC checked the line, the worker may
  * give a new Done quantity (the scoring hook adjusts the ledger). Only the input rows are returned.
+ *
+ * PD-058: entering Done, every moving task without a quantity (the line and / or its subtasks) needs its number ≥ 1 in the
+ * same call (`qtyDone` / `subtaskQtyDone`); it becomes both its qty_assigned and its qty_done (uncapped: there is nothing to
+ * compare with), and the job's Leader is told (production.task.qty_filled, one per task). Otherwise nothing is written:
+ * 400 TASK_QTY_REQUIRED with `details.taskIds` (every such task, the line first).
  */
 export const moveTasks = async (
   tx: QuerySql,
@@ -220,17 +228,27 @@ export const moveTasks = async (
     const firstDone = to.countsDone && task.done_at === null;
     // The worker's Done quantity: the line's from the request, each subtask's from `subtaskQtyDone` (PD-044).
     const declared = subtask ? subtaskQty.get(task.id) : extras.qtyDone;
+    // PD-058: entering Done without a quantity — the number given (≥ 1) becomes both quantities; none: missingQty.
+    const fill = to.countsDone && task.qty_assigned === null;
+    const missingQty = fill && tasksMissingDoneQty([{ id: task.id, qtyAssigned: task.qty_assigned, declared }]).length > 0;
+    let qtyAssigned = task.qty_assigned;
     let qtyDone = task.qty_done;
     let otHours = task.ot_hours === null ? null : Number(task.ot_hours);
     let qtyChanged = false;
-    if (firstDone) {
+    if (firstDone && extras.otHours !== undefined && !subtask) {
+      // PD-035: "Giờ OT" is optional, also on the OT shift; sent at Done it replaces the line's own value.
+      otHours = extras.otHours;
+    }
+    if (fill) {
+      if (!missingQty) {
+        qtyAssigned = declared!;
+        qtyDone = declared!;
+        qtyChanged = !firstDone;
+      }
+    } else if (firstDone) {
       qtyDone = declared ?? task.qty_assigned;
       // SEC2-03: the declared quantity feeds points / Khoán money in the append-only ledger.
-      assertDeclaredDoneQty(task.qty_assigned, qtyDone);
-      // PD-035: "Giờ OT" is optional, also on the OT shift; sent at Done it replaces the line's own value.
-      if (extras.otHours !== undefined && !subtask) {
-        otHours = extras.otHours;
-      }
+      assertDeclaredDoneQty(task.qty_assigned!, qtyDone!);
     } else if (declared !== undefined && declared !== task.qty_done) {
       if (!to.countsDone) {
         throw new AppError("QTY_LOCKED", "Số lượng hoàn thành chỉ nhập khi chuyển sang Done.", 400);
@@ -239,7 +257,9 @@ export const moveTasks = async (
         throw new AppError("QTY_LOCKED", "Task đã được QC check — số lượng đã chốt; nhờ Leader sửa nếu cần.", 400);
       }
       // PD-044: back into Done (e.g. after "Cần sửa lại") the worker may give a new quantity until QC checked the line.
-      assertDeclaredDoneQty(task.qty_assigned, declared);
+      if (task.qty_assigned !== null) {
+        assertDeclaredDoneQty(task.qty_assigned, declared);
+      }
       qtyDone = declared;
       qtyChanged = true;
     }
@@ -249,7 +269,24 @@ export const moveTasks = async (
     const closing = isLineFinished(workflow, { statusId: to.id, isChecking: task.process_is_qc, doneAt }, finish);
     const closedAt = closing ? (task.closed_at ?? now) : null;
     const isLate = computeIsLate({ doneAt, closed: closedAt !== null, deadline: task.deadline, now });
-    return { task, subtask, from, firstDone, qtyChanged, qtyDone, otHours, qcFail, doneAt, checkedAt, closing, closedAt, isLate };
+    return {
+      task,
+      subtask,
+      from,
+      firstDone,
+      fill,
+      missingQty,
+      qtyChanged,
+      qtyAssigned,
+      qtyDone,
+      otHours,
+      qcFail,
+      doneAt,
+      checkedAt,
+      closing,
+      closedAt,
+      isLate
+    };
   };
   // The input rows are checked before anything is read or written (SEC2-03); then their subtasks join (PD-044).
   const inputPlans = tasks.map(planMove);
@@ -259,11 +296,17 @@ export const moveTasks = async (
     throw new AppError("SUBTASK_INVALID", "Số lượng Done gửi kèm không thuộc subtask của task này.", 400);
   }
   const planned = [...inputPlans, ...cascaded.map(planMove)];
+  // PD-058: every task still without a quantity, named at once (the FE asks for all of them in one dialog).
+  const missing = planned.filter((plan) => plan.missingQty).map((plan) => plan.task.id);
+  if (missing.length > 0) {
+    throw taskQtyRequiredError(missing);
+  }
 
   // Existing timestamps are kept by the database (coalesce) so their microseconds survive.
   await tx`
     UPDATE production.tasks AS t
     SET status_id = ${to.id},
+        qty_assigned = CASE WHEN (m->>'fillQty')::boolean THEN (m->>'qtyAssigned')::int ELSE t.qty_assigned END,
         qty_done = CASE WHEN (m->>'setQty')::boolean THEN (m->>'qtyDone')::int ELSE t.qty_done END,
         ot_hours = CASE WHEN (m->>'firstDone')::boolean THEN (m->>'otHours')::numeric ELSE t.ot_hours END,
         done_at = coalesce(t.done_at, (m->>'doneAt')::timestamptz),
@@ -276,7 +319,9 @@ export const moveTasks = async (
       planned.map((plan) => ({
         id: plan.task.id,
         firstDone: plan.firstDone,
-        setQty: plan.firstDone || plan.qtyChanged,
+        setQty: plan.firstDone || plan.qtyChanged || plan.fill,
+        fillQty: plan.fill,
+        qtyAssigned: plan.qtyAssigned,
         qtyDone: plan.qtyDone,
         otHours: plan.otHours,
         doneAt: plan.doneAt?.toISOString() ?? null,
@@ -297,11 +342,17 @@ export const moveTasks = async (
       jobId: plan.task.job_id,
       userId: actorId,
       action: "STATUS" as const,
-      from: { ...statusLogValue(plan.from), ...(plan.qtyChanged ? { qtyDone: plan.task.qty_done } : {}) },
+      from: {
+        ...statusLogValue(plan.from),
+        ...(plan.qtyChanged ? { qtyDone: plan.task.qty_done } : {}),
+        // PD-058: "Số lượng: — → 120" filled in at Done.
+        ...(plan.fill ? { qtyAssigned: null } : {})
+      },
       to: {
         ...statusLogValue(to),
         ...(plan.firstDone ? { qtyDone: plan.qtyDone, ...(plan.otHours !== null ? { otHours: plan.otHours } : {}) } : {}),
         ...(plan.qtyChanged ? { qtyDone: plan.qtyDone } : {}),
+        ...(plan.fill ? { qtyAssigned: plan.qtyAssigned } : {}),
         ...(plan.qcFail ? { qcFail: true } : {}),
         ...(extras.override ? { override: true } : {})
       },
@@ -309,16 +360,21 @@ export const moveTasks = async (
       at: now
     }))
   );
-  // Subtasks raise nothing: their line's notification covers them (PD-044).
+  // Subtasks raise no status notification: their line's covers them (PD-044). A quantity filled in at Done is told for
+  // every task, subtasks included (PD-058).
   const events = planned.flatMap((plan) => {
+    const filled = plan.fill && plan.qtyAssigned !== null ? [taskQtyFilledEvent(organizationId, plan.task.id, actorId, plan.qtyAssigned, true)] : [];
     if (plan.subtask) {
-      return [];
+      return filled;
     }
     const enteredWaitingQc = to.code === "WAITING_QC";
     const enteredChecked = to.countsChecked && plan.task.checked_at === null;
     return enteredWaitingQc || enteredChecked || plan.qcFail
-      ? [taskStatusEvent(organizationId, plan.task.id, actorId, { toCode: to.code, toName: to.name, enteredWaitingQc, enteredChecked, qcFail: plan.qcFail, note })]
-      : [];
+      ? [
+          taskStatusEvent(organizationId, plan.task.id, actorId, { toCode: to.code, toName: to.name, enteredWaitingQc, enteredChecked, qcFail: plan.qcFail, note }),
+          ...filled
+        ]
+      : filled;
   });
   await enqueueProductionEvents(tx, events);
   if (to.countsDone || to.countsChecked) {
@@ -337,6 +393,7 @@ export const moveTasks = async (
     status_id: to.id,
     status_code: to.code,
     status_name: to.name,
+    qty_assigned: plan.qtyAssigned,
     qty_done: plan.qtyDone,
     ot_hours: plan.otHours === null ? null : String(plan.otHours),
     done_at: plan.doneAt,
@@ -598,7 +655,8 @@ const assertLines = async (
 };
 
 /**
- * Inserts tasks for a locked job (Phase 2 "Chia task" and feedback "Giao lại") in one statement (PERF-15).
+ * Inserts tasks for a locked job (Phase 2 "Chia task" and feedback "Giao lại") in one statement (PERF-15). PD-058: a
+ * line's quantity is optional (null = "chưa có số lượng"; Checking lines too).
  * Returns the new ids in line order and the over-allocation warning, if any (allowed, but logged on each
  * new task). Default deadlines: job deadline − QC buffer; feedback redo tasks see feedbackTaskDeadline.
  * A task created already late is flagged late and notified by the next lateness scan (BUG-PR-03).
@@ -666,15 +724,17 @@ export const insertTasks = async (
     }
   }
   let warning: string | null = null;
+  // PD-058: lines without a quantity add nothing (known numbers only).
+  const adding = lines.reduce((sum, line) => sum + (line.qtyAssigned ?? 0), 0);
   // An automatic Tổng tấm (PD-035) follows the lines, so only a typed one can be exceeded.
-  if (options.kind === "NORMAL" && job.total_images_manual) {
+  if (options.kind === "NORMAL" && job.total_images_manual && adding > 0) {
     const assigned = (
       await tx<{ total: number }[]>`
         SELECT coalesce(sum(qty_assigned), 0)::int AS total FROM production.tasks
         WHERE organization_id = ${organizationId} AND job_id = ${job.id} AND kind = 'NORMAL' AND deleted_at IS NULL
       `
     )[0]!.total;
-    warning = overAllocationWarning(job.total_images, assigned, lines.reduce((sum, line) => sum + line.qtyAssigned, 0));
+    warning = overAllocationWarning(job.total_images, assigned, adding);
   }
   // Creation time (history, created_at); `options.assignedAt` replays a past event. "Ngày nhận" of a normal line
   // defaults to the job's, its "Ngày giao" to the job deadline (PD-035); a feedback redo line is received now.
@@ -700,7 +760,8 @@ export const insertTasks = async (
       qcId: line.qcId ?? null,
       processId: line.processId,
       shiftId: line.shiftId,
-      qtyAssigned: line.qtyAssigned,
+      // PD-058: null = "chưa có số lượng" (filled in by the worker, at Done at the latest).
+      qtyAssigned: line.qtyAssigned ?? null,
       assignedAt: assignedAt.toISOString(),
       deadline: deadline.toISOString(),
       errorQty: line.errorQty ?? null,
@@ -855,7 +916,8 @@ export const updateProductionTaskQty = async (context: AccessContext, taskId: st
     if (!doneQtyEditAllowed({ updateScope: scopes.update, mine, done: true, checked: task.checked_at !== null })) {
       throw forbidden("Task đã được QC check — nhờ Leader sửa số lượng hoàn thành.");
     }
-    if (scopes.update !== "all") {
+    // A Done task always has its quantity (PD-058, filled in at Done at the latest).
+    if (scopes.update !== "all" && task.qty_assigned !== null) {
       // SEC2-03: the worker's own number is capped like at Done.
       assertDeclaredDoneQty(task.qty_assigned, input.qtyDone);
     }
@@ -1002,12 +1064,16 @@ const fieldChanges = () => {
  * (the total the Leader gave stays the same). Any time: note, Hình lỗi, tags and custom fields. Shift, dates, OT hours and
  * link follow the line (400 SUBTASK_FIELD_LOCKED when changed here). A process / quantity change is a SUBTASK row
  * ("updated", fromValue = before) on the line's history; the rest the subtask's own FIELD / NOTE rows.
+ *
+ * PD-058: quantities may be null ("chưa có số lượng"). The line gives / takes back the difference only when it has a number
+ * (a subtask without one counts 0 there, so filling it in takes its number from the line); a line without a number gives
+ * nothing — the subtask's number is just recorded. Filling in an empty quantity tells the job's Leader.
  */
 const updateSubtask = async (tx: QuerySql, context: AccessContext, locked: Awaited<ReturnType<typeof lockedTask>>, input: UpdateTaskInput) => {
   const { task, relation, scopes, mine } = locked;
   const organizationId = context.organization.id;
   const parent = (
-    await tx<{ id: string; number: string; process_id: string; qty_assigned: number; done_at: Date | null }[]>`
+    await tx<{ id: string; number: string; process_id: string; qty_assigned: number | null; done_at: Date | null }[]>`
       SELECT id, number, process_id, qty_assigned, done_at FROM production.tasks
       WHERE organization_id = ${organizationId} AND id = ${task.parent_task_id} FOR UPDATE
     `
@@ -1031,7 +1097,8 @@ const updateSubtask = async (tx: QuerySql, context: AccessContext, locked: Await
   }
   const processId = input.processId ?? task.process_id;
   const qtyAssigned = input.qtyAssigned ?? task.qty_assigned;
-  const structural = processId !== task.process_id || qtyAssigned !== task.qty_assigned;
+  const qtyChanged = input.qtyAssigned !== undefined && input.qtyAssigned !== task.qty_assigned;
+  const structural = processId !== task.process_id || qtyChanged;
   if (structural && (task.done_at !== null || parent.done_at !== null)) {
     throw new AppError("TASK_ALREADY_DONE", "Task đã Done — không đổi được quy trình và số lượng của subtask.", 409);
   }
@@ -1048,11 +1115,15 @@ const updateSubtask = async (tx: QuerySql, context: AccessContext, locked: Await
     }
     processName = process!.name;
   }
-  const qtyProblem = qtyAssigned === task.qty_assigned ? null : subtaskQtyProblem(parent.qty_assigned + task.qty_assigned, qtyAssigned);
-  if (qtyProblem) {
-    throw new AppError("SUBTASK_QTY_INVALID", qtyProblem, 400);
+  // PD-058: the line gives the difference only when it has a number (an empty subtask counts 0 in the pool).
+  let parentQty = parent.qty_assigned;
+  if (qtyChanged && input.qtyAssigned !== undefined && parent.qty_assigned !== null) {
+    const qtyProblem = subtaskQtyProblem(parent.qty_assigned + (task.qty_assigned ?? 0), input.qtyAssigned);
+    if (qtyProblem) {
+      throw new AppError("SUBTASK_QTY_INVALID", qtyProblem, 400);
+    }
+    parentQty = parent.qty_assigned - (input.qtyAssigned - (task.qty_assigned ?? 0));
   }
-  const parentQty = parent.qty_assigned - (qtyAssigned - task.qty_assigned);
   const errorQty = input.errorQty === undefined ? task.error_qty : input.errorQty;
   const customValues =
     input.customValues !== undefined
@@ -1067,7 +1138,13 @@ const updateSubtask = async (tx: QuerySql, context: AccessContext, locked: Await
   `;
   if (parentQty !== parent.qty_assigned) {
     await tx`UPDATE production.tasks SET qty_assigned = ${parentQty}, updated_at = now() WHERE organization_id = ${organizationId} AND id = ${parent.id}`;
+  }
+  if (qtyChanged) {
     await syncJobTotalImages(tx, organizationId, task.job_id);
+  }
+  if (qtyChanged && task.qty_assigned === null && input.qtyAssigned !== undefined) {
+    // PD-058: an empty quantity filled in → the job's Leader is told.
+    await enqueueProductionEvents(tx, [taskQtyFilledEvent(organizationId, task.id, context.user.id, input.qtyAssigned, false)]);
   }
   if (input.tagIds) {
     await setEntityTags(tx, organizationId, "TASK", task.id, input.tagIds);
@@ -1081,7 +1158,7 @@ const updateSubtask = async (tx: QuerySql, context: AccessContext, locked: Await
   changes.track("errorQty", task.error_qty, errorQty);
   changes.track("customValues", task.custom_values, customValues);
   const logs: LogInput[] = [];
-  const subtaskValue = (values: { processId: string; processName: string; qtyAssigned: number; parentQtyAssigned: number }) => ({
+  const subtaskValue = (values: { processId: string; processName: string; qtyAssigned: number | null; parentQtyAssigned: number | null }) => ({
     subtaskId: task.id,
     subtaskNumber: Number(task.number),
     subtaskCode: taskRowCode(task),
@@ -1112,7 +1189,8 @@ const updateSubtask = async (tx: QuerySql, context: AccessContext, locked: Await
  * (`qtyAssigned`, the line's OWN quantity — `allocatedQty` adds its subtasks') is the Leader's number (PD-044): the job's
  * Leader, "update: all", or the worker on a line they entered themselves; any other worker gets 403
  * QTY_REQUEST_REQUIRED (send a request instead). Shift, dates and link changes are mirrored to the line's subtasks. A
- * subtask: see updateSubtask.
+ * subtask: see updateSubtask. PD-058: an empty quantity ("chưa có số lượng") is filled in directly by the line's assignee
+ * too (qtyFillAllowed) — never a request — and the job's Leader is told (production.task.qty_filled).
  */
 export const updateProductionTask = async (context: AccessContext, taskId: string, input: UpdateTaskInput) => {
   assertProductionMember(context);
@@ -1125,16 +1203,10 @@ export const updateProductionTask = async (context: AccessContext, taskId: strin
     }
     const { task, relation, scopes, mine } = locked;
     const qtyChange = input.qtyAssigned !== undefined && input.qtyAssigned !== task.qty_assigned;
-    if (
-      qtyChange &&
-      !qtyAssignedEditAllowed({
-        leads: relation.isJobLeader,
-        updateScope: scopes.update,
-        mine,
-        createdByMe: task.created_by === context.user.id,
-        subtask: false
-      })
-    ) {
+    // PD-058: filling in an empty quantity is the assignee's own step (no request); changing a number keeps PD-044.
+    const qtyFill = qtyChange && task.qty_assigned === null;
+    const qtyRights = { leads: relation.isJobLeader, updateScope: scopes.update, mine, createdByMe: task.created_by === context.user.id, subtask: false };
+    if (qtyChange && !(qtyFill ? qtyFillAllowed(qtyRights) : qtyAssignedEditAllowed(qtyRights))) {
       throw mine ? new AppError("QTY_REQUEST_REQUIRED", "Gửi đề nghị sửa số tấm để Leader duyệt.", 403) : forbidden("Bạn không có quyền sửa số lượng giao.");
     }
     const otherFields = Object.entries(input).some(([key, value]) => key !== "qtyAssigned" && value !== undefined);
@@ -1202,8 +1274,11 @@ export const updateProductionTask = async (context: AccessContext, taskId: strin
           error_qty = ${errorQty}, ot_hours = ${otHours}, custom_values = ${tx.json(customValues as never)}, updated_at = now()
       WHERE organization_id = ${organizationId} AND id = ${taskId}
     `;
-    if (input.qtyAssigned !== undefined && input.qtyAssigned !== task.qty_assigned) {
+    if (qtyChange) {
       await syncJobTotalImages(tx, organizationId, task.job_id);
+    }
+    if (qtyFill && input.qtyAssigned !== undefined) {
+      await enqueueProductionEvents(tx, [taskQtyFilledEvent(organizationId, taskId, context.user.id, input.qtyAssigned, false)]);
     }
     if (input.tagIds) {
       await setEntityTags(tx, organizationId, "TASK", taskId, input.tagIds);
@@ -1307,7 +1382,7 @@ const deleteSubtask = async (tx: QuerySql, context: AccessContext, locked: Await
   const { task, relation, scopes, mine } = locked;
   const organizationId = context.organization.id;
   const parent = (
-    await tx<{ id: string; qty_assigned: number; done_at: Date | null }[]>`
+    await tx<{ id: string; qty_assigned: number | null; done_at: Date | null }[]>`
       SELECT id, qty_assigned, done_at FROM production.tasks WHERE organization_id = ${organizationId} AND id = ${task.parent_task_id} FOR UPDATE
     `
   )[0];
@@ -1320,8 +1395,11 @@ const deleteSubtask = async (tx: QuerySql, context: AccessContext, locked: Await
     throw forbidden(done ? "Task đã Done — chỉ người có quyền xoá mọi công việc mới xoá được subtask." : "Bạn không có quyền xoá subtask này.");
   }
   const reversedEntries = await softDeleteTasks(tx, organizationId, context.user.id, [task], { withJob: false });
-  const parentQty = parent.qty_assigned + task.qty_assigned;
-  await tx`UPDATE production.tasks SET qty_assigned = ${parentQty}, updated_at = now() WHERE organization_id = ${organizationId} AND id = ${parent.id}`;
+  // PD-058: the quantity goes back only between numbers (a line or a subtask without one gives / gets nothing).
+  const parentQty = parent.qty_assigned !== null && task.qty_assigned !== null ? parent.qty_assigned + task.qty_assigned : parent.qty_assigned;
+  if (parentQty !== parent.qty_assigned) {
+    await tx`UPDATE production.tasks SET qty_assigned = ${parentQty}, updated_at = now() WHERE organization_id = ${organizationId} AND id = ${parent.id}`;
+  }
   await insertTaskLogs(tx, organizationId, [
     {
       taskId: parent.id,

@@ -83,7 +83,8 @@ export const ProductionSubtaskSchema = z.object({
   /** Display code: its line's number + a letter, e.g. "1216a" (PD-045). */
   code: z.string(),
   process: z.object({ id: Id, name: z.string() }),
-  qtyAssigned: z.number().int(),
+  /** PD-058: null = "chưa có số lượng" (the worker fills it in by Done at the latest). */
+  qtyAssigned: z.number().int().nullable(),
   qtyDone: z.number().int().nullable(),
   reason: z.string().nullable(),
   createdBy: UserRefSchema.nullable(),
@@ -108,7 +109,11 @@ export const ProductionTaskSchema = z.object({
   qc: UserRefSchema.nullable(),
   process: z.object({ id: Id, name: z.string(), isQc: z.boolean() }),
   shift: z.object({ id: Id, name: z.string(), payMode: PayModeSchema, requiresOtHours: z.boolean() }),
-  qtyAssigned: z.number().int(),
+  /**
+   * PD-058: null = "chưa có số lượng" — the quantity is optional until Done (the worker fills it in directly, or in the
+   * Done dialog). Totals count known numbers only. Never null once the task is Done (doneAt set).
+   */
+  qtyAssigned: z.number().int().nullable(),
   qtyDone: z.number().int().nullable(),
   /** "Hình lỗi": display / review only, never changes points or money (PD-035). */
   errorQty: z.number().int().nullable(),
@@ -132,7 +137,7 @@ export const ProductionTaskSchema = z.object({
   subtasks: z.array(ProductionSubtaskSchema),
   /**
    * "Số lượng Leader giao": this line's quantity plus its subtasks' (= qtyAssigned when it has none). A subtask: its
-   * own quantity.
+   * own quantity. PD-058: known numbers only (a task without a quantity counts 0 here — look at qtyAssigned).
    */
   allocatedQty: z.number().int(),
   /** The open quantity change request of the line (PD-044), if any. */
@@ -176,10 +181,14 @@ export const ProductionTaskSchema = z.object({
     canEditQty: z.boolean(),
     /**
      * Change "Số lượng giao" directly, before Done (PD-044): the job's Leader or "update: all". On a subtask the
-     * quantity moves between it and its line (the line keeps at least 1).
+     * quantity moves between it and its line (the line keeps at least 1). PD-058: a task without a quantity is filled in
+     * directly by its assignee too.
      */
     canEditQtyAssigned: z.boolean(),
-    /** Ask the Leader to change "Số lượng giao" (PD-044): the assignee without a direct right, before Done, no open request. */
+    /**
+     * Ask the Leader to change "Số lượng giao" (PD-044): the assignee without a direct right, before Done, no open request.
+     * PD-058: never while the task has no quantity (it is filled in directly).
+     */
     canRequestQty: z.boolean(),
     /** Approve / reject the open quantity request: the job's Leader, or "update: all" (PD-044). */
     canDecideQtyRequest: z.boolean(),
@@ -211,15 +220,16 @@ export const WorkLinkSchema = SafeText()
   .refine((value) => !workLinkControls.test(value), textRuleMessages.control);
 
 /**
- * One work-log row (PD-035): Nhân viên thực hiện, Quy trình, Ca, Số lượng, Ngày nhận, Ngày giao (required; the dates
- * default to the job's), Hình lỗi, Giờ OT, Ghi chú, QC, Link chia việc (PD-040) (optional).
+ * One work-log row (PD-035): Nhân viên thực hiện, Quy trình, Ca, Ngày nhận, Ngày giao (required; the dates default to the
+ * job's), Số lượng (optional since PD-058), Hình lỗi, Giờ OT, Ghi chú, QC, Link chia việc (PD-040) (optional).
  */
 export const CreateTaskLineSchema = z
   .object({
     assigneeId: Id,
     processId: Id,
     shiftId: Id,
-    qtyAssigned: z.number().int().min(1).max(1_000_000),
+    /** PD-058: optional — omitted / null = "chưa có số lượng" (the worker fills it in by Done at the latest). */
+    qtyAssigned: z.number().int().min(1).max(1_000_000).nullable().optional(),
     qcId: Id.nullable().optional(),
     /** "Ngày nhận". Default: the job's (feedback redo tasks: now). */
     assignedAt: IsoDateInput.optional(),
@@ -243,12 +253,17 @@ export const TransitionTaskRequestSchema = z
   .object({
     toStatusId: Id,
     note: SafeText().trim().max(5000).optional(),
+    /**
+     * Done quantity. PD-058: required (≥ 1) when the line has no quantity yet — it becomes both its quantities; missing →
+     * 400 TASK_QTY_REQUIRED (`details.taskIds`).
+     */
     qtyDone: z.number().int().min(0).max(1_000_000).optional(),
     /** Optional, also on the OT shift (PD-035): omitted keeps the line's own "Giờ OT". */
     otHours: OtHours.optional(),
     /**
      * Entering Done with subtasks (PD-044): the Done quantity of each subtask (default: its qtyAssigned). Subtasks move
-     * with their line; they are never moved on their own.
+     * with their line; they are never moved on their own. PD-058: required (≥ 1) for each live subtask without a
+     * quantity (it becomes both its quantities).
      */
     subtaskQtyDone: z
       .array(z.object({ taskId: Id, qtyDone: z.number().int().min(0).max(1_000_000) }).strict())
@@ -258,18 +273,32 @@ export const TransitionTaskRequestSchema = z
   .strict();
 export type TransitionTaskRequest = z.infer<typeof TransitionTaskRequestSchema>;
 
+/**
+ * PD-058: `error.details` of 400 TASK_QTY_REQUIRED ("Nhập số lượng trước khi chuyển Done."): the tasks — the line and / or
+ * its live subtasks — that still have no quantity. Send `qtyDone` (the line) and `subtaskQtyDone` (each subtask), ≥ 1.
+ */
+export const TaskQtyRequiredDetailsSchema = z.object({ taskIds: z.array(Id) });
+export type TaskQtyRequiredDetails = z.infer<typeof TaskQtyRequiredDetailsSchema>;
+
 /** POST /production/tasks/:taskId/subtasks (PD-044): split `qtyAssigned` of the line off into another process. */
 export const CreateSubtaskRequestSchema = z
   .object({
     processId: Id,
-    qtyAssigned: z.number().int().min(1).max(1_000_000),
+    /**
+     * PD-058: optional — omitted / null = "chưa có số lượng". The quantity is carved from the line only when both the
+     * line and the subtask have a number.
+     */
+    qtyAssigned: z.number().int().min(1).max(1_000_000).nullable().optional(),
     /** Optional (PD-045); empty = none. */
     reason: SafeText().trim().max(2000).optional()
   })
   .strict();
 export type CreateSubtaskRequest = z.infer<typeof CreateSubtaskRequestSchema>;
 
-/** POST /production/tasks/:taskId/qty-requests (PD-044): the new total ("Số lượng giao") and why. */
+/**
+ * POST /production/tasks/:taskId/qty-requests (PD-044): the new total ("Số lượng giao") and why. PD-058: a task without a
+ * quantity answers 409 TASK_QTY_EMPTY ("Task chưa có số lượng — điền trực tiếp vào ô số lượng.").
+ */
 export const CreateQtyRequestSchema = z
   .object({
     qtyAssigned: z.number().int().min(1).max(1_000_000),
@@ -293,6 +322,11 @@ export const AssignTaskRequestSchema = z
 
 export const UpdateProductionTaskRequestSchema = z
   .object({
+    /**
+     * "Số lượng giao". PD-058: while the task has none (null), its assignee (and anyone who may already edit it) fills it
+     * in directly here — never through a quantity request (POST …/qty-requests answers 409 TASK_QTY_EMPTY); the job's
+     * Leader is notified (production.qty_filled). A subtask filled while its line has a number takes it from the line.
+     */
     qtyAssigned: z.number().int().min(1).max(1_000_000).optional(),
     assignedAt: IsoDateInput.optional(),
     deadline: IsoDateInput.optional(),
@@ -394,7 +428,7 @@ export const JobSummarySchema = z.object({
   receivedAt: IsoDate,
   /** "Ngày giao" of the job (default of its lines'). */
   deadline: IsoDate,
-  /** "Tổng tấm": the sum of the NORMAL lines unless typed (`totalImagesManual`). */
+  /** "Tổng tấm": the sum of the NORMAL lines unless typed (`totalImagesManual`); PD-058: known numbers only. */
   totalImages: z.number().int(),
   totalImagesManual: z.boolean(),
   driveLink: z.string().nullable(),
@@ -417,11 +451,14 @@ export const JobSummarySchema = z.object({
   uncheckedTaskCount: z.number().int(),
   /**
    * PD-048 "Tổng tấm" per process ("Công đoạn"): images given over the live work tasks of the job, subtasks counted under
-   * their own process, Checking tasks left out (same tasks as qtyAssigned) — largest first, then by name.
+   * their own process, Checking tasks left out (same tasks as qtyAssigned) — largest first, then by name. PD-058: known
+   * numbers only (tasks without a quantity are left out; a process with none known is not listed).
    */
   processTotals: z.array(z.object({ process: z.object({ id: Id, name: z.string() }), qty: z.number().int() })),
-  /** Image totals of normal tasks only (feedback redo tasks are extra work, not part of total_images). */
+  /** Image totals of normal tasks only (feedback redo tasks are extra work, not part of total_images). PD-058: known numbers only. */
   qtyAssigned: z.number().int(),
+  /** PD-058: live lines (subtasks included, Checking lines included) without a quantity yet ("chưa có số lượng"). */
+  tasksWithoutQty: z.number().int(),
   qtyDone: z.number().int(),
   qtyChecked: z.number().int(),
   taskCount: z.number().int(),
@@ -612,7 +649,8 @@ export const CreateWorkEntryRequestSchema = z
     assigneeId: Id.optional(),
     processId: Id,
     shiftId: Id,
-    qtyAssigned: z.number().int().min(1).max(1_000_000),
+    /** PD-058: optional — omitted / null = "chưa có số lượng" (same rule as "Chia task"). */
+    qtyAssigned: z.number().int().min(1).max(1_000_000).nullable().optional(),
     /** Ngày nhận. */
     assignedAt: IsoDateInput,
     /** Ngày giao. */
@@ -715,6 +753,10 @@ export const TaskLogSchema = z.object({
    * QTY_REQUEST (PD-044): toValue { op: "requested" | "approved" | "rejected" | "cancelled", requestId, fromQty, toQty };
    * note = the worker's reason ("requested") or the decision note.
    * STATUS into REWORK carries { qcFail: true } and the QC's reason as note (unchanged from the QC fail of PD-014).
+   * PD-058: a quantity may be null ("chưa có số lượng") in CREATE / FIELD / SUBTASK / DELETE values. Filling it in is a
+   * FIELD row { qtyAssigned: null } → { qtyAssigned: 120 } (PATCH; a subtask filled from its line: a SUBTASK "updated"
+   * row on the line too), or, at Done, the STATUS row { …status, qtyAssigned: null } → { …status, qtyAssigned: 120,
+   * qtyDone: 120 }.
    */
   action: z.enum(["CREATE", "STATUS", "QTY", "ASSIGN", "NOTE", "FIELD", "JOB", "DELETE", "SUBTASK", "QTY_REQUEST"]),
   fromValue: z.record(z.string(), z.unknown()).nullable(),

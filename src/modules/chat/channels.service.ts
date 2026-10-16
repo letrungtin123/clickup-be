@@ -28,6 +28,7 @@ import { purgeNotificationsFor } from "../notifications/notifications.service.js
 import type { AccessContext } from "../access/access-context.js";
 import { assertDepartment } from "../access/departments.js";
 import { assertPermission, hasPermission } from "../access/resource-access.js";
+import { visibleUserIdSql, visibleUserSql } from "../access/test-accounts.js";
 import { enqueueDomainEvents, type DomainEventInput } from "../events/outbox.js";
 import {
   assertCapability,
@@ -177,7 +178,8 @@ export const getChannel = async (context: AccessContext, channelId: string, sql:
 /**
  * Joinable public channels the caller is not in — of their departments, or without department (PD-053) — (superadmins
  * may include private ones to manage). `department` (PD-054, the switcher) narrows to that department's channels and
- * those without department; it must be one of the caller's (403 DEPARTMENT_FORBIDDEN).
+ * those without department; it must be one of the caller's (403 DEPARTMENT_FORBIDDEN). Channels created by a temporary QA
+ * test account are left out for a viewer who is not one (PD-063).
  */
 export const browseChannels = async (context: AccessContext, query: ChannelBrowseQuery): Promise<ChannelBrowsePage> => {
   assertPermission(context, Permission.ChannelView);
@@ -200,6 +202,7 @@ export const browseChannels = async (context: AccessContext, query: ChannelBrows
       AND c.archived_at IS NULL
       AND (c.department IS NULL OR ${context.hasFullOrganizationAuthority} OR c.department = ANY(${departments}::text[]))
       AND (${selected}::text IS NULL OR c.department IS NULL OR c.department = ${selected}::text)
+      AND ${visibleUserIdSql(sql, context, sql`c.created_by`)}
       AND NOT EXISTS (
         SELECT 1 FROM public.channel_members cm
         WHERE cm.organization_id = c.organization_id AND cm.channel_id = c.id
@@ -708,6 +711,7 @@ export const removeChannelMember = async (context: AccessContext, channelId: str
   return { ok: true as const };
 };
 
+/** A channel's members, by name. Temporary QA test accounts are left out for a viewer who is not one (PD-063). */
 export const listChannelMembers = async (context: AccessContext, channelId: string, query: ChannelMemberQuery): Promise<ChannelMemberPage> => {
   const sql = getSql();
   const resolved = await requireChannel(sql, context, channelId);
@@ -724,6 +728,7 @@ export const listChannelMembers = async (context: AccessContext, channelId: stri
     WHERE cm.organization_id = ${context.organization.id}
       AND cm.channel_id = ${channelId}
       AND cm.deleted_at IS NULL
+      AND ${visibleUserSql(sql, context)}
       AND (
         ${q.length === 0}
         OR public.immutable_unaccent(lower(au.display_name)) LIKE public.immutable_unaccent(${like})

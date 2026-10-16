@@ -8,7 +8,11 @@ import { getWorkspaceContext } from "../workspace/workspace.service.js";
 export type AccessContext = WorkspaceContext;
 
 const versionKey = "authz:ver";
-/** `v2`: the context shape changed (departments, PD-041): entries cached by an older build are never read. */
+/**
+ * `v2`: the context shape changed (departments, PD-041): entries cached by an older build are never read. PD-063 added
+ * the optional `isTestAccount` (set only for test accounts): an entry cached before it reads as a real account, which
+ * every account was, so the key stays. A flag set later by SQL shows once the entry expires (TTL) or the version moves.
+ */
 const contextKey = (version: string, userId: string) => `authz:ctx:v2:${version}:${userId}`;
 
 /**

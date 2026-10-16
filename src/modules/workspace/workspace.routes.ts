@@ -12,6 +12,7 @@ import {
   OrganizationMemberCollectionSchema,
   OrganizationMemberQuerySchema,
   OrganizationMemberSchema,
+  RenameOrganizationMemberRequestSchema,
   PermissionCollectionSchema,
   RoleCollectionSchema,
   ManagedRoleSchema,
@@ -31,7 +32,13 @@ import { disconnectUsers } from "../../realtime/publisher.js";
 import { assertPasswordCurrent, invalidateAccessContexts, resolveAccessContext } from "../access/access-context.js";
 import { assertDepartment, resolveCurrentDepartment } from "../access/departments.js";
 import { afterDepartmentChange, applyDepartmentChange } from "../production/users-admin.service.js";
-import { afterMembershipStatusChange, changeOwnPassword, createOrganizationMember, resetMemberPassword } from "./members.service.js";
+import {
+  afterMembershipStatusChange,
+  changeOwnPassword,
+  createOrganizationMember,
+  renameOrganizationMember,
+  resetMemberPassword
+} from "./members.service.js";
 import {
   archiveRole,
   createRole,
@@ -213,6 +220,20 @@ workspaceRoutes.post("/organization/members", async (req, res, next) => {
     const input = CreateOrganizationMemberRequestSchema.parse(req.body);
     const context = await resolveActiveContext(req);
     res.status(201).json(CreatedMemberResponseSchema.parse(await createOrganizationMember(context, input)));
+  } catch (error) {
+    next(error);
+  }
+});
+
+workspaceRoutes.patch("/organization/members/:membershipId/display-name", async (req, res, next) => {
+  try {
+    const membershipId = OpaqueIdSchema.parse(req.params.membershipId);
+    const input = RenameOrganizationMemberRequestSchema.parse(req.body);
+    const context = await resolveActiveContext(req);
+    const member = await renameOrganizationMember(context, membershipId, input.displayName);
+    // Sessions carry the display name: the renamed person sees it at their next request.
+    await invalidateAccessContexts();
+    res.json(OrganizationMemberSchema.parse(member));
   } catch (error) {
     next(error);
   }

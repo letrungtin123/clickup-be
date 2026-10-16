@@ -21,6 +21,7 @@ import { getSql } from "../../db/client.js";
 import { AppError } from "../../lib/app-error.js";
 import { escapeLike, toIso, type QuerySql } from "../../lib/db-types.js";
 import type { AccessContext } from "../access/access-context.js";
+import { visibleUserIdSql } from "../access/test-accounts.js";
 import { actsAsJobLeader, assertProductionMember, assertProductionRole, isProductionAdmin } from "./access.js";
 import { cursorInstantSql, decodeTimeCursor, encodeTimeCursor } from "./cursor.js";
 import { anyTagSql, customFieldFilterSql, resolveCustomFieldFilters, resolveCustomValues, setEntityTags } from "./custom-fields.js";
@@ -222,7 +223,8 @@ export const jobEditChanges = (
 
 /**
  * Job-row filters of GET /production/jobs (everything but the keyset cursor), on `j`. The person filter is
- * optional so the per-person totals can reach the tasks through the assignee index instead.
+ * optional so the per-person totals can reach the tasks through the assignee index instead. Jobs created by a
+ * temporary QA test account are left out for a viewer who is not one (PD-063).
  */
 const jobListFilterSql = (
   sql: QuerySql,
@@ -235,6 +237,7 @@ const jobListFilterSql = (
   const like = query.q ? `%${escapeLike(query.q.toLowerCase())}%` : null;
   return sql`
     j.organization_id = ${context.organization.id} AND j.deleted_at IS NULL
+    AND ${visibleUserIdSql(sql, context, sql`j.created_by`)}
     ${scopes.view === "all" ? sql`` : sql`AND ${jobViewSql(sql, context, scopes)}`}
     ${query.includeArchived ? sql`` : sql`AND j.archived_at IS NULL`}
     ${query.projectId ? sql`AND j.project_id = ${query.projectId}` : sql``}
@@ -409,7 +412,7 @@ export const createJob = async (context: AccessContext, input: CreateJobRequest)
   const organizationId = context.organization.id;
   const sql = getSql();
   if ((await loadJobScopes(sql, context)).create !== "all") {
-    throw forbidden("Bạn không có quyền tạo job — hãy dùng \"Nhập công việc\" để nhập công việc của mình.");
+    throw forbidden("Bạn không có quyền tạo job — hãy dùng \"Nhập Task\" để nhập task của mình.");
   }
   // PD-035: the leader is optional; Tổng tấm left empty follows the lines (0 until the job is split).
   const leaderId = input.leaderId ?? null;
@@ -621,6 +624,7 @@ export const changeJobStatus = async (context: AccessContext, jobId: string, inp
  * archived or deleted (closed statuses included), open statuses first, then Ngày giao newest first. Needs "create" own or
  * all (PD-036) and answers only minimal fields, also for jobs the caller cannot open (the line they add is theirs).
  * Search: the package text (and the old free name), accents / case ignored, through production_jobs_search_idx.
+ * Jobs created by a temporary QA test account are left out for a viewer who is not one (PD-063).
  */
 export const listJobOptions = async (context: AccessContext, query: JobOptionsQuery): Promise<JobOptions> => {
   assertProductionMember(context);
@@ -650,6 +654,7 @@ export const listJobOptions = async (context: AccessContext, query: JobOptionsQu
     JOIN production.job_statuses js ON js.organization_id = j.organization_id AND js.id = j.job_status_id
     WHERE j.organization_id = ${organizationId} AND j.project_id = ${query.projectId}
       AND j.deleted_at IS NULL AND j.archived_at IS NULL
+      AND ${visibleUserIdSql(sql, context, sql`j.created_by`)}
       ${query.statusIds?.length ? sql`AND j.job_status_id = ANY(${query.statusIds}::uuid[])` : sql``}
       ${like ? sql`AND public.immutable_unaccent(lower(j.code || ' ' || coalesce(j.name, ''))) LIKE public.immutable_unaccent(${like})` : sql``}
     ORDER BY js.is_closed, j.deadline DESC, j.id DESC

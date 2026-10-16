@@ -27,6 +27,7 @@ import { getSql } from "../../db/client.js";
 import { AppError } from "../../lib/app-error.js";
 import type { QuerySql } from "../../lib/db-types.js";
 import type { AccessContext } from "../access/access-context.js";
+import { viewerIsTestAccount } from "../access/test-accounts.js";
 import { assertProductionRole, isProductionAdmin } from "./access.js";
 import { closeDaysOf, customFieldsForbidden, loadSettings } from "./catalog.service.js";
 import { daysInclusive, periodOfDay, periodRange, shiftPeriod, weekStart, type KpiCloseDays } from "./scoring.js";
@@ -463,11 +464,20 @@ const activeFilters = (filters: ReportFilters) =>
 
 /**
  * Builds the statement for one report. Pure (no I/O) so the whitelisting and the generated SQL are
- * unit-tested. `from` / `to` are validated business days.
+ * unit-tested. `from` / `to` are validated business days. `hideTestAccounts` (PD-063, a viewer who is not a temporary
+ * QA test account): score rows and tasks of test accounts are left out, so they never show as people nor count.
  */
 export const buildReportQuery = (
   config: ReportConfig,
-  input: { organizationId: string; from: string; to: string; closeDay: KpiCloseDays; limit?: number; customFields?: ReportCustomFields }
+  input: {
+    organizationId: string;
+    from: string;
+    to: string;
+    closeDay: KpiCloseDays;
+    limit?: number;
+    customFields?: ReportCustomFields;
+    hideTestAccounts?: boolean;
+  }
 ): BuiltReportQuery => {
   assertWhitelisted(config);
   const params = new Params();
@@ -558,6 +568,9 @@ export const buildReportQuery = (
       const toTs = startOfBusinessDay(addDays(input.to, 1)).toISOString();
       // Deleted lines (PD-036) are not work any more; their score rows net to zero on the SCORES side.
       where.push(`t.organization_id = ${org}`, "t.deleted_at IS NULL", `${anchor} >= ${params.bind(fromTs, "timestamptz")}`, `${anchor} < ${params.bind(toTs, "timestamptz")}`);
+    }
+    if (input.hideTestAccounts) {
+      where.push(`NOT EXISTS (SELECT 1 FROM public.app_users test_au WHERE test_au.id = ${source === "SCORES" ? "e.user_id" : "t.assignee_id"} AND test_au.is_test_account)`);
     }
     for (const key of filters) {
       const spec = filterSpecs[key];
@@ -766,16 +779,19 @@ export const mapReportRows = (
 const isQueryCanceled = (error: unknown) =>
   typeof error === "object" && error !== null && (error as { code?: unknown }).code === "57014";
 
-/** Runs a validated config without permission checks (callers check). */
+/**
+ * Runs a validated config without permission checks (callers check). `hideTestAccounts`: the viewer is not a temporary
+ * QA test account (PD-063, `!viewerIsTestAccount(context)`).
+ */
 export const executeReport = async (
   sql: postgres.Sql,
   organizationId: string,
   config: ReportConfig,
-  options: { today: string; closeDay: KpiCloseDays }
+  options: { today: string; closeDay: KpiCloseDays; hideTestAccounts: boolean }
 ): Promise<ReportResult> => {
   const { from, to } = resolveReportRange(config, options.today, options.closeDay);
   const customFields = await loadReportCustomFields(sql, organizationId, config);
-  const query = buildReportQuery(config, { organizationId, from, to, closeDay: options.closeDay, customFields });
+  const query = buildReportQuery(config, { organizationId, from, to, closeDay: options.closeDay, customFields, hideTestAccounts: options.hideTestAccounts });
   let raw: Record<string, unknown>[];
   try {
     raw = await sql.begin("read only", async (tx): Promise<Record<string, unknown>[]> => {
@@ -835,5 +851,9 @@ export const runReport = async (context: AccessContext, config: ReportConfig): P
   const sql = getSql();
   const settings = await loadSettings(sql, context.organization.id);
   assertReportAllowed(context, config);
-  return await executeReport(sql, context.organization.id, config, { today: businessDay(new Date()), closeDay: closeDaysOf(settings) });
+  return await executeReport(sql, context.organization.id, config, {
+    today: businessDay(new Date()),
+    closeDay: closeDaysOf(settings),
+    hideTestAccounts: !viewerIsTestAccount(context)
+  });
 };

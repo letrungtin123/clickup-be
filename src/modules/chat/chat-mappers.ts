@@ -280,6 +280,7 @@ export type MessageRow = {
   system_event: ChatSystemEvent | null;
   client_message_id: string | null;
   mentioned_user_ids: string[] | null;
+  mentions_all: boolean;
   reply_count: number;
   last_reply_at: Date | null;
   edited_at: Date | null;
@@ -296,7 +297,7 @@ export type MessageRow = {
  */
 export const messageColumnsSql = (sql: QuerySql, viewerId: string) => sql`
   m.id, m.channel_id, m.seq, m.thread_root_id, m.kind, m.body_json, m.body_text, m.system_event,
-  m.client_message_id, m.mentioned_user_ids, m.reply_count, m.last_reply_at, m.edited_at, m.deleted_at, m.created_at,
+  m.client_message_id, m.mentioned_user_ids, m.mentions_all, m.reply_count, m.last_reply_at, m.edited_at, m.deleted_at, m.created_at,
   (SELECT ${userJsonSql(sql)} FROM public.app_users au WHERE au.id = m.author_user_id) AS author,
   CASE WHEN m.deleted_at IS NOT NULL THEN '[]'::json ELSE (
     SELECT coalesce(json_agg(json_build_object('emoji', r.emoji, 'count', r.n, 'reacted_by_me', r.mine, 'users', r.users)
@@ -342,6 +343,7 @@ export const toMessage = (row: MessageRow): ChatMessage => {
     systemEvent: deleted ? null : row.system_event,
     clientMessageId: row.client_message_id,
     mentions: deleted ? [] : (row.mentioned_user_ids ?? []),
+    mentionsAll: !deleted && row.mentions_all === true,
     attachments: deleted ? [] : (row.attachments ?? []).map(toAttachment),
     reactions: deleted ? [] : (row.reactions ?? []).map(toReactionSummary),
     replyCount: Number(row.reply_count),

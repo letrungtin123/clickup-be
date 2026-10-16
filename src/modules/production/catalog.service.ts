@@ -27,10 +27,11 @@ import { defaultJobPermissions, effectiveJobScopes, productionRoleCodes } from "
 import { closeDayOfPeriod, kpiPeriodOfDay } from "../../contracts/production-scores.js";
 import { getSql } from "../../db/client.js";
 import { AppError } from "../../lib/app-error.js";
-import { toIso, type QuerySql } from "../../lib/db-types.js";
+import { toIso, type QuerySql, type SqlFragment } from "../../lib/db-types.js";
 import { isEmailEnabled } from "../../lib/mailer.js";
 import { invalidateAccessContexts, type AccessContext } from "../access/access-context.js";
 import { departmentMemberSql, effectiveDepartments, productionRolesNotAllowed } from "../access/departments.js";
+import { visibleUserIdSql, visibleUserSql } from "../access/test-accounts.js";
 import { scheduleGoogleAuthUserProvisioning } from "../auth/google-auth.service.js";
 import { toColor } from "../work/mappers.js";
 import { assertConfigEditor, assertProductionAdmin, assertProductionMember, assertProductionRole, isProductionAdmin, productionRolesOf } from "./access.js";
@@ -236,7 +237,8 @@ type MemberRow = {
   tag_ids: string[] | null;
 };
 
-const selectMembers = (sql: QuerySql, organizationId: string, onlyUserId: string | null) => sql<MemberRow[]>`
+/** `visible`: extra predicate on the member (PD-063 listings leave temporary QA test accounts out). */
+const selectMembers = (sql: QuerySql, organizationId: string, onlyUserId: string | null, visible: SqlFragment = sql`TRUE`) => sql<MemberRow[]>`
   SELECT au.id AS user_id, au.display_name, au.email, au.avatar_url, om.status,
     (SELECT array_agg(ur.role_code) FROM production.user_roles ur WHERE ur.organization_id = om.organization_id AND ur.user_id = au.id) AS roles,
     (r.key = 'superadmin') AS superadmin,
@@ -250,6 +252,7 @@ const selectMembers = (sql: QuerySql, organizationId: string, onlyUserId: string
   LEFT JOIN production.member_profiles mp ON mp.organization_id = om.organization_id AND mp.user_id = au.id
   WHERE om.organization_id = ${organizationId} AND om.deleted_at IS NULL
     AND (${onlyUserId}::uuid IS NULL OR au.id = ${onlyUserId}::uuid)
+    AND ${visible}
   ORDER BY au.display_name, au.id
   LIMIT 2000
 `;
@@ -284,7 +287,8 @@ export const listMembers = async (context: AccessContext, query: ProductionMembe
   }
   const sql = getSql();
   const plans = await resolveCustomFieldFilters(sql, org(context), "USER", query.cf);
-  const rows = await selectMembers(sql, org(context), null);
+  // PD-063: temporary QA test accounts are left out for a viewer who is not one.
+  const rows = await selectMembers(sql, org(context), null, visibleUserSql(sql, context));
   return {
     items: rows
       .map(toMember)
@@ -375,9 +379,13 @@ export const updateMember = async (
 
 export const listTeams = async (context: AccessContext) => {
   assertProductionMember(context);
-  const rows = await getSql()<{ id: string; name: string; active: boolean; member_count: number }[]>`
+  const sql = getSql();
+  const rows = await sql<{ id: string; name: string; active: boolean; member_count: number }[]>`
     SELECT t.id, t.name, t.active,
-      (SELECT count(*)::int FROM production.member_profiles mp WHERE mp.organization_id = t.organization_id AND mp.team_id = t.id) AS member_count
+      (
+        SELECT count(*)::int FROM production.member_profiles mp
+        WHERE mp.organization_id = t.organization_id AND mp.team_id = t.id AND ${visibleUserIdSql(sql, context, sql`mp.user_id`)}
+      ) AS member_count
     FROM production.teams t WHERE t.organization_id = ${org(context)} ORDER BY t.active DESC, t.name
   `;
   return { items: rows.map((row) => ({ id: row.id, name: row.name, active: row.active, memberCount: row.member_count })) };

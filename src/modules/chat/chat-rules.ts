@@ -9,6 +9,7 @@ import type {
 } from "../../contracts/chat.js";
 import { chatLimits, isDirectKind } from "../../contracts/chat.js";
 import { departmentCodes, sortDepartments, type Department } from "../../contracts/departments.js";
+import { sanitizeRichText, type SanitizeLimits, type SanitizeResult } from "../../contracts/rich-text.js";
 import { AppError } from "../../lib/app-error.js";
 import { decodeCursor, decodeTimeCursor, encodeCursor, encodeTimeCursor, invalidCursor, isUuid } from "../../lib/db-types.js";
 import type { AccessContext } from "../access/access-context.js";
@@ -254,6 +255,35 @@ export const findInvalidMentions = (mentionIds: string[], eligibleIds: Iterable<
 /** Users to notify / index for "mentions of me": everyone mentioned except the author. */
 export const mentionRecipients = (mentionIds: string[], authorId: string) =>
   [...new Set(mentionIds.map((id) => id.toLowerCase()))].filter((id) => id !== authorId.toLowerCase());
+
+/** @all (PD-061) mentions everyone in public / private channels and group DMs; in a 1:1 DM it is plain text. */
+export const allowsMentionAll = (kind: ChannelKind) => kind !== "dm";
+
+/**
+ * A body sanitized with `allowMentionAll` as the conversation allows it: in a 1:1 DM an @all mention becomes the text
+ * "@all" (no error). The other mentions keep their (already server-side) labels.
+ */
+export const applyMentionAllPolicy = (sanitized: SanitizeResult, kind: ChannelKind, limits: SanitizeLimits): SanitizeResult =>
+  !sanitized.mentionsAll || allowsMentionAll(kind) ? sanitized : sanitizeRichText(sanitized.doc, limits, { allowMentionAll: false });
+
+/**
+ * Rows of message_mentions (mention badge, "mentions of me"): the people mentioned by name plus, with @all, every
+ * current member of the conversation (`allMemberIds`); never the author, each person once.
+ */
+export const mentionRowRecipients = (mentionIds: string[], allMemberIds: readonly string[] | null, authorId: string) =>
+  mentionRecipients([...mentionIds, ...(allMemberIds ?? [])], authorId);
+
+/**
+ * One `chat.mentioned` per person (PD-061). `named`: people mentioned by name who pass the usual rules (notify level,
+ * channel.view); `everyone`: with @all, the current members of the conversation, whatever their notify level. Named
+ * people get the personal notification; the other members the @all one (payload.all). Never the author.
+ */
+export const splitMentionNotifications = (named: string[], everyone: readonly string[], authorId: string | null) => {
+  const author = authorId ?? "";
+  const personal = mentionRecipients(named, author);
+  const taken = new Set(personal);
+  return { named: personal, all: mentionRecipients([...everyone], author).filter((id) => !taken.has(id)) };
+};
 
 // Read state --------------------------------------------------------------------------------------
 

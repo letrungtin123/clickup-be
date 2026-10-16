@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { commentLimits, RichTextError, sanitizeRichText } from "./rich-text.js";
+import { commentLimits, MENTION_ALL_ID, messageLimits, RichTextError, sanitizeKnowledgeBody, sanitizeRichText } from "./rich-text.js";
 
 const userId = "3f0c1d9e-8a4b-4c2d-9e1f-2a3b4c5d6e7f";
 
@@ -173,5 +173,58 @@ describe("sanitizeRichText hardening", () => {
     expect(() => sanitizeRichText(paragraph(...mentionsOnly), limits)).toThrow(RichTextError);
     const manyParagraphs = { type: "doc", content: Array.from({ length: 30 }, () => ({ type: "paragraph", content: [{ type: "text", text: "a" }] })) };
     expect(() => sanitizeRichText(manyParagraphs, limits)).toThrow(RichTextError);
+  });
+});
+
+describe("@all mentions (PD-061)", () => {
+  const otherId = "4a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d";
+  const doc = (...content: unknown[]) => ({ type: "doc", content: [{ type: "paragraph", content }] });
+  const all = (label: unknown = "all") => ({ type: "mention", attrs: { id: "all", label } });
+
+  it("keeps the @all node with allowMentionAll; the label is always 'all' and mentions stay user ids", () => {
+    const result = sanitizeRichText(
+      doc({ type: "text", text: "Họp nhé " }, all(`Everyone${String.fromCharCode(0x202e)}`), { type: "mention", attrs: { id: userId, label: "Minh" } }),
+      messageLimits,
+      { allowMentionAll: true, mentionLabels: new Map([[userId, "Minh"]]) }
+    );
+    expect(MENTION_ALL_ID).toBe("all");
+    expect(result.mentionsAll).toBe(true);
+    expect(result.mentions).toEqual([userId]);
+    expect(result.doc.content?.[0]?.content).toEqual([
+      { type: "text", text: "Họp nhé " },
+      { type: "mention", attrs: { id: "all", label: "all" } },
+      { type: "mention", attrs: { id: userId, label: "Minh" } }
+    ]);
+    expect(result.text).toBe("Họp nhé @all@Minh");
+  });
+
+  it("an @all without a label (or a forged one) still reads @all", () => {
+    const result = sanitizeRichText(doc({ type: "mention", attrs: { id: "all" } }), messageLimits, { allowMentionAll: true });
+    expect(result.doc.content?.[0]?.content).toEqual([{ type: "mention", attrs: { id: "all", label: "all" } }]);
+    expect(result).toMatchObject({ text: "@all", mentions: [], mentionsAll: true });
+  });
+
+  it("without allowMentionAll it is the plain text '@all' (tasks, knowledge, 1:1 DMs)", () => {
+    for (const options of [{}, { allowMentionAll: false }, { mentionLabels: new Map([[otherId, "Lan"]]) }]) {
+      const result = sanitizeRichText(doc({ type: "text", text: "Hi " }, all()), commentLimits, options);
+      expect(result.doc.content?.[0]?.content).toEqual([{ type: "text", text: "Hi " }, { type: "text", text: "@all" }]);
+      expect(result).toMatchObject({ text: "Hi @all", mentions: [], mentionsAll: false });
+    }
+    expect(sanitizeKnowledgeBody(doc(all())).mentionsAll).toBe(false);
+  });
+
+  it("only the exact id 'all' is @all: other non-uuid ids are still dropped", () => {
+    const result = sanitizeRichText(doc(all(), { type: "mention", attrs: { id: "ALL" } }, { type: "mention", attrs: { id: "everyone" } }), messageLimits, {
+      allowMentionAll: true
+    });
+    expect(result.doc.content?.[0]?.content).toEqual([{ type: "mention", attrs: { id: "all", label: "all" } }]);
+    expect(result.mentions).toEqual([]);
+  });
+
+  it("is idempotent: a sanitized @all document sanitizes to itself", () => {
+    const first = sanitizeRichText(doc(all(), { type: "text", text: " xem" }), messageLimits, { allowMentionAll: true });
+    const second = sanitizeRichText(first.doc, messageLimits, { allowMentionAll: true });
+    expect(second).toEqual(first);
+    expect(sanitizeRichText(doc({ type: "text", text: "x" }), messageLimits).mentionsAll).toBe(false);
   });
 });

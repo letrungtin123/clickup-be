@@ -53,8 +53,8 @@ export const ChannelRoleSchema = z.enum(["member", "admin"]);
 export type ChannelRole = z.infer<typeof ChannelRoleSchema>;
 /**
  * Per-channel inbox level (BUG-WK-06): "all" = @mentions + replies in threads you take part in (default),
- * "mentions" = @mentions only, "none" = nothing from this channel. Clients use it for toasts too
- * (toast every new message only for "all").
+ * "mentions" = @mentions only, "none" = nothing from this channel — except @all (PD-061), which reaches every
+ * member whatever their level. Clients use it for toasts too (toast every new message only for "all").
  */
 export const NotifyLevelSchema = z.enum(["all", "mentions", "none"]);
 export type NotifyLevel = z.infer<typeof NotifyLevelSchema>;
@@ -397,7 +397,15 @@ export const ChatMessageSchema = z.object({
   text: z.string(),
   systemEvent: ChatSystemEventSchema.nullable(),
   clientMessageId: Id.nullable(),
+  /** People mentioned by name (user ids; never "all"). Empty when deleted. */
   mentions: z.array(Id),
+  /**
+   * The message mentions everyone in the conversation with @all (PD-061: public / private channels and group DMs; in a
+   * 1:1 DM "@all" is plain text). The body holds the node { type: "mention", attrs: { id: "all", label: "all" } }
+   * (MENTION_ALL_ID). Every current member except the author gets the mention (badge, "mentions of me", inbox
+   * `chat.mentioned` with payload.all = true), whatever their notify level. false when deleted.
+   */
+  mentionsAll: z.boolean(),
   attachments: z.array(ChatAttachmentSchema),
   reactions: z.array(ReactionSummarySchema),
   replyCount: z.number().int().min(0),
@@ -590,6 +598,8 @@ export type ChatMessageUpdatedEvent = {
   body: ChatMessage["body"];
   text: string;
   mentions: string[];
+  /** ChatMessage.mentionsAll after the edit (PD-061). */
+  mentionsAll: boolean;
   editedAt: string;
 };
 

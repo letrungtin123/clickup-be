@@ -145,24 +145,23 @@ describe("status transitions (SPEC Phase 2 §2)", () => {
     expect(targets("PROCESSING", who(["QC"], { isAssignee: true }))).toEqual([]);
   });
 
-  it("ADMIN may force any move but must give a reason", () => {
+  it("PD-064: ADMIN has no override — the same flow as everyone (assignee, job leader, role-based steps)", () => {
     const admin = who(["ADMIN"]);
-    // Every other status except FEEDBACK (system only).
-    expect(targets("ASSIGNED", admin)).toHaveLength(9);
-    // One line to Complete only as an override (PD-044), even when the ADMIN leads the job.
+    // Not the assignee of the line: nothing to do on it.
+    expect(targets("ASSIGNED", admin)).toEqual([]);
+    rejects(() => assertTransition(workflow, "ASSIGNED", "DELIVERED", admin, "Khách nhận trực tiếp"), "TRANSITION_NOT_ALLOWED");
+    rejects(() => assertTransition(workflow, "PROCESSING", "DONE", admin, "x"), "TRANSITION_NOT_ALLOWED");
+    // A Quản trị doing the work (assignee) follows the staff flow step by step.
+    const workingAdmin = who(["ADMIN", "ACCOUNT", "LEADER"], { isAssignee: true });
+    expect(targets("ASSIGNED", workingAdmin)).toEqual(["PROCESSING"]);
+    expect(targets("PROCESSING", workingAdmin)).toEqual(["DONE"]);
+    expect(assertTransition(workflow, "PROCESSING", "DONE", workingAdmin, undefined).override).toBe(false);
+    // One line never goes to Complete, even when the ADMIN leads the job; the job's own action still lists it.
     const leadingAdmin = who(["ADMIN"], { isJobLeader: true });
-    expect(allowedTransitions(workflow, "CHECKED", leadingAdmin).find((option) => option.toStatusId === "COMPLETE")).toEqual({
-      toStatusId: "COMPLETE",
-      requiresNote: true,
-      override: true
-    });
-    expect(assertTransition(workflow, "CHECKED", "COMPLETE", leadingAdmin, "Khách cần gấp").override).toBe(true);
+    expect(allowedTransitions(workflow, "CHECKED", leadingAdmin).find((option) => option.toStatusId === "COMPLETE")).toBeUndefined();
     expect(allowedTransitions(workflow, "CHECKED", leadingAdmin, "job").find((option) => option.toStatusId === "COMPLETE")?.override).toBe(false);
-    rejects(() => assertTransition(workflow, "ASSIGNED", "DELIVERED", admin, undefined), "NOTE_REQUIRED");
-    expect(assertTransition(workflow, "ASSIGNED", "DELIVERED", admin, "Khách nhận trực tiếp").override).toBe(true);
-    // Role-based steps (Account delivers) need no reason; relation-based ones (the assignee's Done) do.
+    // Role-based steps (Account delivers) stay open to an ADMIN, with no reason.
     expect(assertTransition(workflow, "COMPLETE", "DELIVERING", admin, undefined).override).toBe(false);
-    expect(assertTransition(workflow, "PROCESSING", "DONE", admin, "x").override).toBe(true);
   });
 
   it("Done moves to Waiting QC automatically only when a QC is assigned", () => {
@@ -221,7 +220,8 @@ describe("audit fixes (2026-10-10)", () => {
     // The admin as the task's QC moves as QC (not an override): it counts.
     const adminQc = who(["ADMIN", "QC"], { isQc: true });
     expect(assertTransition(workflow, "WAITING_QC", "REWORK", adminQc, "Sai màu").override).toBe(false);
-    expect(assertTransition(workflow, "WAITING_QC", "PROCESSING", admin, "Mở lại").override).toBe(true);
+    // PD-064: no ADMIN override to reopen work any more.
+    rejects(() => assertTransition(workflow, "WAITING_QC", "PROCESSING", admin, "Mở lại"), "TRANSITION_NOT_ALLOWED");
   });
 
   it("BUG-PR-08: lateness — closed without Done is not late; Done after the deadline is", () => {
@@ -394,14 +394,13 @@ describe("PD-045 the line workflow stops at Đã check; a job status that needs 
     transitions: workflow.transitions.filter((item) => !after.has(item.toStatusId) && !after.has(item.fromStatusId))
   };
 
-  it("nobody but an ADMIN override moves a line past Đã check (a Checking line past Done)", () => {
+  it("nobody moves a line past Đã check (a Checking line past Done) — no ADMIN override either (PD-064)", () => {
     const jobLeader = who(["LEADER"], { isJobLeader: true });
     expect(allowedTransitions(pd045, "CHECKED", jobLeader)).toEqual([]);
     expect(allowedTransitions(pd045, "CHECKED", jobLeader, "job")).toEqual([]);
     expect(allowedTransitions(pd045, "DONE", jobLeader).map((option) => option.toStatusId)).toEqual(["WAITING_QC"]);
     expect(allowedTransitions(pd045, "CHECKED", who(["ACCOUNT"]))).toEqual([]);
-    const forced = allowedTransitions(pd045, "CHECKED", who(["ADMIN"])).find((option) => option.toStatusId === "COMPLETE");
-    expect(forced).toEqual({ toStatusId: "COMPLETE", requiresNote: true, override: true });
+    expect(allowedTransitions(pd045, "CHECKED", who(["ADMIN"]))).toEqual([]);
     rejects(() => assertTransition(pd045, "CHECKED", "COMPLETE", jobLeader, undefined), "TRANSITION_NOT_ALLOWED");
   });
 

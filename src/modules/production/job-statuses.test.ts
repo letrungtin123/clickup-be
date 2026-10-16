@@ -140,6 +140,7 @@ const jobRow = (overrides: Partial<JobRow> = {}): JobRow => ({
   task_count: 0,
   late_task_count: 0,
   unchecked_task_count: 0,
+  tasks_without_qty: 0,
   open_feedback_count: 0,
   workers: null,
   qc_people: null,

@@ -12,8 +12,9 @@ import { closeDayOfPeriod } from "../../contracts/production-scores.js";
 import type { CustomFieldFilter, CustomValues, KhoanPayPolicy } from "../../contracts/production-catalog.js";
 import { getSql } from "../../db/client.js";
 import { AppError } from "../../lib/app-error.js";
-import { toIso, toNullableIso, type QuerySql } from "../../lib/db-types.js";
+import { toIso, toNullableIso, type QuerySql, type SqlFragment } from "../../lib/db-types.js";
 import type { AccessContext } from "../access/access-context.js";
+import { viewerIsTestAccount, visibleUserSql } from "../access/test-accounts.js";
 import { enqueueDomainEvents } from "../events/outbox.js";
 import { toUserRef, type UserRefJson } from "../work/mappers.js";
 import { assertConfigEditor, assertProductionAdmin, assertProductionMember, isProductionAdmin } from "./access.js";
@@ -222,7 +223,12 @@ type SettlementRow = UserRefJson & {
 
 const nullableNumber = (value: string | null) => (value === null ? null : Number(value));
 
-const selectSettlements = (sql: QuerySql, organizationId: string, filter: { fromPeriod: string; toPeriod: string; userIds: string[] | null }) =>
+/** `visible`: the people the viewer may see (PD-063: temporary QA test accounts are left out for a real viewer). */
+const selectSettlements = (
+  sql: QuerySql,
+  organizationId: string,
+  filter: { fromPeriod: string; toPeriod: string; userIds: string[] | null; visible: SqlFragment }
+) =>
   sql<SettlementRow[]>`
     SELECT ks.id AS settlement_id, au.id, au.display_name, au.email, au.avatar_url,
       to_char(ks.period_month, 'YYYY-MM') AS period, to_char(ks.period_from, 'YYYY-MM-DD') AS period_from,
@@ -237,6 +243,7 @@ const selectSettlements = (sql: QuerySql, organizationId: string, filter: { from
     WHERE ks.organization_id = ${organizationId}
       AND ks.period_month BETWEEN ${`${filter.fromPeriod}-01`}::date AND ${`${filter.toPeriod}-01`}::date
       AND (${filter.userIds}::uuid[] IS NULL OR ks.user_id = ANY(${filter.userIds}::uuid[]))
+      AND ${filter.visible}
     ORDER BY ks.period_month, ks.total_points DESC, au.display_name
   `;
 
@@ -356,7 +363,7 @@ export const runKpiSettlement = async (context: AccessContext, input: { period: 
   );
   const [runs, rows] = await Promise.all([
     selectRuns(sql, org(context), { ids: [runId], limit: 1 }),
-    selectSettlements(sql, org(context), { fromPeriod: input.period, toPeriod: input.period, userIds: null })
+    selectSettlements(sql, org(context), { fromPeriod: input.period, toPeriod: input.period, userIds: null, visible: visibleUserSql(sql, context) })
   ]);
   const viewer = { id: context.user.id, admin: true, moneyPublic: settings.moneyPublic };
   return { run: toRun(runs[0]!), items: rows.map((row) => toSettlement(row, viewer)) };
@@ -380,7 +387,7 @@ export const listKpiSettlements = async (
   const period = query.period ?? latestClosedPeriod(new Date(), closeDaysOf(settings));
   const userIds = subject ? [subject.id] : admin ? null : [context.user.id];
   const [rows, runs] = await Promise.all([
-    selectSettlements(sql, org(context), { fromPeriod: period, toPeriod: period, userIds }),
+    selectSettlements(sql, org(context), { fromPeriod: period, toPeriod: period, userIds, visible: visibleUserSql(sql, context) }),
     admin ? selectRuns(sql, org(context), { period, limit: 1 }) : Promise.resolve([])
   ]);
   const viewer = { id: context.user.id, admin, moneyPublic: settings.moneyPublic };
@@ -438,7 +445,7 @@ const reportRow = (
  * (any of them) and USER custom fields (e.g. cf.nang_luc=A). Others see only themselves and cannot use the
  * tag / custom-field filters (403 CUSTOM_FIELDS_FORBIDDEN: members' custom values are Admin data). `userId`
  * ("Điểm cá nhân", PD-052): only that production member, for any production member. Khoán money: ADMIN, the
- * owner, or settings.moneyPublic.
+ * owner, or settings.moneyPublic. Temporary QA test accounts are left out for a viewer who is not one (PD-063).
  */
 export const getKpiReport = async (
   context: AccessContext,
@@ -483,7 +490,7 @@ export const getKpiReport = async (
   const readTo = readPeriods[readPeriods.length - 1]!;
 
   const [settledRows, runPeriods, firstData] = await Promise.all([
-    selectSettlements(sql, organizationId, { fromPeriod: readFrom, toPeriod: readTo, userIds: onlyUserIds }),
+    selectSettlements(sql, organizationId, { fromPeriod: readFrom, toPeriod: readTo, userIds: onlyUserIds, visible: visibleUserSql(sql, context) }),
     sql<{ period: string }[]>`
       SELECT DISTINCT to_char(period_month, 'YYYY-MM') AS period FROM production.kpi_settlement_runs
       WHERE organization_id = ${organizationId} AND period_month BETWEEN ${`${readFrom}-01`}::date AND ${`${readTo}-01`}::date
@@ -523,8 +530,16 @@ export const getKpiReport = async (
   const inRange = new Set(periods);
   const userIds = [...new Set(rows.filter((row) => inRange.has(row.period)).map((row) => row.userId))];
   const people = userIds.length
-    ? await sql<(UserRefJson & { team_id: string | null; team_name: string | null; custom_values: CustomValues | null; tag_ids: string[] | null })[]>`
-        SELECT au.id, au.display_name, au.email, au.avatar_url, mp.team_id, tm.name AS team_name, mp.custom_values,
+    ? await sql<
+        (UserRefJson & {
+          team_id: string | null;
+          team_name: string | null;
+          custom_values: CustomValues | null;
+          tag_ids: string[] | null;
+          is_test_account: boolean;
+        })[]
+      >`
+        SELECT au.id, au.display_name, au.email, au.avatar_url, mp.team_id, tm.name AS team_name, mp.custom_values, au.is_test_account,
           (SELECT array_agg(et.tag_id) FROM production.entity_tags et
             WHERE et.organization_id = ${organizationId} AND et.entity = 'USER' AND et.entity_id = au.id) AS tag_ids
         FROM public.app_users au
@@ -541,6 +556,8 @@ export const getKpiReport = async (
   const visibleUsers = userIds.filter((userId) => {
     const person = profileOf.get(userId);
     return (
+      // PD-063: temporary QA test accounts are left out for a viewer who is not one.
+      (viewerIsTestAccount(context) || person?.is_test_account !== true) &&
       (!query.teamId || person?.team_id === query.teamId) &&
       (tagIds.length === 0 || (person?.tag_ids ?? []).some((tagId) => tagIds.includes(tagId))) &&
       matchesCustomFieldFilters(person?.custom_values, plans)

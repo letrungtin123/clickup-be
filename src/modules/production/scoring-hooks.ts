@@ -12,6 +12,7 @@ import {
   type TaskKind
 } from "./scoring.js";
 import { businessDay } from "./time.js";
+import { taskQtyRequiredError } from "./workflow.js";
 
 /**
  * Seams between the task workflow engine (Phase 2) and score recording (Phase 3). The engine calls
@@ -43,7 +44,8 @@ type TaskScoreRow = {
   pay_mode: PayMode;
   kind: TaskKind;
   qty_done: number | null;
-  qty_assigned: number;
+  /** null: no quantity yet (PD-058) — never the case at Done (moveTasks fills it in first). */
+  qty_assigned: number | null;
 };
 
 type OriginalRow = {
@@ -153,6 +155,10 @@ const adjustTo = async (
  * the rule of the line's (project, process) on the business day of `at` and the line's shift. Re-entering Done never
  * writes a second original entry; if qty_done changed in between (e.g. an Admin override), an adjustment brings the
  * entry to it. counts_checked statuses record nothing any more.
+ *
+ * PD-058: a task enters Done only with its quantity (moveTasks fills an empty one in first, the database refuses Done
+ * without one); should a task still have none here, nothing is recorded and the change is refused (400 TASK_QTY_REQUIRED)
+ * rather than writing a guessed number into the append-only ledger.
  */
 export const onTaskStatusEntered = async (sql: QuerySql, input: StatusEnteredInput): Promise<void> => {
   if (!input.status.countsDone) {
@@ -162,12 +168,16 @@ export const onTaskStatusEntered = async (sql: QuerySql, input: StatusEnteredInp
   if (!task) {
     return;
   }
+  const qty = task.qty_done ?? task.qty_assigned;
+  if (qty === null) {
+    throw taskQtyRequiredError([task.id]);
+  }
   const role = lineScoreRole(task.process_is_qc);
   const original = (await loadOriginals(sql, input.organizationId, task.id)).find((row) => row.role === role);
   const time = await eventTime(sql, input.organizationId, input.at);
   if (!original) {
     const rule = await getCreditRule(sql, input.organizationId, task.project_id, task.process_id, time.day);
-    const entry = computeLineEntry({ role, rule, qtyDone: task.qty_done ?? task.qty_assigned, payMode: task.pay_mode, kind: task.kind });
+    const entry = computeLineEntry({ role, rule, qtyDone: qty, payMode: task.pay_mode, kind: task.kind });
     await insertOriginal(sql, input.organizationId, task, entry, { userId: task.assignee_id, processId: task.process_id, time });
     return;
   }

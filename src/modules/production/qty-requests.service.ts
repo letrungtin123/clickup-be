@@ -59,7 +59,8 @@ const closedError = () => new AppError("QTY_REQUEST_CLOSED", "Đề nghị này 
 /**
  * POST /production/tasks/:taskId/qty-requests → the line. The line's worker only; a NORMAL line that is not a subtask, not
  * Done, without an open request (409 QTY_REQUEST_OPEN); the new total differs from the current one and leaves the line at
- * least 1 image besides its subtasks.
+ * least 1 image besides its subtasks. PD-058: a task without a quantity is filled in directly, never asked for (409
+ * TASK_QTY_EMPTY); the total counts known numbers only.
  */
 export const createQtyRequest = async (context: AccessContext, taskId: string, input: CreateQtyRequest): Promise<ProductionTask> => {
   assertProductionMember(context);
@@ -67,6 +68,9 @@ export const createQtyRequest = async (context: AccessContext, taskId: string, i
   const sql = getSql();
   const jobId = await sql.begin(async (tx) => {
     const { task, mine } = await lockedTask(tx, context, taskId);
+    if (task.qty_assigned === null) {
+      throw new AppError("TASK_QTY_EMPTY", "Task chưa có số lượng — điền trực tiếp vào ô số lượng.", 409);
+    }
     if (!mine) {
       throw forbidden("Chỉ người làm task này gửi được đề nghị sửa số tấm.");
     }

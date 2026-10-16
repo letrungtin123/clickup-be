@@ -58,7 +58,7 @@ vi.mock("../notifications/notifications.service.js", () => ({
   })
 }));
 
-const { productionRecipients, productionNotificationHandlers, notifyDeadline } = await import("./notifications.js");
+const { productionRecipients, productionNotificationHandlers, notifyDeadline, leaveRequestedBody, leaveReasonExcerpt } = await import("./notifications.js");
 
 const org = "11111111-1111-4111-8111-111111111111";
 const assignee = "22222222-2222-4222-8222-222222222222";
@@ -425,18 +425,40 @@ describe("worker handlers load the people the rules need", () => {
     expect(adminQuery.text).toContain("r.key = 'superadmin'");
   });
 
-  it("leave requested → approvers (team leaders, admins, superadmins) but never the requester", async () => {
+  it("leave requested → the approvers only: active production admins and superadmins (PD-057: no Leaders), never the requester", async () => {
     db.state.handler = (call) => {
       if (call.text.includes("FROM production.leave_requests lr")) {
-        return [{ user_id: assignee, display_name: "NV", from_date: "2026-10-12", to_date: "2026-10-12", part: "FULL_DAY", status: "PENDING", decision_note: null, team_id: null }];
+        return [{ user_id: assignee, display_name: "NV", from_date: "2026-10-12", to_date: "2026-10-12", part: "FULL_DAY", status: "PENDING", note: "Việc gia đình", decision_note: null }];
       }
       if (call.text.includes("ur.role_code = 'ADMIN'")) {
-        return [{ user_id: leader }, { user_id: superadmin }, { user_id: assignee }];
+        return [{ user_id: admin }, { user_id: superadmin }, { user_id: assignee }];
       }
       return undefined;
     };
     await productionNotificationHandlers["production.leave.requested"]!(envelope("production.leave.requested", { leaveId: "ffffffff-ffff-4fff-8fff-ffffffffffff" }, assignee));
-    expect(sorted(draftsOf("production.leave_requested")[0]!.recipientIds)).toEqual(sorted([leader, superadmin]));
+    const [draft] = draftsOf("production.leave_requested");
+    expect(sorted(draft!.recipientIds)).toEqual(sorted([admin, superadmin]));
+    // What, when and why for the approver (PD-057).
+    expect(draft!.body).toBe("Nghỉ cả ngày 12/10: Việc gia đình");
+    expect(draft!.payload).toMatchObject({ requesterName: "NV", fromDate: "2026-10-12", part: "FULL_DAY", reason: "Việc gia đình", note: null });
+    const approverQuery = db.state.calls.find((call) => call.text.includes("ur.role_code = 'ADMIN'"))!;
+    // Admins must be active members; superadmins are implicit Admins; Leaders are not asked any more.
+    expect(approverQuery.text).toContain("om.status = 'active'");
+    expect(approverQuery.text).toContain("r.key = 'superadmin'");
+    expect(db.state.calls.some((call) => call.text.includes("LEADER"))).toBe(false);
+  });
+
+  it("leave request body: part, dates and the reason, cut to 200 characters on one line", () => {
+    const leave = (part: string, from: string, to: string, note: string | null) => ({ part, from_date: from, to_date: to, note });
+    expect(leaveRequestedBody(leave("FULL_DAY", "2026-10-20", "2026-10-21", "Việc gia đình"))).toBe("Nghỉ cả ngày 20/10 – 21/10: Việc gia đình");
+    expect(leaveRequestedBody(leave("MORNING", "2026-10-20", "2026-10-20", " Khám\n bệnh "))).toBe("Nghỉ buổi sáng 20/10: Khám bệnh");
+    expect(leaveRequestedBody(leave("AFTERNOON", "2026-12-31", "2026-12-31", null))).toBe("Nghỉ buổi chiều 31/12");
+    expect(leaveRequestedBody(leave("FULL_DAY", "2026-12-30", "2027-01-02", "   "))).toBe("Nghỉ cả ngày 30/12 – 02/01");
+    const long = leaveReasonExcerpt("ố".repeat(500))!;
+    expect([...long]).toHaveLength(200);
+    expect(long.endsWith("…")).toBe(true);
+    expect(leaveReasonExcerpt("a".repeat(200))).toBe("a".repeat(200));
+    expect(leaveReasonExcerpt(null)).toBeNull();
   });
 
   it("leader removed → production admins get the list of open jobs; nothing once the person leads again", async () => {
@@ -464,5 +486,61 @@ describe("worker handlers load the people the rules need", () => {
     leaderActive = true;
     await productionNotificationHandlers["production.member.leader_removed"]!(envelope("production.member.leader_removed", { userId: leader }, admin));
     expect(delivered.drafts).toHaveLength(0);
+  });
+});
+
+describe("PD-058 a quantity filled in (production.qty_filled) and tasks without a quantity", () => {
+  const people = { assigneeId: assignee, qcId: qc, leaderId: leader };
+
+  it("goes to the job's active Leader (never the person who filled it in); without one to the production Admins", () => {
+    expect(productionRecipients.qtyFilled(people, [admin], assignee)).toEqual([leader]);
+    // The Leader filling it in tells nobody.
+    expect(productionRecipients.qtyFilled(people, [admin], leader)).toEqual([]);
+    expect(sorted(productionRecipients.qtyFilled({ ...people, leaderId: null }, [admin, superadmin], assignee))).toEqual(sorted([admin, superadmin]));
+    expect(productionRecipients.qtyFilled({ ...people, leaderId: null }, [admin, superadmin], admin)).toEqual([superadmin]);
+  });
+
+  it("the handler names the task and the number filled in (payload filledQty / atDone); no Leader → the Admins", async () => {
+    let leaderActive = true;
+    db.state.handler = (call) => {
+      if (call.text.includes("AS leader_active") && call.text.includes("FROM production.tasks t")) {
+        return [taskInfo({ leader_active: leaderActive, qty_assigned: 120, qty_done: null })];
+      }
+      if (call.text.includes("role_code = 'ADMIN'")) {
+        return [{ user_id: admin }, { user_id: superadmin }];
+      }
+      return undefined;
+    };
+    await productionNotificationHandlers["production.task.qty_filled"]!(envelope("production.task.qty_filled", { taskId, qty: 120, atDone: false }, assignee));
+    const [draft] = draftsOf("production.qty_filled");
+    expect(draft).toMatchObject({ recipientIds: [leader], title: "JOB-9", body: "#3 · Retouch · 120 tấm", actorUserId: assignee });
+    expect(draft!.payload).toMatchObject({ productionTaskId: taskId, taskCode: "3", qty: 120, filledQty: 120, atDone: false });
+    expect(db.state.calls.some((call) => call.text.includes("role_code = 'ADMIN'"))).toBe(false);
+
+    delivered.drafts = [];
+    leaderActive = false;
+    await productionNotificationHandlers["production.task.qty_filled"]!(envelope("production.task.qty_filled", { taskId, qty: 30, atDone: true }, assignee));
+    const [atDone] = draftsOf("production.qty_filled");
+    expect(sorted(atDone!.recipientIds)).toEqual(sorted([admin, superadmin]));
+    expect(atDone!.payload).toMatchObject({ filledQty: 30, atDone: true });
+
+    // A deleted task or a malformed event tells nobody.
+    delivered.drafts = [];
+    await productionNotificationHandlers["production.task.qty_filled"]!(envelope("production.task.qty_filled", { taskId }, assignee));
+    db.state.handler = () => [];
+    await productionNotificationHandlers["production.task.qty_filled"]!(envelope("production.task.qty_filled", { taskId, qty: 5 }, assignee));
+    expect(delivered.drafts).toHaveLength(0);
+  });
+
+  it("a task without a quantity is named without '· N tấm' and carries qty null", async () => {
+    db.state.handler = (call) =>
+      call.text.includes("AS leader_active") && call.text.includes("FROM production.tasks t") ? [taskInfo({ qty_assigned: null, qty_done: null })] : undefined;
+    await productionNotificationHandlers["production.task.assigned"]!(envelope("production.task.assigned", { taskId }, leader));
+    const [draft] = draftsOf("production.task_assigned");
+    expect(draft).toMatchObject({ body: "#3 · Retouch" });
+    expect(draft!.payload).toMatchObject({ qty: null });
+
+    await notifyDeadline("production.task_late", [{ organization_id: org, id: taskId }]);
+    expect(draftsOf("production.task_late")[0]).toMatchObject({ body: "#3 · Retouch" });
   });
 });

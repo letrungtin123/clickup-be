@@ -123,30 +123,49 @@ describe("assertValidNewLeave", () => {
 });
 
 describe("assertValidCalendarWindow", () => {
-  it("allows up to 93 days", () => {
+  it("allows up to 366 days (PD-057: one year for the range view and the export)", () => {
     expect(codeOf(() => assertValidCalendarWindow("2026-10-01", "2027-01-01"))).toBeNull();
-    expect(codeOf(() => assertValidCalendarWindow("2026-10-01", "2027-01-02"))?.code).toBe("LEAVE_WINDOW_TOO_LONG");
-    expect(codeOf(() => assertValidCalendarWindow("2026-10-02", "2026-10-01"))?.code).toBe("LEAVE_RANGE_INVALID");
+    // 2026-10-01 … 2027-10-01 is 366 inclusive days; one more is too long.
+    expect(codeOf(() => assertValidCalendarWindow("2026-10-01", "2027-10-01"))).toBeNull();
+    expect(codeOf(() => assertValidCalendarWindow("2026-10-01", "2027-10-02"))).toEqual({ code: "LEAVE_WINDOW_TOO_LONG", status: 400 });
+    expect(codeOf(() => assertValidCalendarWindow("2026-10-02", "2026-10-01"))).toEqual({ code: "LEAVE_RANGE_INVALID", status: 400 });
     expect(codeOf(() => assertValidCalendarWindow("2026-10-01", "2026-1-31"))?.code).toBe("LEAVE_DATE_INVALID");
+    expect(codeOf(() => assertValidCalendarWindow("2026-10-01", "2026-10-01"))).toBeNull();
+  });
+
+  it("says what was refused: viewing or exporting", () => {
+    const messageOf = (fn: () => unknown) => {
+      try {
+        fn();
+      } catch (error) {
+        return (error as AppError).message;
+      }
+      return null;
+    };
+    expect(messageOf(() => assertValidCalendarWindow("2026-10-01", "2027-10-02"))).toBe("Chỉ xem được tối đa 366 ngày mỗi lần.");
+    expect(messageOf(() => assertValidCalendarWindow("2026-10-01", "2027-10-02", "xuất"))).toBe("Chỉ xuất được tối đa 366 ngày mỗi lần.");
+    expect(messageOf(() => assertValidCalendarWindow("2026-10-02", "2026-10-01", "xuất"))).toBe("Ngày kết thúc phải sau hoặc trùng ngày bắt đầu.");
   });
 });
 
 describe("cancel / decide permissions", () => {
   const today = "2026-10-09";
 
-  it("owner cancels PENDING/APPROVED before the start day; ADMIN anytime", () => {
+  it("PD-059: owner or ADMIN cancels PENDING/APPROVED only before the start day — never a past or ongoing leave", () => {
     expect(canCancelLeave({ status: "APPROVED", fromDate: "2026-10-10", own: true }, { admin: false, today })).toBe(true);
     expect(canCancelLeave({ status: "PENDING", fromDate: "2026-10-09", own: true }, { admin: false, today })).toBe(false);
-    expect(canCancelLeave({ status: "APPROVED", fromDate: "2026-10-01", own: false }, { admin: true, today })).toBe(true);
+    expect(canCancelLeave({ status: "APPROVED", fromDate: "2026-10-10", own: false }, { admin: true, today })).toBe(true);
+    expect(canCancelLeave({ status: "APPROVED", fromDate: "2026-10-09", own: false }, { admin: true, today })).toBe(false);
+    expect(canCancelLeave({ status: "APPROVED", fromDate: "2026-10-01", own: false }, { admin: true, today })).toBe(false);
     expect(canCancelLeave({ status: "APPROVED", fromDate: "2026-10-10", own: false }, { admin: false, today })).toBe(false);
     expect(canCancelLeave({ status: "REJECTED", fromDate: "2026-10-20", own: true }, { admin: true, today })).toBe(false);
   });
 
-  it("LEADER decides others' PENDING requests; ADMIN also their own", () => {
-    expect(canDecideLeave({ status: "PENDING", own: false }, { admin: false, leader: true })).toBe(true);
-    expect(canDecideLeave({ status: "PENDING", own: true }, { admin: false, leader: true })).toBe(false);
-    expect(canDecideLeave({ status: "PENDING", own: true }, { admin: true, leader: false })).toBe(true);
-    expect(canDecideLeave({ status: "APPROVED", own: false }, { admin: true, leader: true })).toBe(false);
-    expect(canDecideLeave({ status: "PENDING", own: false }, { admin: false, leader: false })).toBe(false);
+  it("PD-057: only ADMIN decides, PENDING requests only (Leaders no longer)", () => {
+    expect(canDecideLeave({ status: "PENDING" }, { admin: true })).toBe(true);
+    expect(canDecideLeave({ status: "PENDING" }, { admin: false })).toBe(false);
+    for (const status of ["APPROVED", "REJECTED", "CANCELLED"]) {
+      expect(canDecideLeave({ status }, { admin: true })).toBe(false);
+    }
   });
 });

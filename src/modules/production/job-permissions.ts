@@ -62,6 +62,12 @@ export const qtyAssignedEditAllowed = (input: {
 }) => input.leads || input.updateScope === "all" || (input.mine && (input.subtask || input.createdByMe));
 
 /**
+ * PD-058 filling in a quantity that is still empty ("chưa có số lượng"): its assignee directly — no request, no approval —
+ * and anyone who may already change "Số lượng giao" (qtyAssignedEditAllowed). The job's Leader is notified.
+ */
+export const qtyFillAllowed = (input: Parameters<typeof qtyAssignedEditAllowed>[0]) => input.mine || qtyAssignedEditAllowed(input);
+
+/**
  * PD-044 the Done quantity after Done: "update: all" at any time (scores are adjusted, unchanged), and the line's worker
  * until QC checked it ("Đã check") — a subtask has its own Done quantity.
  */

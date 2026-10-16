@@ -7,6 +7,7 @@ import { escapeLike } from "../../lib/db-types.js";
 import type { AccessContext } from "../access/access-context.js";
 import { assertDepartment, departmentMemberSql } from "../access/departments.js";
 import { getProjectAccess, hasPermission } from "../access/resource-access.js";
+import { visibleUserSql } from "../access/test-accounts.js";
 import { dmCallerOf, loadChannel } from "../chat/chat-access.js";
 import { dmDirectoryScope, mentionScope } from "../chat/chat-rules.js";
 import { toUserRef, type UserRefJson } from "./mappers.js";
@@ -23,6 +24,7 @@ import { userJsonSql } from "./tasks.repo.js";
  * `department` (PD-054, the department switcher): on top of every other scope, only members of that department (the
  * superadmin included, public.is_department_member); it must be one of the caller's (403 DEPARTMENT_FORBIDDEN).
  * Mention pickers (`channelId` without `purpose`) follow the channel only and ignore it.
+ * PD-063: temporary QA test accounts are left out for a viewer who is not one (a test account sees everyone).
  */
 export const searchDirectory = async (
   context: AccessContext,
@@ -108,6 +110,7 @@ export const searchDirectory = async (
       AND om.status = 'active'
       AND om.deleted_at IS NULL
       AND ${projectFilter}
+      AND ${visibleUserSql(sql, context)}
       ${department ? sql`AND ${departmentMemberSql(sql, sql`om.organization_id`, sql`om.user_id`, department)}` : sql``}
       AND (
         ${q.length === 0}

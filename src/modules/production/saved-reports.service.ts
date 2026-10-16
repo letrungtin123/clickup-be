@@ -11,6 +11,7 @@ import { AppError } from "../../lib/app-error.js";
 import { toIso, type JsonObject, type QuerySql } from "../../lib/db-types.js";
 import { logger } from "../../lib/logger.js";
 import type { AccessContext } from "../access/access-context.js";
+import { visibleUserIdSql, visibleUserSql, type TestAccountViewer } from "../access/test-accounts.js";
 import { assertProductionRole, isProductionAdmin } from "./access.js";
 import { assertReportConfigUsable, usesMemberCustomFields } from "./reports.js";
 
@@ -118,12 +119,13 @@ const assertCanPin = (context: AccessContext) => {
   }
 };
 
+/** Own and shared saved reports. Those of temporary QA test accounts are left out for a viewer who is not one (PD-063). */
 export const listSavedReports = async (context: AccessContext) => {
   assertProductionRole(context, "LEADER");
   const sql = getSql();
   const rows = await sql<SavedRow[]>`
     ${selectSaved(sql)}
-    WHERE r.organization_id = ${org(context)} AND (r.owner_id = ${context.user.id} OR r.shared)
+    WHERE r.organization_id = ${org(context)} AND (r.owner_id = ${context.user.id} OR r.shared) AND ${visibleUserSql(sql, context, sql`u`)}
     ORDER BY r.pinned DESC, r.pin_order, r.updated_at DESC, r.id
     LIMIT ${listLimit}
   `;
@@ -210,11 +212,14 @@ export const deleteSavedReport = async (context: AccessContext, reportId: string
   return { deleted: true };
 };
 
-/** Pinned reports for the Admin dashboard (configs only; the page runs them). */
-export const listPinnedReports = async (sql: QuerySql, organizationId: string) => {
+/**
+ * Pinned reports for the Admin dashboard (configs only; the page runs them). Those of temporary QA test accounts are left
+ * out for a viewer who is not one (PD-063).
+ */
+export const listPinnedReports = async (sql: QuerySql, organizationId: string, viewer: TestAccountViewer) => {
   const rows = await sql<{ id: string; name: string; config: unknown }[]>`
     SELECT id, name, config FROM production.saved_reports
-    WHERE organization_id = ${organizationId} AND pinned
+    WHERE organization_id = ${organizationId} AND pinned AND ${visibleUserIdSql(sql, viewer, sql`owner_id`)}
     ORDER BY pin_order, updated_at DESC, id
     LIMIT 50
   `;

@@ -1,3 +1,4 @@
+import type { Response } from "express";
 import type postgres from "postgres";
 import type { z } from "zod";
 
@@ -6,6 +7,7 @@ import type {
   DecideLeaveRequestSchema,
   LeaveCalendar,
   LeaveCalendarQuerySchema,
+  LeaveExportQuery,
   LeavePart,
   LeaveRequest,
   LeaveStatus
@@ -16,8 +18,10 @@ import { nullableText, toIso, toNullableIso, type QuerySql } from "../../lib/db-
 import { publishToRoom } from "../../realtime/publisher.js";
 import { enqueueProductionEvents, leaveEvent } from "./notifications.js";
 import type { AccessContext } from "../access/access-context.js";
+import { visibleUserSql } from "../access/test-accounts.js";
 import { toUserRef, type UserRefJson } from "../work/mappers.js";
 import { assertProductionMember, assertProductionRole, hasProductionRole, isProductionAdmin, productionRoom } from "./access.js";
+import { sendLeaveAttendanceWorkbook } from "./leave-export.js";
 import {
   assertValidCalendarWindow,
   assertValidNewLeave,
@@ -31,7 +35,9 @@ import { businessDay, isValidDay } from "./time.js";
 
 /**
  * Shared leave calendar ("Lịch nghỉ", SPEC §6.3, PLAN §10). Any production member files requests
- * for themselves; LEADER/ADMIN decide; everyone sees approved leave (names and dates only).
+ * for themselves (with a reason, PD-057); only ADMIN decides (PD-057 — Leaders still see pending
+ * requests, read-only); everyone sees approved leave (names and dates only); ADMIN exports the
+ * payroll attendance workbook.
  */
 
 type In<T extends z.ZodTypeAny> = z.infer<T>;
@@ -87,7 +93,7 @@ const selectLeaves = (sql: QuerySql, organizationId: string, where: postgres.Pen
   LIMIT 5000
 `;
 
-/** Notes, decider and email are only shown to the owner and to LEADER/ADMIN. */
+/** Notes, decider and email are only shown to the owner and to LEADER/ADMIN (Leaders read-only, PD-057). */
 const toLeave = (row: LeaveRow, viewer: Viewer): LeaveRequest => {
   const own = row.user_id === viewer.userId;
   const details = own || viewer.admin || viewer.leader;
@@ -109,7 +115,7 @@ const toLeave = (row: LeaveRow, viewer: Viewer): LeaveRequest => {
     createdAt: toIso(row.created_at),
     updatedAt: toIso(row.updated_at),
     canCancel: canCancelLeave({ status: row.status, fromDate: row.from_date, own }, viewer),
-    canDecide: canDecideLeave({ status: row.status, own }, viewer)
+    canDecide: canDecideLeave({ status: row.status }, viewer)
   };
 };
 
@@ -138,8 +144,9 @@ const isOverlapViolation = (error: unknown) =>
 // Reads -------------------------------------------------------------------------------------------
 
 /**
- * Calendar window: APPROVED requests of everyone, the caller's own requests in any status, and
- * (LEADER/ADMIN) every PENDING request.
+ * Calendar window (≤ leaveLimits.maxCalendarDays, one year since PD-057): APPROVED requests of everyone, the
+ * caller's own requests in any status, and (LEADER/ADMIN) every PENDING request — Leaders read-only. Temporary QA
+ * test accounts' requests are left out for a viewer who is not one (PD-063), here, in the queue and in the export.
  */
 export const getLeaveCalendar = async (context: AccessContext, query: In<typeof LeaveCalendarQuerySchema>): Promise<LeaveCalendar> => {
   assertProductionMember(context);
@@ -154,7 +161,8 @@ export const getLeaveCalendar = async (context: AccessContext, query: In<typeof 
       (lr.status IN ('PENDING', 'APPROVED') AND lr.slot_range && ${windowRange(sql, query.from, query.to)}
         AND (lr.status = 'APPROVED' OR lr.user_id = ${viewer.userId} OR ${seeAllPending}::boolean))
       OR (lr.user_id = ${viewer.userId} AND lr.from_date <= ${query.to}::date AND lr.to_date >= ${query.from}::date)
-    ) AND (${query.teamId ?? null}::uuid IS NULL OR mp.team_id = ${query.teamId ?? null}::uuid)`
+    ) AND (${query.teamId ?? null}::uuid IS NULL OR mp.team_id = ${query.teamId ?? null}::uuid)
+      AND ${visibleUserSql(sql, context)}`
   );
   return { from: query.from, to: query.to, today: viewer.today, items: rows.map((row) => toLeave(row, viewer)) };
 };
@@ -168,12 +176,15 @@ export const listMyLeave = async (context: AccessContext) => {
   return { items: rows.map((row) => toLeave(row, viewer)).reverse().slice(0, 200) };
 };
 
-/** Approval queue (LEADER/ADMIN): every PENDING request, oldest leave first. */
+/**
+ * Pending queue: every PENDING request, oldest leave first. ADMIN decides them; LEADER keeps seeing the queue
+ * read-only (`canDecide` false, PD-057).
+ */
 export const listPendingLeave = async (context: AccessContext) => {
   assertProductionRole(context, "LEADER");
   const viewer = viewerOf(context);
   const sql = getSql();
-  const rows = await selectLeaves(sql, org(context), sql`lr.status = 'PENDING'`);
+  const rows = await selectLeaves(sql, org(context), sql`lr.status = 'PENDING' AND ${visibleUserSql(sql, context)}`);
   return { items: rows.map((row) => toLeave(row, viewer)) };
 };
 
@@ -204,22 +215,26 @@ export const createLeaveRequest = async (context: AccessContext, input: In<typeo
   return await loadOne(sql, context, id);
 };
 
-/** LEADER/ADMIN approve or reject a PENDING request; a LEADER cannot decide their own. */
+/** PD-057: only Quản trị — production ADMIN, organization superadmins included — decides leave requests. */
+export const assertLeaveDecider = (context: AccessContext) => {
+  assertProductionMember(context);
+  if (!isProductionAdmin(context)) {
+    throw new AppError("FORBIDDEN", "Chỉ Quản trị mới duyệt được đơn nghỉ.", 403);
+  }
+};
+
+/** ADMIN approves or rejects a PENDING request (their own too — PD-057 kept the ADMIN rule). */
 export const decideLeaveRequest = async (context: AccessContext, id: string, input: In<typeof DecideLeaveRequestSchema>) => {
-  assertProductionRole(context, "LEADER");
-  const admin = isProductionAdmin(context);
+  assertLeaveDecider(context);
   const sql = getSql();
   await sql.begin(async (tx) => {
     const current = (
-      await tx<{ user_id: string; status: LeaveStatus }[]>`
-        SELECT user_id, status FROM production.leave_requests WHERE organization_id = ${org(context)} AND id = ${id} FOR UPDATE
+      await tx<{ status: LeaveStatus }[]>`
+        SELECT status FROM production.leave_requests WHERE organization_id = ${org(context)} AND id = ${id} FOR UPDATE
       `
     )[0];
     if (!current) {
       throw notFound();
-    }
-    if (current.user_id === context.user.id && !admin) {
-      throw new AppError("LEAVE_SELF_DECISION", "Bạn không thể tự duyệt đơn nghỉ của chính mình.", 403);
     }
     if (current.status !== "PENDING") {
       throw new AppError("LEAVE_NOT_PENDING", "Đơn nghỉ này đã được xử lý.", 409);
@@ -235,7 +250,7 @@ export const decideLeaveRequest = async (context: AccessContext, id: string, inp
   return await loadOne(sql, context, id);
 };
 
-/** Owner cancels a PENDING/APPROVED request before it starts; ADMIN may cancel anytime. */
+/** Owner or ADMIN cancels a PENDING/APPROVED request, only before it starts (PD-059). */
 export const cancelLeaveRequest = async (context: AccessContext, id: string) => {
   assertProductionMember(context);
   const viewer = viewerOf(context);
@@ -256,7 +271,7 @@ export const cancelLeaveRequest = async (context: AccessContext, id: string) => 
     }
     if (!canCancelLeave({ status: current.status, fromDate: current.from_date, own }, viewer)) {
       throw current.status === "PENDING" || current.status === "APPROVED"
-        ? new AppError("LEAVE_ALREADY_STARTED", "Đơn nghỉ đã bắt đầu nên không thể tự huỷ. Vui lòng liên hệ Quản trị.", 409)
+        ? new AppError("LEAVE_ALREADY_STARTED", "Đơn nghỉ đã diễn ra nên không thể huỷ — chỉ huỷ được đơn nghỉ từ ngày mai trở đi.", 409)
         : new AppError("LEAVE_NOT_CANCELLABLE", "Đơn nghỉ này đã bị từ chối hoặc đã huỷ.", 409);
     }
     await tx`
@@ -267,6 +282,85 @@ export const cancelLeaveRequest = async (context: AccessContext, id: string) => 
   });
   publishLeaveChanged(org(context));
   return await loadOne(sql, context, id);
+};
+
+// Payroll attendance export (PD-057) ------------------------------------------------------------
+
+/** PD-057: only Quản trị (production ADMIN, organization superadmins included) exports; non-members get 404. */
+export const assertLeaveExporter = (context: AccessContext) => {
+  assertProductionMember(context);
+  if (!isProductionAdmin(context)) {
+    throw new AppError("FORBIDDEN", "Chỉ Quản trị mới xuất được bảng chấm công nghỉ phép.", 403);
+  }
+};
+
+type AttendanceMemberRow = { user_id: string; display_name: string; email: string | null; team_name: string | null };
+
+/**
+ * GET /production/leave/export — the attendance workbook of [from, to] (PD-057): every active member holding a
+ * production role (of `teamId`'s team when given; anyone else with APPROVED leave in the window is added) × every
+ * day from APPROVED requests, plus the APPROVED / PENDING / REJECTED requests overlapping the window. Everything is
+ * loaded and the file built before anything is sent, so every failure is a JSON error.
+ */
+export const exportLeaveAttendance = async (context: AccessContext, res: Response, query: LeaveExportQuery) => {
+  assertLeaveExporter(context);
+  assertValidCalendarWindow(query.from, query.to, "xuất");
+  const sql = getSql();
+  const organizationId = org(context);
+  const teamId = query.teamId ?? null;
+  let teamName: string | null = null;
+  if (teamId) {
+    const team = (await sql<{ name: string }[]>`SELECT name FROM production.teams WHERE organization_id = ${organizationId} AND id = ${teamId}`)[0];
+    if (!team) {
+      throw new AppError("TEAM_NOT_FOUND", "Không tìm thấy team.", 404);
+    }
+    teamName = team.name;
+  }
+  const [members, rows] = await Promise.all([
+    sql<AttendanceMemberRow[]>`
+      SELECT au.id AS user_id, au.display_name, au.email, tm.name AS team_name
+      FROM public.organization_memberships om
+      JOIN public.app_users au ON au.id = om.user_id AND au.deleted_at IS NULL
+      LEFT JOIN production.member_profiles mp ON mp.organization_id = om.organization_id AND mp.user_id = om.user_id
+      LEFT JOIN production.teams tm ON tm.organization_id = om.organization_id AND tm.id = mp.team_id
+      WHERE om.organization_id = ${organizationId} AND om.deleted_at IS NULL AND om.status = 'active'
+        AND EXISTS (SELECT 1 FROM production.user_roles ur WHERE ur.organization_id = om.organization_id AND ur.user_id = om.user_id)
+        AND (${teamId}::uuid IS NULL OR mp.team_id = ${teamId}::uuid)
+        AND ${visibleUserSql(sql, context)}
+      ORDER BY au.display_name, au.id
+      LIMIT 2000
+    `,
+    selectLeaves(
+      sql,
+      organizationId,
+      sql`lr.status IN ('APPROVED', 'PENDING', 'REJECTED') AND lr.from_date <= ${query.to}::date AND lr.to_date >= ${query.from}::date
+        AND (${teamId}::uuid IS NULL OR mp.team_id = ${teamId}::uuid) AND ${visibleUserSql(sql, context)}`
+    )
+  ]);
+  await sendLeaveAttendanceWorkbook(res, {
+    from: query.from,
+    to: query.to,
+    teamName,
+    exportedAt: new Date(),
+    exporterName: context.user.displayName,
+    people: members.map((row) => ({ userId: row.user_id, displayName: row.display_name, email: row.email, teamName: row.team_name })),
+    requests: rows.map((row) => {
+      const owner = toUserRef(row.owner)!;
+      return {
+        userId: row.user_id,
+        person: { userId: row.user_id, displayName: owner.displayName, email: owner.email, teamName: row.team_name },
+        fromDate: row.from_date,
+        toDate: row.to_date,
+        part: row.part,
+        status: row.status,
+        note: row.note,
+        deciderName: toUserRef(row.decider)?.displayName ?? null,
+        decidedAt: row.decided_at,
+        decisionNote: row.decision_note,
+        createdAt: row.created_at
+      };
+    })
+  });
 };
 
 // KPI pro-rata (settings.kpi_prorate_leave) -----------------------------------------------------

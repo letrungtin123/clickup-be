@@ -10,6 +10,7 @@ import { getSql } from "../../db/client.js";
 import { AppError } from "../../lib/app-error.js";
 import { toIso, type QuerySql } from "../../lib/db-types.js";
 import type { AccessContext } from "../access/access-context.js";
+import { visibleUserIdSql, type TestAccountViewer } from "../access/test-accounts.js";
 import { assertProductionRole, isProductionAdmin } from "./access.js";
 import { loadSettings } from "./catalog.service.js";
 
@@ -17,7 +18,8 @@ import { loadSettings } from "./catalog.service.js";
  * Anomalies report (SPEC Phase 5 §5, PLAN §10) — LEADER: tasks of the jobs they lead; ADMIN: every job.
  * Window: the last `days` days (default 30) by first Done (tasks) / recording time (scores).
  *  - QTY_MISMATCH: Done with qty_done ≠ qty_assigned; who set the quantity = latest QTY correction log,
- *    else the Done log that recorded it. Key "<task>:<qty_done>" (a new correction shows it again).
+ *    else the Done log that recorded it. Key "<task>:<qty_done>" (a new correction shows it again). PD-058: a task
+ *    without a quantity ("chưa có số lượng") is never a mismatch; one filled in at Done gets the same number twice.
  *  - QC_FAIL_REPEAT: qc_fail_count ≥ 2. Key "<task>:<count>".
  *  - WORKER_FAIL_RATE: per assignee over tasks Done in the window, fb_rate (FB_WRONG / tasks) or
  *    qc_fail_rate (tasks failed by QC at least once / tasks) strictly above settings.anomalyFailRate.
@@ -39,12 +41,25 @@ const taskRef = (row: TaskCols) => ({ id: row.task_id, number: Number(row.task_n
 
 type ReviewRow = { kind: AnomalyKind; subject_key: string; reviewed_at: Date; note: string | null; reviewer: UserCols | null };
 
+/**
+ * Whose anomalies: `leaderId` a Leader's jobs (null: every job, ADMIN); `viewer` (PD-063): for a viewer who is not a
+ * temporary QA test account, the jobs test accounts created and the tasks they work on are left out.
+ */
+type AnomalyScope = { leaderId: string | null; viewer: TestAccountViewer };
+
+const scopeOf = (context: AccessContext): AnomalyScope => ({
+  leaderId: isProductionAdmin(context) ? null : context.user.id,
+  viewer: { isTestAccount: context.isTestAccount }
+});
+
 /** A Leader's jobs: the ones they lead and the ones without a leader (every Leader leads those, PD-035). */
-const leaderScope = (sql: QuerySql, leaderId: string | null) => (leaderId ? sql`AND (j.leader_id = ${leaderId} OR j.leader_id IS NULL)` : sql``);
+const leaderScope = (sql: QuerySql, scope: AnomalyScope) =>
+  sql`${scope.leaderId ? sql`AND (j.leader_id = ${scope.leaderId} OR j.leader_id IS NULL)` : sql``}
+    AND ${visibleUserIdSql(sql, scope.viewer, sql`j.created_by`)} AND ${visibleUserIdSql(sql, scope.viewer, sql`t.assignee_id`)}`;
 
 type Draft = Omit<Anomaly, "reviewed"> & { reviewed?: never };
 
-const queryQtyMismatch = async (sql: QuerySql, organizationId: string, since: Date, leaderId: string | null, _threshold: number, subjectId: string | null = null): Promise<Draft[]> => {
+const queryQtyMismatch = async (sql: QuerySql, organizationId: string, since: Date, scope: AnomalyScope, _threshold: number, subjectId: string | null = null): Promise<Draft[]> => {
   const rows = await sql<
     (TaskCols & { assignee: UserCols; qty_assigned: number; qty_done: number; done_at: Date; changed_by: UserCols | null; changed_at: Date | null; action: string | null })[]
   >`
@@ -65,8 +80,9 @@ const queryQtyMismatch = async (sql: QuerySql, organizationId: string, since: Da
       LIMIT 1
     ) lg ON true
     LEFT JOIN public.app_users uc ON uc.id = lg.user_id
-    WHERE t.organization_id = ${organizationId} AND t.deleted_at IS NULL AND t.done_at >= ${since} AND t.qty_done IS NOT NULL AND t.qty_done <> t.qty_assigned
-      ${leaderScope(sql, leaderId)} ${subjectId ? sql`AND t.id = ${subjectId}` : sql``}
+    WHERE t.organization_id = ${organizationId} AND t.deleted_at IS NULL AND t.done_at >= ${since} AND t.qty_done IS NOT NULL
+      AND t.qty_assigned IS NOT NULL AND t.qty_done <> t.qty_assigned
+      ${leaderScope(sql, scope)} ${subjectId ? sql`AND t.id = ${subjectId}` : sql``}
     ORDER BY t.done_at DESC, t.id
     LIMIT ${perKindLimit + 1}
   `;
@@ -85,7 +101,7 @@ const queryQtyMismatch = async (sql: QuerySql, organizationId: string, since: Da
   }));
 };
 
-const queryQcFailRepeat = async (sql: QuerySql, organizationId: string, since: Date, leaderId: string | null, _threshold: number, subjectId: string | null = null): Promise<Draft[]> => {
+const queryQcFailRepeat = async (sql: QuerySql, organizationId: string, since: Date, scope: AnomalyScope, _threshold: number, subjectId: string | null = null): Promise<Draft[]> => {
   const rows = await sql<
     (TaskCols & { assignee: UserCols; qc_fail_count: number; updated_at: Date; status_id: string; status_code: string; status_name: string; status_color: string })[]
   >`
@@ -97,7 +113,7 @@ const queryQcFailRepeat = async (sql: QuerySql, organizationId: string, since: D
     JOIN production.statuses s ON s.organization_id = t.organization_id AND s.id = t.status_id
     JOIN public.app_users ua ON ua.id = t.assignee_id
     WHERE t.organization_id = ${organizationId} AND t.deleted_at IS NULL AND t.done_at >= ${since} AND t.qc_fail_count >= 2
-      ${leaderScope(sql, leaderId)} ${subjectId ? sql`AND t.id = ${subjectId}` : sql``}
+      ${leaderScope(sql, scope)} ${subjectId ? sql`AND t.id = ${subjectId}` : sql``}
     ORDER BY t.updated_at DESC, t.id
     LIMIT ${perKindLimit + 1}
   `;
@@ -118,7 +134,7 @@ const queryWorkerFailRate = async (
   sql: QuerySql,
   organizationId: string,
   since: Date,
-  leaderId: string | null,
+  scope: AnomalyScope,
   threshold: number,
   subjectId: string | null = null
 ): Promise<Draft[]> => {
@@ -134,7 +150,7 @@ const queryWorkerFailRate = async (
         max(t.done_at) AS last_done
       FROM production.tasks t
       JOIN production.jobs j ON j.organization_id = t.organization_id AND j.id = t.job_id
-      WHERE t.organization_id = ${organizationId} AND t.deleted_at IS NULL AND t.done_at >= ${since} ${leaderScope(sql, leaderId)}
+      WHERE t.organization_id = ${organizationId} AND t.deleted_at IS NULL AND t.done_at >= ${since} ${leaderScope(sql, scope)}
         ${subjectId ? sql`AND t.assignee_id = ${subjectId}` : sql``}
       GROUP BY t.assignee_id
     ) a
@@ -158,7 +174,7 @@ const queryWorkerFailRate = async (
   }));
 };
 
-const queryFastDone = async (sql: QuerySql, organizationId: string, since: Date, leaderId: string | null, _threshold: number, subjectId: string | null = null): Promise<Draft[]> => {
+const queryFastDone = async (sql: QuerySql, organizationId: string, since: Date, scope: AnomalyScope, _threshold: number, subjectId: string | null = null): Promise<Draft[]> => {
   const rows = await sql<(TaskCols & { assignee: UserCols; assigned_at: Date; done_at: Date; qty_done: number | null; seconds: string })[]>`
     SELECT t.id AS task_id, t.number::text AS task_number, t.job_id, j.code AS job_code,
       json_build_object('id', ua.id, 'display_name', ua.display_name, 'email', ua.email, 'avatar_url', ua.avatar_url) AS assignee,
@@ -168,7 +184,7 @@ const queryFastDone = async (sql: QuerySql, organizationId: string, since: Date,
     JOIN public.app_users ua ON ua.id = t.assignee_id
     WHERE t.organization_id = ${organizationId} AND t.deleted_at IS NULL AND t.done_at >= ${since}
       AND t.done_at <= t.assigned_at + make_interval(mins => ${fastDoneMinutes})
-      ${leaderScope(sql, leaderId)} ${subjectId ? sql`AND t.id = ${subjectId}` : sql``}
+      ${leaderScope(sql, scope)} ${subjectId ? sql`AND t.id = ${subjectId}` : sql``}
     ORDER BY t.done_at DESC, t.id
     LIMIT ${perKindLimit + 1}
   `;
@@ -185,7 +201,7 @@ const queryFastDone = async (sql: QuerySql, organizationId: string, since: Date,
   }));
 };
 
-const queryMissingRule = async (sql: QuerySql, organizationId: string, since: Date, leaderId: string | null, _threshold: number, subjectId: string | null = null): Promise<Draft[]> => {
+const queryMissingRule = async (sql: QuerySql, organizationId: string, since: Date, scope: AnomalyScope, _threshold: number, subjectId: string | null = null): Promise<Draft[]> => {
   const rows = await sql<
     (TaskCols & { entry_id: string; earner: UserCols; role: "WORKER" | "QC"; project_code: string; process_name: string | null; qty: number; business_day: string; created_at: Date })[]
   >`
@@ -200,7 +216,7 @@ const queryMissingRule = async (sql: QuerySql, organizationId: string, since: Da
     JOIN public.app_users u ON u.id = e.user_id
     WHERE e.organization_id = ${organizationId} AND t.deleted_at IS NULL AND e.credit_rule_id IS NULL AND e.adjusts_entry_id IS NULL
       AND e.created_at >= ${since} AND e.kind <> 'FB_WRONG'
-      ${leaderScope(sql, leaderId)} ${subjectId ? sql`AND e.id = ${subjectId}` : sql``}
+      ${leaderScope(sql, scope)} ${subjectId ? sql`AND e.id = ${subjectId}` : sql``}
     ORDER BY e.created_at DESC, e.id
     LIMIT ${perKindLimit + 1}
   `;
@@ -220,7 +236,7 @@ const queryMissingRule = async (sql: QuerySql, organizationId: string, since: Da
 
 const kindQueries: Record<
   AnomalyKind,
-  (sql: QuerySql, organizationId: string, since: Date, leaderId: string | null, threshold: number, subjectId?: string | null) => Promise<Draft[]>
+  (sql: QuerySql, organizationId: string, since: Date, scope: AnomalyScope, threshold: number, subjectId?: string | null) => Promise<Draft[]>
 > = {
   QTY_MISMATCH: queryQtyMismatch,
   QC_FAIL_REPEAT: queryQcFailRepeat,
@@ -237,13 +253,14 @@ export const listAnomalies = async (
   assertProductionRole(context, "LEADER");
   const sql = getSql();
   const organizationId = org(context);
-  const leaderId = isProductionAdmin(context) ? null : context.user.id;
+  const scope = scopeOf(context);
+  const leaderId = scope.leaderId;
   const settings = await loadSettings(sql, organizationId);
   const threshold = settings.anomalyFailRate;
   const since = new Date(Date.now() - query.days * 86_400_000);
   const kinds = query.kind ? [query.kind] : [...anomalyKinds];
 
-  const results = await Promise.all(kinds.map((kind) => kindQueries[kind](sql, organizationId, since, leaderId, threshold)));
+  const results = await Promise.all(kinds.map((kind) => kindQueries[kind](sql, organizationId, since, scope, threshold)));
   const truncated = results.some((rows) => rows.length > perKindLimit);
   const drafts = results.flatMap((rows) => rows.slice(0, perKindLimit));
 
@@ -326,7 +343,7 @@ export const workerFailRateKeys = (userId: string, tasks: readonly WorkerTaskSam
  */
 const resolveOwnAnomaly = async (sql: QuerySql, context: AccessContext, kind: AnomalyKind, key: string): Promise<string | null> => {
   const organizationId = org(context);
-  const leaderId = isProductionAdmin(context) ? null : context.user.id;
+  const scope = scopeOf(context);
   const subjectId = key.slice(0, 36);
   const threshold = (await loadSettings(sql, organizationId)).anomalyFailRate;
   const now = new Date();
@@ -336,7 +353,7 @@ const resolveOwnAnomaly = async (sql: QuerySql, context: AccessContext, kind: An
       SELECT t.done_at, t.kind = 'FB_WRONG' AS fb_wrong, t.qc_fail_count > 0 AS qc_failed
       FROM production.tasks t
       JOIN production.jobs j ON j.organization_id = t.organization_id AND j.id = t.job_id
-      WHERE t.organization_id = ${organizationId} AND t.deleted_at IS NULL AND t.assignee_id = ${subjectId} AND t.done_at >= ${since} ${leaderScope(sql, leaderId)}
+      WHERE t.organization_id = ${organizationId} AND t.deleted_at IS NULL AND t.assignee_id = ${subjectId} AND t.done_at >= ${since} ${leaderScope(sql, scope)}
     `;
     const samples = rows.map((row) => ({ doneAt: row.done_at, fbWrong: row.fb_wrong, qcFailed: row.qc_failed }));
     if (!workerFailRateKeys(subjectId, samples, now, threshold).has(key)) {
@@ -344,7 +361,7 @@ const resolveOwnAnomaly = async (sql: QuerySql, context: AccessContext, kind: An
     }
     return null;
   }
-  const match = (await kindQueries[kind](sql, organizationId, since, leaderId, threshold, subjectId)).find((draft) => draft.key === key);
+  const match = (await kindQueries[kind](sql, organizationId, since, scope, threshold, subjectId)).find((draft) => draft.key === key);
   if (!match) {
     throw anomalyNotFound();
   }

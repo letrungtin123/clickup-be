@@ -98,8 +98,11 @@ export const assertValidNewLeave = (span: LeaveSpan, today: string) => {
   }
 };
 
-/** Validates a calendar window. Throws AppError (400) with a Vietnamese message. */
-export const assertValidCalendarWindow = (from: string, to: string) => {
+/**
+ * Validates a calendar window — the calendar (`action` "xem") and the attendance export ("xuất", PD-057), at most
+ * leaveLimits.maxCalendarDays inclusive days. Throws AppError (400) with a Vietnamese message.
+ */
+export const assertValidCalendarWindow = (from: string, to: string, action: "xem" | "xuất" = "xem") => {
   if (!isValidDay(from) || !isValidDay(to)) {
     throw invalid("LEAVE_DATE_INVALID", "Khoảng ngày không hợp lệ.");
   }
@@ -107,18 +110,24 @@ export const assertValidCalendarWindow = (from: string, to: string) => {
     throw invalid("LEAVE_RANGE_INVALID", "Ngày kết thúc phải sau hoặc trùng ngày bắt đầu.");
   }
   if (dayDiff(from, to) + 1 > leaveLimits.maxCalendarDays) {
-    throw invalid("LEAVE_WINDOW_TOO_LONG", `Chỉ xem được tối đa ${leaveLimits.maxCalendarDays} ngày mỗi lần.`);
+    throw invalid("LEAVE_WINDOW_TOO_LONG", `Chỉ ${action} được tối đa ${leaveLimits.maxCalendarDays} ngày mỗi lần.`);
   }
 };
 
-/** Owner may cancel before the leave starts; ADMIN anytime. Only PENDING/APPROVED requests are cancellable. */
+/**
+ * Only a leave that has not started yet can be cancelled (PD-059, owner 2026-10-16: a past or ongoing leave has
+ * happened, it stays on record — ADMIN included): its owner or an ADMIN, PENDING/APPROVED requests only.
+ */
 export const canCancelLeave = (
   request: { status: string; fromDate: string; own: boolean },
   viewer: { admin: boolean; today: string }
 ) =>
   (request.status === "PENDING" || request.status === "APPROVED") &&
-  (viewer.admin || (request.own && request.fromDate > viewer.today));
+  request.fromDate > viewer.today &&
+  (viewer.admin || request.own);
 
-/** LEADER/ADMIN decide PENDING requests; a LEADER never decides their own (ADMIN may). */
-export const canDecideLeave = (request: { status: string; own: boolean }, viewer: { admin: boolean; leader: boolean }) =>
-  request.status === "PENDING" && (viewer.admin || (viewer.leader && !request.own));
+/**
+ * Only ADMIN (organization superadmins included) decides, and only PENDING requests — their own too (PD-057:
+ * Leaders no longer approve; they still see pending requests read-only).
+ */
+export const canDecideLeave = (request: { status: string }, viewer: { admin: boolean }) => request.status === "PENDING" && viewer.admin;

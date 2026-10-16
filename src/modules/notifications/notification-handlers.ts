@@ -1,6 +1,7 @@
 import { getSql } from "../../db/client.js";
 import { logger } from "../../lib/logger.js";
 import { departmentMemberSql } from "../access/departments.js";
+import { splitMentionNotifications } from "../chat/chat-rules.js";
 import type { DomainEventEnvelope } from "../events/outbox.js";
 import { knowledgeNotificationHandlers } from "../knowledge/notifications.js";
 import { productionNotificationHandlers } from "../production/notifications.js";
@@ -150,10 +151,38 @@ const withNotifyLevel = async (
   });
 };
 
-const notifyChatMentions = async (event: DomainEventEnvelope, mentioned: string[]) => {
+/**
+ * @all (PD-061): the current members of the conversation (not the author) when `wanted` and the message still mentions
+ * everyone (public / private channel or group DM; never a 1:1 DM). Notify levels do not apply.
+ */
+const mentionAllMembers = async (event: DomainEventEnvelope, wanted: boolean) => {
   const channelId = str(event.payload.channelId);
   const messageId = str(event.payload.messageId) ?? event.aggregateId;
-  if (mentioned.length === 0 || !channelId || !messageId) {
+  if (!wanted || !channelId || !messageId) {
+    return [];
+  }
+  const rows = await getSql()<{ user_id: string }[]>`
+    SELECT cm.user_id
+    FROM public.channel_members cm
+    JOIN public.channels c
+      ON c.organization_id = cm.organization_id AND c.id = cm.channel_id AND c.deleted_at IS NULL AND c.kind <> 'dm'
+    JOIN public.messages m
+      ON m.organization_id = cm.organization_id AND m.id = ${messageId} AND m.channel_id = c.id
+      AND m.mentions_all AND m.deleted_at IS NULL
+    WHERE cm.organization_id = ${event.organizationId} AND cm.channel_id = ${channelId} AND cm.deleted_at IS NULL
+  `;
+  const author = str(event.payload.authorId) ?? event.actorUserId;
+  return rows.map((row) => row.user_id).filter((id) => id !== author);
+};
+
+/**
+ * `chat.mentioned`, one per person (PD-061): people mentioned by name keep the usual rules; with @all (`everyone`) every
+ * other member gets one too, payload.all = true, whatever their notify level ("none" included).
+ */
+const notifyChatMentions = async (event: DomainEventEnvelope, mentioned: string[], everyone: string[] = []) => {
+  const channelId = str(event.payload.channelId);
+  const messageId = str(event.payload.messageId) ?? event.aggregateId;
+  if ((mentioned.length === 0 && everyone.length === 0) || !channelId || !messageId) {
     return;
   }
   const chat = await loadChatMessage(event, channelId, messageId);
@@ -161,28 +190,49 @@ const notifyChatMentions = async (event: DomainEventEnvelope, mentioned: string[
     return;
   }
   // Public channels may notify non-members, but only people whose role can see channels at all.
-  // Private conversations only notify current members. Members who muted the channel ("none") get nothing.
-  const eligible = chat.kind === "public" ? await filterByPermission(event.organizationId, mentioned, "channel.view") : mentioned;
-  const recipients = await withNotifyLevel(event, channelId, eligible, ["all", "mentions"], { nonMembers: chat.kind === "public" });
-  await deliverNotifications({
+  // Private conversations only notify current members. Members who muted the channel ("none") get nothing for a
+  // mention by name (@all still reaches them).
+  const eligible =
+    mentioned.length === 0
+      ? []
+      : chat.kind === "public"
+        ? await filterByPermission(event.organizationId, mentioned, "channel.view")
+        : mentioned;
+  const named = await withNotifyLevel(event, channelId, eligible, ["all", "mentions"], { nonMembers: chat.kind === "public" });
+  const actorUserId = str(event.payload.authorId) ?? event.actorUserId;
+  const recipients = splitMentionNotifications(named, everyone, actorUserId);
+  const common = {
     organizationId: event.organizationId,
-    recipientIds: recipients,
-    type: "chat.mentioned",
-    actorUserId: str(event.payload.authorId) ?? event.actorUserId,
+    type: "chat.mentioned" as const,
+    actorUserId,
     title: chat.name ?? "Direct message",
     body: chat.text,
     channelId,
     messageId,
-    payload: { channelKind: chat.kind, threadRootId: chat.threadRootId },
+    // One key for both: a person never gets the named and the @all notification of the same message.
     dedupeKey: `evt:${event.id}:mention`
-  });
+  };
+  if (recipients.named.length > 0) {
+    await deliverNotifications({
+      ...common,
+      recipientIds: recipients.named,
+      payload: { channelKind: chat.kind, threadRootId: chat.threadRootId }
+    });
+  }
+  if (recipients.all.length > 0) {
+    await deliverNotifications({
+      ...common,
+      recipientIds: recipients.all,
+      payload: { channelKind: chat.kind, threadRootId: chat.threadRootId, all: true }
+    });
+  }
 };
 
 /**
- * A thread reply notifies the root author and earlier repliers (minus anyone already @mentioned) who are
- * still members and keep the channel on "all".
+ * A thread reply notifies the root author and earlier repliers (minus anyone already @mentioned, by name or with @all)
+ * who are still members and keep the channel on "all".
  */
-const notifyThreadParticipants = async (event: DomainEventEnvelope) => {
+const notifyThreadParticipants = async (event: DomainEventEnvelope, mentionedIds: string[]) => {
   const channelId = str(event.payload.channelId);
   const messageId = str(event.payload.messageId) ?? event.aggregateId;
   const threadRootId = str(event.payload.threadRootId);
@@ -200,7 +250,7 @@ const notifyThreadParticipants = async (event: DomainEventEnvelope) => {
       AND deleted_at IS NULL AND kind = 'user'
     LIMIT 200
   `;
-  const mentioned = new Set(strArray(event.payload.mentionedUserIds));
+  const mentioned = new Set(mentionedIds);
   const candidates = participants.map((row) => row.author_user_id).filter((id) => !mentioned.has(id));
   await deliverNotifications({
     organizationId: event.organizationId,
@@ -350,8 +400,10 @@ const handlers: Record<string, Handler> = {
   },
 
   "chat.message.created": async (event) => {
-    await notifyChatMentions(event, strArray(event.payload.mentionedUserIds));
-    await notifyThreadParticipants(event);
+    const mentioned = strArray(event.payload.mentionedUserIds);
+    const everyone = await mentionAllMembers(event, event.payload.mentionsAll === true);
+    await notifyChatMentions(event, mentioned, everyone);
+    await notifyThreadParticipants(event, [...mentioned, ...everyone]);
   },
 
   "chat.message.updated": async (event) => {
@@ -370,7 +422,10 @@ const handlers: Record<string, Handler> = {
       }
       await refreshNotificationExcerpts({ organizationId: event.organizationId, messageId, excerpt: current.text });
     }
-    await notifyChatMentions(event, strArray(event.payload.addedMentionUserIds));
+    // @all added by the edit (PD-061): the members the previous version did not mention yet.
+    const previous = new Set(strArray(event.payload.previousMentionUserIds));
+    const everyone = (await mentionAllMembers(event, event.payload.mentionsAllAdded === true)).filter((id) => !previous.has(id));
+    await notifyChatMentions(event, strArray(event.payload.addedMentionUserIds), everyone);
   },
 
   "chat.message.deleted": async (event) => {

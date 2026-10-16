@@ -271,9 +271,12 @@ const customFilterRows = (fields: readonly ExportField[], filters: readonly Cust
 
 // Jobs -------------------------------------------------------------------------------------------------
 
-/** "Người làm" cell: "Name · 25 tấm, Other · 10 tấm" (most images first, like the list). */
+/**
+ * "Người làm" cell: "Name · 25 tấm, Other · 10 tấm" (most images first, like the list). PD-058: someone whose tasks have no
+ * quantity yet is listed by name only.
+ */
 export const workersCell = (workers: readonly JobWorker[]): CellValue =>
-  workers.length > 0 ? workers.map((worker) => `${worker.user.displayName} · ${worker.qty} tấm`).join(", ") : null;
+  workers.length > 0 ? workers.map((worker) => (worker.qty > 0 ? `${worker.user.displayName} · ${worker.qty} tấm` : worker.user.displayName)).join(", ") : null;
 
 /** Per-person view (`personId`): the person's columns, next to the job totals. */
 export const personColumns = (name: string): SheetColumn[] => [
@@ -322,7 +325,8 @@ type WorkLogRow = {
   assigned_at: Date;
   deadline: Date;
   shift: string;
-  qty_assigned: number;
+  /** null: no quantity yet (PD-058) — an empty "Số lượng" cell. */
+  qty_assigned: number | null;
   error_qty: number | null;
   ot_hours: string | null;
   note: string | null;

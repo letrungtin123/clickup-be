@@ -119,11 +119,12 @@ export type TransitionOption = { toStatusId: string; requiresNote: boolean; over
 
 /**
  * Moves the caller may make from `fromStatusId`: listed transitions whose actor matches the caller and
- * whose target status the caller's roles may set. ADMIN may additionally force any move (override,
- * reason required). SYSTEM-only transitions are never offered to people, nor are moves into a
+ * whose target status the caller's roles may set. PD-064 (owner, 2026-10-16): there is no ADMIN override any more —
+ * a Quản trị moves a task along the same flow as everyone (as its assignee, QC, job leader or through role-based steps
+ * such as Account's). SYSTEM-only transitions are never offered to people, nor are moves into a
  * system-only status (FEEDBACK), moves out of FEEDBACK while the job's feedback is open (closing it
  * releases the tasks), or any move of an archived job's task. For one line (`scope` "task", the default) a job-level
- * target (Complete, PD-044) is offered only as an ADMIN override; the job's own action (`scope` "job") offers it as listed.
+ * target (Complete, PD-044) is never offered; the job's own action (`scope` "job") offers it as listed.
  */
 export const allowedTransitions = (
   workflow: Workflow,
@@ -148,13 +149,6 @@ export const allowedTransitions = (
     }
     if (transition.actors.some((actor) => actorMatches(actor, relation)) && holdsSetByRole(target, relation)) {
       options.set(target.id, { toStatusId: target.id, requiresNote: transition.requiresNote, override: false });
-    }
-  }
-  if (relation.roles.has("ADMIN")) {
-    for (const status of workflow.statuses) {
-      if (peopleMayEnter(status) && status.id !== fromStatusId && !options.has(status.id)) {
-        options.set(status.id, { toStatusId: status.id, requiresNote: true, override: true });
-      }
     }
   }
   return [...options.values()].sort(
@@ -350,7 +344,14 @@ export const feedbackTaskDeadline = (input: {
 
 // Task lines ------------------------------------------------------------------------------------------
 
-export type TaskLineInput = { assigneeId: string; qcId?: string | null | undefined; processId: string; shiftId: string; qtyAssigned: number };
+/** `qtyAssigned` null / omitted: no quantity yet ("chưa có số lượng", PD-058) — a line is valid without one. */
+export type TaskLineInput = {
+  assigneeId: string;
+  qcId?: string | null | undefined;
+  processId: string;
+  shiftId: string;
+  qtyAssigned?: number | null | undefined;
+};
 
 export type TaskLineContext = {
   memberRoles: ReadonlyMap<string, ReadonlySet<ProductionRole>>;
@@ -433,6 +434,20 @@ export const assertDeclaredDoneQty = (qtyAssigned: number, qtyDone: number) => {
     );
   }
 };
+
+/**
+ * PD-058 Done needs quantities: a task (the line or one of its live subtasks) without a quantity (qty_assigned null) enters
+ * Done only with a number ≥ 1 in the same request (`qtyDone` for the line, `subtaskQtyDone` for a subtask) — it becomes both
+ * its qty_assigned and its qty_done. Returns the ids of the tasks still missing one (input order); empty = fine.
+ */
+export const tasksMissingDoneQty = (tasks: readonly { id: string; qtyAssigned: number | null; declared: number | undefined }[]) =>
+  tasks.filter((task) => task.qtyAssigned === null && (task.declared === undefined || task.declared < 1)).map((task) => task.id);
+
+export const taskQtyRequiredMessage = "Nhập số lượng trước khi chuyển Done.";
+
+/** 400 TASK_QTY_REQUIRED with `details.taskIds` (the tasks without a quantity, PD-058). */
+export const taskQtyRequiredError = (taskIds: readonly string[]) =>
+  new AppError("TASK_QTY_REQUIRED", taskQtyRequiredMessage, 400, { taskIds: [...taskIds] });
 
 /**
  * PD-044 subtask process: active, not the QC process ("Checking" is its own line, PD-037) and not its line's own.

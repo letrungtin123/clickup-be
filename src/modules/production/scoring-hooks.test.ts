@@ -192,3 +192,24 @@ describe("PD-036 — deleting a line reverses its entries", () => {
     expect(inserts()).toHaveLength(0);
   });
 });
+
+describe("PD-058 — a quantity filled in at Done", () => {
+  it("the entry is priced on the number given at Done (it became both qty_assigned and qty_done)", async () => {
+    db.state.handler = answer(line({ assignee_id: worker, qc_id: qcPerson, process_id: retouchProcess, process_is_qc: false, qty_assigned: 120, qty_done: 120 }));
+    await onTaskStatusEntered(db.sql as never, { organizationId: org, taskId, status: { id: "DONE", countsDone: true, countsChecked: false }, at });
+    expect(inserts()).toHaveLength(1);
+    const values = inserts()[0]!.values;
+    expect(values).toContain(120); // qty
+    expect(values).toContain(360); // 3 × 120
+  });
+
+  it("a task that still has no quantity records nothing: 400 TASK_QTY_REQUIRED (never a guessed number in the ledger)", async () => {
+    db.state.handler = answer(line({ qty_assigned: null, qty_done: null }));
+    const error = await onTaskStatusEntered(db.sql as never, { organizationId: org, taskId, status: { id: "DONE", countsDone: true, countsChecked: false }, at }).then(
+      () => null,
+      (caught: unknown) => caught as { code: string; statusCode: number; details: unknown }
+    );
+    expect(error).toMatchObject({ code: "TASK_QTY_REQUIRED", statusCode: 400, details: { taskIds: [taskId] } });
+    expect(inserts()).toHaveLength(0);
+  });
+});

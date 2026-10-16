@@ -11,8 +11,9 @@ import type {
 } from "../../contracts/production-scores.js";
 import { getSql } from "../../db/client.js";
 import { AppError } from "../../lib/app-error.js";
-import { toIso, type QuerySql } from "../../lib/db-types.js";
+import { toIso, type QuerySql, type SqlFragment } from "../../lib/db-types.js";
 import type { AccessContext } from "../access/access-context.js";
+import { visibleUserIdSql, visibleUserSql } from "../access/test-accounts.js";
 import { toUserRef, type UserRefJson } from "../work/mappers.js";
 import { assertConfigEditor, assertProductionAdmin } from "./access.js";
 import { closeDaysOf, loadSettings } from "./catalog.service.js";
@@ -53,7 +54,7 @@ const toTarget = (row: TargetRow): KpiTarget => ({
   updatedAt: toIso(row.updated_at)
 });
 
-const selectTargets = (sql: QuerySql, organizationId: string, filter: { ids?: string[]; until?: string }) => sql<TargetRow[]>`
+const selectTargets = (sql: QuerySql, organizationId: string, filter: { ids?: string[]; until?: string; visible?: SqlFragment }) => sql<TargetRow[]>`
   SELECT k.id, k.user_id, k.period_type, k.target_points::text AS target_points, to_char(k.effective_from, 'YYYY-MM') AS effective_from,
     k.note, k.created_at, k.updated_at,
     CASE WHEN u.id IS NULL THEN NULL
@@ -63,6 +64,7 @@ const selectTargets = (sql: QuerySql, organizationId: string, filter: { ids?: st
   WHERE k.organization_id = ${organizationId}
     ${filter.ids ? sql`AND k.id = ANY(${filter.ids}::uuid[])` : sql``}
     ${filter.until ? sql`AND k.effective_from <= ${filter.until}::date` : sql``}
+    ${filter.visible ? sql`AND ${filter.visible}` : sql``}
   ORDER BY k.user_id, k.period_type, k.effective_from DESC
   LIMIT 20000
 `;
@@ -97,7 +99,10 @@ const upsertTargets = async (sql: QuerySql, organizationId: string, items: Upser
 
 type MemberRow = UserRefJson & { team_id: string | null; roles: string[] | null };
 
-/** GET /production/kpi-targets?year — production members × the 12 monthly periods (+ quarters, year) and history. */
+/**
+ * GET /production/kpi-targets?year — production members × the 12 monthly periods (+ quarters, year) and history.
+ * Temporary QA test accounts (and their targets) are left out for a viewer who is not one (PD-063).
+ */
 export const getKpiTargetMatrix = async (context: AccessContext, query: { year?: number | undefined }): Promise<KpiTargetMatrix> => {
   assertProductionAdmin(context);
   const sql = getSql();
@@ -117,10 +122,11 @@ export const getKpiTargetMatrix = async (context: AccessContext, query: { year?:
       WHERE om.organization_id = ${organizationId} AND om.deleted_at IS NULL AND om.status = 'active'
         AND (EXISTS (SELECT 1 FROM production.user_roles ur WHERE ur.organization_id = om.organization_id AND ur.user_id = au.id)
           OR EXISTS (SELECT 1 FROM production.kpi_targets k WHERE k.organization_id = om.organization_id AND k.user_id = au.id))
+        AND ${visibleUserSql(sql, context)}
       ORDER BY au.display_name, au.id
       LIMIT 2000
     `,
-    selectTargets(sql, organizationId, { until: `${year}-12-01` })
+    selectTargets(sql, organizationId, { until: `${year}-12-01`, visible: visibleUserIdSql(sql, context, sql`k.user_id`) })
   ]);
 
   const history = targetRows.map(toTarget);
@@ -244,7 +250,8 @@ export const importKpiTargets = async (context: AccessContext, input: In<typeof 
 /**
  * POST /production/kpi-targets/apply-defaults — "Áp KPI mặc định theo role": every active member holding
  * STAFF, LEADER or QC without a MONTH target effective for the period gets one starting at that period:
- * settings.kpiDefaultLeader for LEADERs, settings.kpiDefaultMember otherwise.
+ * settings.kpiDefaultLeader for LEADERs, settings.kpiDefaultMember otherwise. A real caller never touches temporary QA
+ * test accounts (PD-063).
  */
 export const applyDefaultKpiTargets = async (context: AccessContext, period: string): Promise<ApplyDefaultKpiResult> => {
   assertConfigEditor(context);
@@ -264,6 +271,7 @@ export const applyDefaultKpiTargets = async (context: AccessContext, period: str
       JOIN production.user_roles ur ON ur.organization_id = om.organization_id AND ur.user_id = om.user_id
         AND ur.role_code IN ('STAFF', 'LEADER', 'QC')
       WHERE om.organization_id = ${organizationId} AND om.deleted_at IS NULL AND om.status = 'active'
+        AND ${visibleUserSql(tx, context)}
       GROUP BY om.organization_id, om.user_id
     `;
     const items: { userId: string; targetPoints: number }[] = [];

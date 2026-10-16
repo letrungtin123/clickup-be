@@ -435,7 +435,8 @@ export const DashboardTaskSchema = z.object({
   assignee: UserRefSchema,
   qc: UserRefSchema.nullable(),
   status: ProductionStatusRefSchema,
-  qtyAssigned: z.number().int(),
+  /** PD-058: null = "chưa có số lượng". */
+  qtyAssigned: z.number().int().nullable(),
   deadline: IsoDate,
   /** Late: minutes past the deadline. Due soon: minutes left. */
   minutes: z.number().int()

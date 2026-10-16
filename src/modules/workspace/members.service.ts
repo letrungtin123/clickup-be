@@ -292,6 +292,29 @@ export const insertOrganizationMemberRecords = async (
   `;
 };
 
+/**
+ * PD-062 (owner, 2026-10-16): only the organization superadmin renames accounts — any member, their own too. The
+ * display name lives in public.app_users (every list, mention label and notification reads it from there).
+ */
+export const renameOrganizationMember = async (context: WorkspaceContext, membershipId: string, displayName: string) => {
+  if (!context.hasFullOrganizationAuthority) {
+    throw new AppError("FORBIDDEN", "Chỉ Siêu quản trị mới đổi được tên tài khoản.", 403);
+  }
+  const sql = getSql();
+  const target = (
+    await sql<{ user_id: string }[]>`
+      SELECT user_id FROM public.organization_memberships
+      WHERE id = ${membershipId} AND organization_id = ${context.organization.id} AND deleted_at IS NULL
+    `
+  )[0];
+  if (!target) {
+    throw new AppError("ORG_MEMBER_NOT_FOUND", "Organization member was not found.", 404);
+  }
+  await sql`UPDATE public.app_users SET display_name = ${displayName} WHERE id = ${target.user_id}`;
+  logger.info({ actorId: context.user.id, targetUserId: target.user_id }, "Member renamed");
+  return await getOrganizationMemberByUserId(context, target.user_id);
+};
+
 export const resetMemberPassword = async (context: WorkspaceContext, membershipId: string) => {
   assertPermission(context, Permission.MemberManage);
   const sql = getSql();

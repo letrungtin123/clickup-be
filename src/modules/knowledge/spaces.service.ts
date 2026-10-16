@@ -31,6 +31,7 @@ import { registerUniqueViolations } from "../../lib/db-errors.js";
 import { rankAtEnd, rankForPlacement } from "../../lib/rank.js";
 import { evictUsersFromRoom, resetRoom } from "../../realtime/publisher.js";
 import type { AccessContext } from "../access/access-context.js";
+import { visibleUserSql } from "../access/test-accounts.js";
 import { businessDate, exportFilename, sendWorkbook } from "../production/excel.js";
 import { toColor, toUserRef, type UserRefJson } from "../work/mappers.js";
 import {
@@ -443,6 +444,7 @@ const toMember = (row: MemberRow): KnowledgeMember => ({
   createdAt: toIso(row.created_at)
 });
 
+/** A space's members. Temporary QA test accounts are left out for a viewer who is not one (PD-063). */
 export const listMembers = async (context: AccessContext, spaceId: string) => {
   requireKnowledgePermission(context, Permission.KnowledgeView);
   const sql = getSql();
@@ -454,6 +456,7 @@ export const listMembers = async (context: AccessContext, spaceId: string) => {
     JOIN public.organization_memberships om
       ON om.organization_id = sm.organization_id AND om.user_id = sm.user_id AND om.status = 'active' AND om.deleted_at IS NULL
     WHERE sm.space_id = ${spaceId} AND sm.organization_id = ${context.organization.id}
+      AND ${visibleUserSql(sql, context)}
     ORDER BY CASE sm.access_level WHEN 'manage' THEN 1 WHEN 'submit' THEN 2 ELSE 3 END, au.display_name, au.id
     LIMIT 2000
   `;

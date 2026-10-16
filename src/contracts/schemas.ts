@@ -258,7 +258,13 @@ export const WorkspaceContextSchema = z.object({
   /** Departments the user belongs to (PD-041), stable order; a superadmin implicitly belongs to all. */
   departments: z.array(DepartmentSchema).default([]),
   /** More than one department: the header shows the department switcher. */
-  canSwitchDepartment: z.boolean().default(false)
+  canSwitchDepartment: z.boolean().default(false),
+  /**
+   * Temporary QA test account (PD-063, public.app_users.is_test_account). A viewer who is not one never sees test
+   * accounts or the jobs / channels they created in any listing; a test account sees everyone. Absent = real account.
+   * Server-side only: GET /workspace/context leaves it out.
+   */
+  isTestAccount: z.boolean().optional()
 });
 
 /**
@@ -269,7 +275,7 @@ export const WorkspaceContextSchema = z.object({
 export const NotificationChannelsSchema = z.object({ notifyWeb: z.boolean(), notifyEmail: z.boolean() });
 
 /** GET /workspace/context response: the access context plus `notificationPreferences` (read fresh, not cached). */
-export const WorkspaceSessionSchema = WorkspaceContextSchema.extend({
+export const WorkspaceSessionSchema = WorkspaceContextSchema.omit({ isTestAccount: true }).extend({
   notificationPreferences: NotificationChannelsSchema.default({ notifyWeb: true, notifyEmail: false }),
   /**
    * The department shown (PD-041), remembered per user (PUT /workspace/department) and read fresh: the saved choice when
@@ -303,6 +309,13 @@ export const ChangePasswordRequestSchema = z
     message: "The new password must be different.",
     path: ["newPassword"]
   });
+
+/**
+ * PATCH /organization/members/:membershipId/display-name (PD-062): the organization superadmin renames an account —
+ * anyone's, their own included. Same rule as the name given at creation.
+ */
+export const RenameOrganizationMemberRequestSchema = z.object({ displayName: SafeLineSchema(160) }).strict();
+export type RenameOrganizationMemberRequest = z.infer<typeof RenameOrganizationMemberRequestSchema>;
 
 export const CreateOrganizationMemberRequestSchema = z
   .object({

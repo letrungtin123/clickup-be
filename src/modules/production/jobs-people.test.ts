@@ -128,6 +128,7 @@ const jobRow = (overrides: Partial<JobRow> = {}): JobRow => ({
   task_count: 3,
   late_task_count: 0,
   unchecked_task_count: 0,
+  tasks_without_qty: 0,
   open_feedback_count: 0,
   workers: [
     { user: userJson(other, "Worker B"), qty: 25, task_count: 2 },

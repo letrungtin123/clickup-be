@@ -18,6 +18,11 @@ export const notificationTypes = [
   "task.due_soon",
   "task.overdue",
   "project.member_added",
+  /**
+   * Payload { channelKind, threadRootId } — plus `all: true` when the person was reached by @all (PD-061: every member
+   * of the conversation but the author, whatever their notify level). One per person and message: someone also
+   * mentioned by name gets the personal one (no `all`) unless their notify level filters it out.
+   */
   "chat.mentioned",
   "chat.thread_replied",
   "channel.member_added",
@@ -41,6 +46,14 @@ export const notificationTypes = [
    */
   "production.qty_change_requested",
   "production.qty_change_decided",
+  /**
+   * PD-058: someone filled in the quantity of a task that had none ("chưa có số lượng") — directly (PATCH) or when moving
+   * it to Done → the job's active Leader; without one the production Admins (like qty_change_requested); never the person
+   * who filled it. One per task (a subtask too). Payload: task payload ({ jobCode, taskCode, taskNumber, processName,
+   * qty, deadline, … }) + { filledQty, atDone }. Inbox: "<actor> đã điền số lượng <filledQty> cho task #<taskCode>".
+   * Target: productionTaskId.
+   */
+  "production.qty_filled",
   /**
    * PD-045: someone changed a job's status (the manual chip) → the job's active Leader and every production Account /
    * Admin (organization superadmins included), never the person who changed it. Payload: { jobId, jobCode, jobName,

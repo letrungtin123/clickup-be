@@ -21,6 +21,7 @@ import { getSql } from "../../db/client.js";
 import { AppError } from "../../lib/app-error.js";
 import { decodeCursor, encodeCursor, escapeLike, invalidCursor, isUuid } from "../../lib/db-types.js";
 import { effectiveDepartments, type MemberDepartmentChange, type MemberDepartmentWriter } from "../access/departments.js";
+import { visibleUserSql } from "../access/test-accounts.js";
 
 type QuerySql = postgres.Sql | postgres.TransactionSql;
 
@@ -29,6 +30,7 @@ type WorkspaceContextRow = {
   email: string | null;
   display_name: string;
   must_change_password: boolean;
+  is_test_account: boolean;
   production_roles: string[] | null;
   departments: string[] | null;
   organization_id: string;
@@ -329,6 +331,7 @@ export const getWorkspaceContext = async (userId: string): Promise<WorkspaceCont
       au.email,
       au.display_name,
       au.must_change_password,
+      au.is_test_account,
       (
         SELECT array_agg(pur.role_code ORDER BY pur.role_code)
         FROM production.user_roles pur
@@ -364,7 +367,7 @@ export const getWorkspaceContext = async (userId: string): Promise<WorkspaceCont
       AND rp.organization_id = r.organization_id
     WHERE au.id = ${userId}
       AND au.deleted_at IS NULL
-    GROUP BY au.id, au.email, au.display_name, au.must_change_password, o.id, o.slug, o.name, r.id, r.key, r.name, om.joined_at, om.created_at
+    GROUP BY au.id, au.email, au.display_name, au.must_change_password, au.is_test_account, o.id, o.slug, o.name, r.id, r.key, r.name, om.joined_at, om.created_at
     ORDER BY om.joined_at ASC NULLS LAST, om.created_at ASC
     LIMIT 1
   `;
@@ -404,7 +407,9 @@ export const getWorkspaceContext = async (userId: string): Promise<WorkspaceCont
     // module, its menus, endpoints and live room are closed to someone outside it exactly as to someone without a role.
     productionRoles: departments.includes("PHOTO_RETOUCH") ? (row.production_roles ?? []) : [],
     departments,
-    canSwitchDepartment: departments.length > 1
+    canSwitchDepartment: departments.length > 1,
+    // PD-063: only set for test accounts, so real accounts keep the exact context shape they had.
+    ...(row.is_test_account ? { isTestAccount: true } : {})
   };
 };
 
@@ -668,7 +673,7 @@ const memberStatusRank = (sql: QuerySql) => sql`(CASE om.status WHEN 'active' TH
 
 const memberCursorTag = "members";
 
-/** Members ordered by status (active, invited, disabled), name, id; keyset paged (WK-37). */
+/** Members ordered by status (active, invited, disabled), name, id; keyset paged (WK-37). Test accounts: PD-063. */
 export const listOrganizationMembers = async (
   context: WorkspaceContext,
   query: OrganizationMemberQuery = { limit: 500 }
@@ -704,6 +709,8 @@ export const listOrganizationMembers = async (
       )
     )`;
   }
+  // PD-063: temporary QA test accounts are left out for a viewer who is not one.
+  filter = sql`${filter} AND ${visibleUserSql(sql, context)}`;
   if (query.cursor) {
     filter = sql`${filter} AND (${memberStatusRank(sql)}, au.display_name, au.id) > (${Number(rank)}::int, ${String(name)}::text, ${String(id)}::uuid)`;
   }

@@ -31,6 +31,9 @@ import { subtaskProcessProblem, subtaskQtyProblem } from "./workflow.js";
  * PD-045 code: the subtask takes the next letter of its line — sub_seq = the highest sub_seq of every subtask the line
  * ever had (deleted ones included: a letter is never reused) + 1, under the line's row lock; "1216" → "1216a", "1216b"…
  * After "zz" (702) the line takes no more subtasks (409 SUBTASK_LIMIT).
+ *
+ * PD-058: the quantity is optional (null = "chưa có số lượng", filled in later or at Done). It is carved from the line only
+ * when both the line and the subtask have a number (same rule as above); otherwise nothing is carved.
  */
 export const createProductionSubtask = async (context: AccessContext, taskId: string, input: CreateSubtaskRequest): Promise<ProductionTask> => {
   assertProductionMember(context);
@@ -62,7 +65,10 @@ export const createProductionSubtask = async (context: AccessContext, taskId: st
     if (processProblem) {
       throw new AppError("PROCESS_INVALID", processProblem, 400);
     }
-    const qtyProblem = subtaskQtyProblem(task.qty_assigned, input.qtyAssigned);
+    // PD-058: the quantity is optional; it is carved from the line only when both have a number (same rule as before).
+    const qty = input.qtyAssigned ?? null;
+    const carve = qty !== null && task.qty_assigned !== null;
+    const qtyProblem = carve ? subtaskQtyProblem(task.qty_assigned!, qty) : null;
     if (qtyProblem) {
       throw new AppError("SUBTASK_QTY_INVALID", qtyProblem, 400);
     }
@@ -79,15 +85,17 @@ export const createProductionSubtask = async (context: AccessContext, taskId: st
     if (subSeq > maxSubtaskSeq) {
       throw new AppError("SUBTASK_LIMIT", `Task #${Number(task.number)} đã có tối đa ${maxSubtaskSeq} subtask.`, 409);
     }
-    const parentQty = task.qty_assigned - input.qtyAssigned;
-    await tx`UPDATE production.tasks SET qty_assigned = ${parentQty}, updated_at = now() WHERE organization_id = ${organizationId} AND id = ${taskId}`;
+    const parentQty = carve ? task.qty_assigned! - qty : task.qty_assigned;
+    if (carve) {
+      await tx`UPDATE production.tasks SET qty_assigned = ${parentQty}, updated_at = now() WHERE organization_id = ${organizationId} AND id = ${taskId}`;
+    }
     // The line's people, shift, dates, status, lateness, link and custom fields, copied in the database (full precision).
     const id = randomUUID();
     const created = (
       await tx<{ number: string }[]>`
         INSERT INTO production.tasks (id, organization_id, job_id, assignee_id, qc_id, process_id, shift_id, qty_assigned, assigned_at, deadline,
           status_id, kind, parent_task_id, sub_seq, split_reason, work_link, custom_values, is_late, created_by)
-        SELECT ${id}, p.organization_id, p.job_id, p.assignee_id, p.qc_id, ${input.processId}, p.shift_id, ${input.qtyAssigned}, p.assigned_at,
+        SELECT ${id}, p.organization_id, p.job_id, p.assignee_id, p.qc_id, ${input.processId}, p.shift_id, ${qty}::int, p.assigned_at,
           p.deadline, p.status_id, 'NORMAL', p.id, ${subSeq}, ${reason}, p.work_link, p.custom_values, p.is_late, ${context.user.id}
         FROM production.tasks p WHERE p.organization_id = ${organizationId} AND p.id = ${taskId}
         RETURNING number
@@ -100,7 +108,7 @@ export const createProductionSubtask = async (context: AccessContext, taskId: st
         jobId: task.job_id,
         userId: context.user.id,
         action: "CREATE",
-        to: { assigneeId: task.assignee_id, qcId: task.qc_id, qtyAssigned: input.qtyAssigned, kind: "NORMAL", parentTaskId: taskId, processId: input.processId },
+        to: { assigneeId: task.assignee_id, qcId: task.qc_id, qtyAssigned: qty, kind: "NORMAL", parentTaskId: taskId, processId: input.processId },
         note: reason
       },
       {
@@ -115,7 +123,7 @@ export const createProductionSubtask = async (context: AccessContext, taskId: st
           subtaskCode,
           processId: input.processId,
           processName: process!.name,
-          qtyAssigned: input.qtyAssigned,
+          qtyAssigned: qty,
           parentQtyAssigned: parentQty
         },
         note: reason
