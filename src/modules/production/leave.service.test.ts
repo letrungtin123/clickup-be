@@ -6,9 +6,10 @@ import type { AccessContext } from "../access/access-context.js";
 import type * as NotificationsModule from "./notifications.js";
 
 /**
- * PD-057 at the service level, without a database (fake tagged-template `sql`): only Quản trị (production ADMIN,
- * organization superadmins included) exports the attendance workbook and decides leave requests; Leaders keep seeing
- * pending requests read-only; the reason is required on new requests. Fake names and ids only: the repository is public.
+ * PD-057 at the service level, without a database (fake tagged-template `sql`): only the approvers — the roles of the
+ * `leave_approval` feature (PD-065; by default Quản trị, organization superadmins always) — export the attendance
+ * workbook and decide leave requests; Leaders keep seeing pending requests read-only; the reason is optional again
+ * (PD-065). Fake names and ids only: the repository is public.
  */
 type Call = { text: string; values: unknown[] };
 type Fragment = { readonly isFragment: true; text: string; values: unknown[] };
@@ -73,8 +74,10 @@ vi.mock("./notifications.js", async (importOriginal) => ({
   })
 }));
 
-const { decideLeaveRequest, exportLeaveAttendance, listPendingLeave, getLeaveCalendar } = await import("./leave.service.js");
-const { CreateLeaveRequestSchema, LeaveExportQuerySchema, leaveNoteRequiredMessage } = await import("../../contracts/production-leave.js");
+const { createLeaveRequest, decideLeaveRequest, exportLeaveAttendance, listPendingLeave, getLeaveCalendar } = await import("./leave.service.js");
+const { CreateLeaveRequestSchema, LeaveExportQuerySchema } = await import("../../contracts/production-leave.js");
+const { defaultFeaturePermissions } = await import("../../contracts/production-catalog.js");
+const { clearProductionConfigCache } = await import("./catalog-cache.js");
 
 const org = "11111111-1111-4111-8111-111111111111";
 const me = "22222222-2222-4222-8222-222222222222";
@@ -147,21 +150,33 @@ beforeEach(() => {
   db.state.calls = [];
   db.state.handler = () => [];
   spies.events = [];
+  clearProductionConfigCache();
 });
+
+/** Only the settings were read (the feature matrix), nothing about leave or members. */
+const readSettingsOnly = () => db.state.calls.every((call) => call.text.includes("production.settings") || call.text.includes("production.kpi_close_days"));
+
+/** A stored feature matrix whose `leave_approval` is `roles` (answered to the settings read). */
+const approvers = (roles: string[]) => (call: Call) =>
+  call.text.includes("FROM production.settings")
+    ? [{ key: "feature_permissions", value: { ...defaultFeaturePermissions, leave_approval: roles } }]
+    : undefined;
 
 describe("GET /production/leave/export (PD-057)", () => {
   const query = { from: "2026-10-01", to: "2026-10-31" };
 
-  it("Leaders, Staff and other roles get 403 with the Vietnamese message; non-members 404; nothing is read", async () => {
-    for (const roles of [["LEADER"], ["STAFF"], ["QC"], ["ACCOUNT"], ["LEADER", "ACCOUNT", "QC", "STAFF"]]) {
+  it("Leaders, Staff, Director and other roles get 403 with the Vietnamese message; non-members 404; nothing but the matrix is read", async () => {
+    for (const roles of [["LEADER"], ["STAFF"], ["QC"], ["ACCOUNT"], ["DIRECTOR"], ["LEADER", "ACCOUNT", "QC", "STAFF", "DIRECTOR"]]) {
       const { res, sent } = fakeResponse();
       expect(await failure(exportLeaveAttendance(contextWith(roles), res, query))).toEqual({
         code: "FORBIDDEN",
         status: 403,
-        message: "Chỉ Quản trị mới xuất được bảng chấm công nghỉ phép."
+        message: "Bạn không có quyền xuất bảng chấm công nghỉ phép."
       });
       expect(sent.body).toBeNull();
     }
+    expect(readSettingsOnly()).toBe(true);
+    db.state.calls = [];
     const { res } = fakeResponse();
     expect(await failure(exportLeaveAttendance(contextWith([]), res, query))).toMatchObject({ code: "PRODUCTION_NOT_FOUND", status: 404 });
     expect(db.state.calls).toHaveLength(0);
@@ -184,7 +199,7 @@ describe("GET /production/leave/export (PD-057)", () => {
     });
     expect(LeaveExportQuerySchema.safeParse({ from: "2026-10-01", to: "31/10/2026" }).success).toBe(false);
     expect(LeaveExportQuerySchema.safeParse({ from: "2026-10-01", to: "2026-10-31", teamId: "x" }).success).toBe(false);
-    expect(db.state.calls).toHaveLength(0);
+    expect(readSettingsOnly()).toBe(true);
   });
 
   it("an unknown team is 404", async () => {
@@ -250,18 +265,61 @@ describe("GET /production/leave/export (PD-057)", () => {
   });
 });
 
-describe("decide (PD-057: only Quản trị)", () => {
-  it("Leaders and Staff get 403 'Chỉ Quản trị mới duyệt được đơn nghỉ.' before anything is read; non-members 404", async () => {
-    for (const roles of [["LEADER"], ["STAFF"], ["LEADER", "ACCOUNT"]]) {
+describe("decide (PD-057 / PD-065: the leave_approval feature, by default Quản trị)", () => {
+  it("Leaders, Staff and the Director get 403 before any request is read; non-members 404", async () => {
+    for (const roles of [["LEADER"], ["STAFF"], ["DIRECTOR"], ["LEADER", "ACCOUNT"]]) {
       expect(await failure(decideLeaveRequest(contextWith(roles), leaveId, { decision: "APPROVED" }))).toEqual({
         code: "FORBIDDEN",
         status: 403,
-        message: "Chỉ Quản trị mới duyệt được đơn nghỉ."
+        message: "Bạn không có quyền duyệt đơn nghỉ."
       });
     }
+    expect(readSettingsOnly()).toBe(true);
+    db.state.calls = [];
     expect(await failure(decideLeaveRequest(contextWith([]), leaveId, { decision: "REJECTED" }))).toMatchObject({ status: 404 });
     expect(db.state.calls).toHaveLength(0);
     expect(spies.events).toHaveLength(0);
+  });
+
+  it("the superadmin moves leave_approval to Leader: Leaders decide and export, a production Admin no longer (the superadmin always)", async () => {
+    let status = "PENDING";
+    const stored = approvers(["LEADER"]);
+    db.state.handler = (call) => {
+      const settings = stored(call);
+      if (settings) return settings;
+      if (call.text.startsWith("SELECT status FROM production.leave_requests")) return [{ status }];
+      if (call.text.startsWith("UPDATE production.leave_requests")) {
+        status = String(call.values[0]);
+        return [];
+      }
+      if (call.text.includes("FROM production.leave_requests lr")) return [leaveRow({ status })];
+      return undefined;
+    };
+    expect(await decideLeaveRequest(contextWith(["LEADER"]), leaveId, { decision: "APPROVED" })).toMatchObject({ status: "APPROVED", canDecide: false });
+    status = "PENDING";
+    expect((await listPendingLeave(contextWith(["LEADER"]))).items[0]).toMatchObject({ canDecide: true });
+    expect((await listPendingLeave(contextWith(["ADMIN"]))).items[0]).toMatchObject({ canDecide: false });
+    expect(await failure(decideLeaveRequest(contextWith(["ADMIN"]), leaveId, { decision: "APPROVED" }))).toMatchObject({ code: "FORBIDDEN", status: 403 });
+    expect(await failure(exportLeaveAttendance(contextWith(["ADMIN"]), fakeResponse().res, { from: "2026-10-01", to: "2026-10-31" }))).toMatchObject({
+      code: "FORBIDDEN",
+      status: 403
+    });
+    expect((await listPendingLeave(contextWith([], { superadmin: true }))).items[0]).toMatchObject({ canDecide: true });
+  });
+
+  it("a Director given leave_approval sees every pending request with its details and decides it", async () => {
+    const stored = approvers(["ADMIN", "DIRECTOR"]);
+    db.state.handler = (call) => stored(call) ?? (call.text.includes("FROM production.leave_requests lr") ? [leaveRow()] : undefined);
+    const pending = await listPendingLeave(contextWith(["DIRECTOR"]));
+    expect(pending.items[0]).toMatchObject({ canDecide: true, note: "Việc gia đình" });
+    const calendar = await getLeaveCalendar(contextWith(["DIRECTOR"]), { from: "2026-10-01", to: "2026-10-31" });
+    const window = db.state.calls.find((call) => call.text.includes("FROM production.leave_requests lr") && call.text.includes("lr.slot_range"))!;
+    expect(window.values).toContain(true);
+    expect(calendar.items[0]).toMatchObject({ canDecide: true });
+    // Without the feature the Director has no pending queue at all (not a Leader either).
+    clearProductionConfigCache();
+    db.state.handler = (call) => (call.text.includes("FROM production.leave_requests lr") ? [leaveRow()] : undefined);
+    expect(await failure(listPendingLeave(contextWith(["DIRECTOR"])))).toMatchObject({ code: "FORBIDDEN", status: 403 });
   });
 
   it("ADMIN and the superadmin decide — their own requests too — and notify the requester", async () => {
@@ -309,20 +367,29 @@ describe("decide (PD-057: only Quản trị)", () => {
   });
 });
 
-describe("new request reason (PD-057)", () => {
+describe("new request reason (PD-065: optional again)", () => {
   const base = { fromDate: "2026-10-20", toDate: "2026-10-20" };
-  const issueOf = (input: unknown) => {
-    const result = CreateLeaveRequestSchema.safeParse(input);
-    return result.success ? null : result.error.issues.map((issue) => ({ path: issue.path.join("."), message: issue.message }));
-  };
 
-  it("is required, trimmed, at least 3 characters", () => {
-    for (const note of [undefined, null, "", "   ", "ab", "  ab  "]) {
-      expect(issueOf({ ...base, ...(note === undefined ? {} : { note }) })).toEqual([{ path: "note", message: leaveNoteRequiredMessage }]);
+  it("is optional: missing, null or blank → null; otherwise trimmed (any length up to the maximum)", () => {
+    for (const note of [undefined, null, "", "   "]) {
+      expect(CreateLeaveRequestSchema.parse({ ...base, ...(note === undefined ? {} : { note }) })).toEqual({ ...base, part: "FULL_DAY", note: null });
     }
-    expect(leaveNoteRequiredMessage).toBe("Nhập lý do nghỉ (ít nhất 3 ký tự).");
+    expect(CreateLeaveRequestSchema.parse({ ...base, note: "  ab  " }).note).toBe("ab");
     expect(CreateLeaveRequestSchema.parse({ ...base, note: "  Ốm sốt  " }).note).toBe("Ốm sốt");
     expect(CreateLeaveRequestSchema.parse({ ...base, part: "MORNING", note: "Khám bệnh" })).toEqual({ ...base, part: "MORNING", note: "Khám bệnh" });
+  });
+
+  it("a request without a reason is stored with note NULL and notifies the approvers", async () => {
+    const soon = new Date(Date.now() + 2 * 86_400_000).toISOString().slice(0, 10);
+    db.state.handler = (call) =>
+      call.text.startsWith("INSERT INTO production.leave_requests") ? [{ id: leaveId }]
+      : call.text.includes("FROM production.leave_requests lr") ? [leaveRow({ user_id: me, owner: user(me, "Quản trị A"), note: null })]
+      : undefined;
+    const created = await createLeaveRequest(contextWith(["STAFF"]), CreateLeaveRequestSchema.parse({ fromDate: soon, toDate: soon }));
+    expect(created).toMatchObject({ status: "PENDING", note: null });
+    const insert = db.state.calls.find((call) => call.text.startsWith("INSERT INTO production.leave_requests"))!;
+    expect(insert.values.at(-1)).toBeNull();
+    expect(spies.events.map((event) => event.type)).toEqual(["production.leave.requested"]);
   });
 
   it("is at most 1000 characters and never contains NUL", () => {

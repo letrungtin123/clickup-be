@@ -95,7 +95,7 @@ const readWorkflowModel = async (sql: QuerySql, organizationId: string): Promise
   };
 };
 
-/** Production roles of the given users (superadmins count as ADMIN). */
+/** Production roles of the given users (superadmins count as ADMIN and DIRECTOR, PD-065). */
 export const loadMemberRoles = async (sql: QuerySql, organizationId: string, userIds: string[]) => {
   const unique = [...new Set(userIds)];
   const result = new Map<string, Set<ProductionRole>>();
@@ -116,6 +116,7 @@ export const loadMemberRoles = async (sql: QuerySql, organizationId: string, use
     const roles = new Set((row.roles ?? []).filter((role): role is ProductionRole => known.has(role)));
     if (row.superadmin) {
       roles.add("ADMIN");
+      roles.add("DIRECTOR");
     }
     result.set(row.user_id, roles);
   }

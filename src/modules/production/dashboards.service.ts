@@ -12,8 +12,9 @@ import { AppError } from "../../lib/app-error.js";
 import { toIso } from "../../lib/db-types.js";
 import type { AccessContext } from "../access/access-context.js";
 import { viewerIsTestAccount, visibleUserIdSql, visibleUserSql } from "../access/test-accounts.js";
-import { assertProductionAdmin, assertProductionRole, isProductionAdmin } from "./access.js";
+import { seesWholeOrganization } from "./access.js";
 import { closeDaysOf, loadSettings } from "./catalog.service.js";
+import { assertFeature } from "./features.js";
 import { loadWorkflowModel, notSubtaskSql } from "./jobs.repo.js";
 import { getKpiReport } from "./kpi-settlement.service.js";
 import { executeReport } from "./reports.js";
@@ -59,19 +60,20 @@ const toDashboardTask = (row: OpenTaskRow, now: number): DashboardTask => ({
 });
 
 /**
- * GET /production/dashboard/leader — LEADER: open tasks of the jobs they lead that are late (red) or due
- * within settings.dueSoonHours (amber); today's workload of every worker (all jobs, so the leader can
- * pick who to give work to); team points per week. ADMIN sees every job, or one leader's with leaderId.
+ * GET /production/dashboard/leader — the roles of the `leader_dashboard` feature (PD-065; by default Leader, Admin and
+ * Director, the superadmin always; others 403): open tasks of the jobs they lead (and the jobs without a leader) that are
+ * late (red) or due within settings.dueSoonHours (amber); today's workload of every worker (all jobs, so the leader can
+ * pick who to give work to); team points per week. ADMIN and DIRECTOR see every job, or one leader's with leaderId.
  * PD-063: for a viewer who is not a temporary QA test account, test accounts and the jobs they created are left out.
  */
 export const getLeaderDashboard = async (context: AccessContext, query: { leaderId?: string | undefined }): Promise<LeaderDashboard> => {
-  assertProductionRole(context, "LEADER");
-  const admin = isProductionAdmin(context);
+  const sql = getSql();
+  await assertFeature(context, "leader_dashboard", { sql });
+  const admin = seesWholeOrganization(context);
   if (query.leaderId && !admin && query.leaderId !== context.user.id) {
     throw new AppError("FORBIDDEN", "Bạn chỉ xem được dashboard của mình.", 403);
   }
   const leaderId = query.leaderId ?? (admin ? null : context.user.id);
-  const sql = getSql();
   const organizationId = org(context);
   const settings = await loadSettings(sql, organizationId);
   const now = new Date();
@@ -289,12 +291,14 @@ const kpiBuckets = [
 ] as const;
 
 /**
- * GET /production/dashboard/admin — the 6 SPEC cards plus the pinned saved reports. ADMIN only. PD-063: temporary QA
- * test accounts and their jobs are left out for a viewer who is not one.
+ * GET /production/dashboard/admin ("Quản trị số liệu") — the 6 SPEC cards plus the pinned saved reports, organization-wide.
+ * PD-065: the roles of the `admin_dashboard` feature only (by default Director; the superadmin always) — a production
+ * Admin without it gets 403 like anyone else. PD-063: temporary QA test accounts and their jobs are left out for a viewer
+ * who is not one.
  */
 export const getAdminDashboard = async (context: AccessContext): Promise<AdminDashboard> => {
-  assertProductionAdmin(context);
   const sql = getSql();
+  await assertFeature(context, "admin_dashboard", { sql });
   const organizationId = org(context);
   const settings = await loadSettings(sql, organizationId);
   const now = new Date();
@@ -342,7 +346,8 @@ export const getAdminDashboard = async (context: AccessContext): Promise<AdminDa
       LIMIT 50
     `,
     // Phase 6 KPI report (settled figures, or what a settlement would give now): % = total points / target.
-    getKpiReport(context, { from: period, to: period }, { rollups: false }),
+    // Every person, whatever the viewer's own KPI scope (the dashboard is organization-wide).
+    getKpiReport(context, { from: period, to: period }, { rollups: false, everyone: true }),
     listPinnedReports(sql, organizationId, context)
   ]);
 

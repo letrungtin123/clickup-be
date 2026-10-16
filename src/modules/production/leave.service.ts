@@ -20,7 +20,8 @@ import { enqueueProductionEvents, leaveEvent } from "./notifications.js";
 import type { AccessContext } from "../access/access-context.js";
 import { visibleUserSql } from "../access/test-accounts.js";
 import { toUserRef, type UserRefJson } from "../work/mappers.js";
-import { assertProductionMember, assertProductionRole, hasProductionRole, isProductionAdmin, productionRoom } from "./access.js";
+import { assertProductionMember, hasProductionRole, isProductionAdmin, productionRoom } from "./access.js";
+import { assertFeature, hasFeature } from "./features.js";
 import { sendLeaveAttendanceWorkbook } from "./leave-export.js";
 import {
   assertValidCalendarWindow,
@@ -35,9 +36,9 @@ import { businessDay, isValidDay } from "./time.js";
 
 /**
  * Shared leave calendar ("Lịch nghỉ", SPEC §6.3, PLAN §10). Any production member files requests
- * for themselves (with a reason, PD-057); only ADMIN decides (PD-057 — Leaders still see pending
- * requests, read-only); everyone sees approved leave (names and dates only); ADMIN exports the
- * payroll attendance workbook.
+ * for themselves (the reason is optional again, PD-065); only the roles of the `leave_approval` feature decide and
+ * export the payroll attendance workbook (PD-065; by default Quản trị, the superadmin always — PD-057); Leaders still
+ * see pending requests, read-only; everyone sees approved leave (names and dates only).
  */
 
 type In<T extends z.ZodTypeAny> = z.infer<T>;
@@ -63,12 +64,14 @@ type LeaveRow = {
   team_name: string | null;
 };
 
-type Viewer = { userId: string; admin: boolean; leader: boolean; today: string };
+/** `decider`: the `leave_approval` feature (PD-065) — decides PENDING requests and sees them all with their details. */
+type Viewer = { userId: string; admin: boolean; leader: boolean; decider: boolean; today: string };
 
-const viewerOf = (context: AccessContext): Viewer => ({
+const viewerOf = async (context: AccessContext, sql: QuerySql): Promise<Viewer> => ({
   userId: context.user.id,
   admin: isProductionAdmin(context),
   leader: hasProductionRole(context, "LEADER"),
+  decider: await hasFeature(context, "leave_approval", sql),
   today: businessDay(new Date())
 });
 
@@ -93,10 +96,10 @@ const selectLeaves = (sql: QuerySql, organizationId: string, where: postgres.Pen
   LIMIT 5000
 `;
 
-/** Notes, decider and email are only shown to the owner and to LEADER/ADMIN (Leaders read-only, PD-057). */
+/** Notes, decider and email are only shown to the owner, to LEADER/ADMIN (Leaders read-only, PD-057) and to approvers (PD-065). */
 const toLeave = (row: LeaveRow, viewer: Viewer): LeaveRequest => {
   const own = row.user_id === viewer.userId;
-  const details = own || viewer.admin || viewer.leader;
+  const details = own || viewer.admin || viewer.leader || viewer.decider;
   const owner = toUserRef(row.owner)!;
   return {
     id: row.id,
@@ -126,7 +129,7 @@ const loadOne = async (sql: QuerySql, context: AccessContext, id: string) => {
   if (!row) {
     throw notFound();
   }
-  return toLeave(row, viewerOf(context));
+  return toLeave(row, await viewerOf(context, sql));
 };
 
 const publishLeaveChanged = (organizationId: string) => {
@@ -145,15 +148,15 @@ const isOverlapViolation = (error: unknown) =>
 
 /**
  * Calendar window (≤ leaveLimits.maxCalendarDays, one year since PD-057): APPROVED requests of everyone, the
- * caller's own requests in any status, and (LEADER/ADMIN) every PENDING request — Leaders read-only. Temporary QA
+ * caller's own requests in any status, and (LEADER/ADMIN/approvers) every PENDING request — Leaders read-only. Temporary QA
  * test accounts' requests are left out for a viewer who is not one (PD-063), here, in the queue and in the export.
  */
 export const getLeaveCalendar = async (context: AccessContext, query: In<typeof LeaveCalendarQuerySchema>): Promise<LeaveCalendar> => {
   assertProductionMember(context);
   assertValidCalendarWindow(query.from, query.to);
-  const viewer = viewerOf(context);
-  const seeAllPending = viewer.admin || viewer.leader;
   const sql = getSql();
+  const viewer = await viewerOf(context, sql);
+  const seeAllPending = viewer.admin || viewer.leader || viewer.decider;
   const rows = await selectLeaves(
     sql,
     org(context),
@@ -170,20 +173,23 @@ export const getLeaveCalendar = async (context: AccessContext, query: In<typeof 
 /** "Đơn của tôi": the caller's own requests in any status, newest leave first. */
 export const listMyLeave = async (context: AccessContext) => {
   assertProductionMember(context);
-  const viewer = viewerOf(context);
   const sql = getSql();
+  const viewer = await viewerOf(context, sql);
   const rows = await selectLeaves(sql, org(context), sql`lr.user_id = ${viewer.userId}`);
   return { items: rows.map((row) => toLeave(row, viewer)).reverse().slice(0, 200) };
 };
 
 /**
- * Pending queue: every PENDING request, oldest leave first. ADMIN decides them; LEADER keeps seeing the queue
- * read-only (`canDecide` false, PD-057).
+ * Pending queue: every PENDING request, oldest leave first. The approvers (`leave_approval`, PD-065) decide them;
+ * LEADER and ADMIN keep seeing the queue (read-only without the feature: `canDecide` false, PD-057). Others 403.
  */
 export const listPendingLeave = async (context: AccessContext) => {
-  assertProductionRole(context, "LEADER");
-  const viewer = viewerOf(context);
+  assertProductionMember(context);
   const sql = getSql();
+  const viewer = await viewerOf(context, sql);
+  if (!viewer.admin && !viewer.leader && !viewer.decider) {
+    throw new AppError("FORBIDDEN", "Bạn không có quyền thực hiện thao tác này.", 403);
+  }
   const rows = await selectLeaves(sql, org(context), sql`lr.status = 'PENDING' AND ${visibleUserSql(sql, context)}`);
   return { items: rows.map((row) => toLeave(row, viewer)) };
 };
@@ -215,18 +221,17 @@ export const createLeaveRequest = async (context: AccessContext, input: In<typeo
   return await loadOne(sql, context, id);
 };
 
-/** PD-057: only Quản trị — production ADMIN, organization superadmins included — decides leave requests. */
-export const assertLeaveDecider = (context: AccessContext) => {
-  assertProductionMember(context);
-  if (!isProductionAdmin(context)) {
-    throw new AppError("FORBIDDEN", "Chỉ Quản trị mới duyệt được đơn nghỉ.", 403);
-  }
-};
+/**
+ * PD-065: only the roles of the `leave_approval` feature (by default Quản trị; organization superadmins always) decide leave
+ * requests (PD-057). Others 403 FORBIDDEN "Bạn không có quyền duyệt đơn nghỉ." (`details.feature`), non-members 404.
+ */
+export const assertLeaveDecider = async (context: AccessContext, sql: QuerySql = getSql()) =>
+  await assertFeature(context, "leave_approval", { sql, message: "Bạn không có quyền duyệt đơn nghỉ." });
 
-/** ADMIN approves or rejects a PENDING request (their own too — PD-057 kept the ADMIN rule). */
+/** An approver decides a PENDING request (their own too — PD-057). */
 export const decideLeaveRequest = async (context: AccessContext, id: string, input: In<typeof DecideLeaveRequestSchema>) => {
-  assertLeaveDecider(context);
   const sql = getSql();
+  await assertLeaveDecider(context, sql);
   await sql.begin(async (tx) => {
     const current = (
       await tx<{ status: LeaveStatus }[]>`
@@ -253,8 +258,8 @@ export const decideLeaveRequest = async (context: AccessContext, id: string, inp
 /** Owner or ADMIN cancels a PENDING/APPROVED request, only before it starts (PD-059). */
 export const cancelLeaveRequest = async (context: AccessContext, id: string) => {
   assertProductionMember(context);
-  const viewer = viewerOf(context);
   const sql = getSql();
+  const viewer = await viewerOf(context, sql);
   await sql.begin(async (tx) => {
     const current = (
       await tx<{ user_id: string; status: LeaveStatus; from_date: string }[]>`
@@ -286,13 +291,12 @@ export const cancelLeaveRequest = async (context: AccessContext, id: string) => 
 
 // Payroll attendance export (PD-057) ------------------------------------------------------------
 
-/** PD-057: only Quản trị (production ADMIN, organization superadmins included) exports; non-members get 404. */
-export const assertLeaveExporter = (context: AccessContext) => {
-  assertProductionMember(context);
-  if (!isProductionAdmin(context)) {
-    throw new AppError("FORBIDDEN", "Chỉ Quản trị mới xuất được bảng chấm công nghỉ phép.", 403);
-  }
-};
+/**
+ * PD-065: only the roles of the `leave_approval` feature (by default Quản trị; organization superadmins always) export
+ * (PD-057). Others 403 FORBIDDEN "Bạn không có quyền xuất bảng chấm công nghỉ phép.", non-members 404.
+ */
+export const assertLeaveExporter = async (context: AccessContext, sql: QuerySql = getSql()) =>
+  await assertFeature(context, "leave_approval", { sql, message: "Bạn không có quyền xuất bảng chấm công nghỉ phép." });
 
 type AttendanceMemberRow = { user_id: string; display_name: string; email: string | null; team_name: string | null };
 
@@ -303,9 +307,9 @@ type AttendanceMemberRow = { user_id: string; display_name: string; email: strin
  * loaded and the file built before anything is sent, so every failure is a JSON error.
  */
 export const exportLeaveAttendance = async (context: AccessContext, res: Response, query: LeaveExportQuery) => {
-  assertLeaveExporter(context);
-  assertValidCalendarWindow(query.from, query.to, "xuất");
   const sql = getSql();
+  await assertLeaveExporter(context, sql);
+  assertValidCalendarWindow(query.from, query.to, "xuất");
   const organizationId = org(context);
   const teamId = query.teamId ?? null;
   let teamName: string | null = null;

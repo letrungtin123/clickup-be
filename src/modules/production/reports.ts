@@ -28,7 +28,7 @@ import { AppError } from "../../lib/app-error.js";
 import type { QuerySql } from "../../lib/db-types.js";
 import type { AccessContext } from "../access/access-context.js";
 import { viewerIsTestAccount } from "../access/test-accounts.js";
-import { assertProductionRole, isProductionAdmin } from "./access.js";
+import { assertProductionRole, featuresOf, isProductionAdmin } from "./access.js";
 import { closeDaysOf, customFieldsForbidden, loadSettings } from "./catalog.service.js";
 import { daysInclusive, periodOfDay, periodRange, shiftPeriod, weekStart, type KpiCloseDays } from "./scoring.js";
 import { addDays, businessDay, businessTimeZone, isValidDay, startOfBusinessDay } from "./time.js";
@@ -822,8 +822,17 @@ export const executeReport = async (
  * Who may run what: ADMIN and LEADER use reports (LEADER sees every job — PD-014). Money (money_khoan)
  * is ADMIN only — refused, never silently dropped. Members' custom fields are Admin data. Points by person / job
  * are open (PD-052: every production member sees everyone's points, so settings.scoresPublic no longer gates PR-11).
+ * `dashboardViewer` (PD-065): the caller has the `admin_dashboard` feature ("Quản trị số liệu") — they run reports,
+ * its pinned ones included, as the Admin did (money and members' custom fields too) whatever their roles.
  */
-export const assertReportAllowed = (context: AccessContext, config: Pick<ReportConfig, "dimensions" | "measures" | "filters">) => {
+export const assertReportAllowed = (
+  context: AccessContext,
+  config: Pick<ReportConfig, "dimensions" | "measures" | "filters">,
+  options: { dashboardViewer?: boolean } = {}
+) => {
+  if (options.dashboardViewer) {
+    return;
+  }
   assertProductionRole(context, "LEADER");
   const admin = isProductionAdmin(context);
   if (!admin && config.measures.some((measure) => reportMeasureInfo[measure].adminOnly)) {
@@ -850,7 +859,7 @@ export const usesMemberCustomFields = (config: Pick<ReportConfig, "dimensions" |
 export const runReport = async (context: AccessContext, config: ReportConfig): Promise<ReportResult> => {
   const sql = getSql();
   const settings = await loadSettings(sql, context.organization.id);
-  assertReportAllowed(context, config);
+  assertReportAllowed(context, config, { dashboardViewer: featuresOf(context, settings.featurePermissions).has("admin_dashboard") });
   return await executeReport(sql, context.organization.id, config, {
     today: businessDay(new Date()),
     closeDay: closeDaysOf(settings),

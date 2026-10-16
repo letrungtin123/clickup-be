@@ -1,7 +1,7 @@
 import { z } from "zod";
 
 import { DepartmentListSchema, departmentRolesProblem } from "./departments.js";
-import { ProductionMemberSchema, ProductionRoleSchema, UpdateProductionMemberRequestSchema } from "./production-catalog.js";
+import { ProductionMemberSchema, ProductionRoleSchema, productionRoleCodes, UpdateProductionMemberRequestSchema } from "./production-catalog.js";
 import { JobStatusRefSchema } from "./production-jobs.js";
 import { AccountEmailSchema, SafeLineSchema, TemporaryPasswordResponseSchema } from "./schemas.js";
 
@@ -39,7 +39,7 @@ export const CreateProductionUserRequestSchema = z
      */
     roles: z
       .array(ProductionRoleSchema)
-      .max(5)
+      .max(productionRoleCodes.length)
       .default([])
       .transform((roles) => [...new Set(roles)]),
     teamId: Id.nullable().optional(),

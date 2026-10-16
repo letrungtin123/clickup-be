@@ -75,10 +75,15 @@ vi.mock("./notifications.js", async (importOriginal) => ({
   ...(await importOriginal<typeof NotificationsModule>()),
   enqueueProductionEvents: vi.fn(() => Promise.resolve())
 }));
-vi.mock("./catalog.service.js", async (importOriginal) => ({
-  ...(await importOriginal<typeof CatalogModule>()),
-  loadSettings: vi.fn(() => Promise.resolve({ kpiCloseDay: 25, kpiProrateLeave: false, ...fixtures.settings } as ProductionSettings))
-}));
+vi.mock("./catalog.service.js", async (importOriginal) => {
+  const { defaultFeaturePermissions } = await import("../../contracts/production-catalog.js");
+  return {
+    ...(await importOriginal<typeof CatalogModule>()),
+    loadSettings: vi.fn(() =>
+      Promise.resolve({ kpiCloseDay: 25, kpiProrateLeave: false, featurePermissions: defaultFeaturePermissions, ...fixtures.settings } as ProductionSettings)
+    )
+  };
+});
 
 const { getScoreBoard, getUserScoreForecast, getUserScores } = await import("./scores.service.js");
 const { getKpiReport, listKpiSettlements } = await import("./kpi-settlement.service.js");
@@ -334,5 +339,56 @@ describe("PD-052 — KPI settlements / report of one member (userId)", () => {
       code: "SCORE_USER_NOT_FOUND",
       status: 404
     });
+  });
+});
+
+describe("PD-065 — others' scores and money follow the feature permission matrix", () => {
+  const boardRows = [
+    { user_id: me, display_name: "Tôi", email: "me@example.test", avatar_url: null, team_id: null, team_name: null, points_official: "10", points_khoan: "2", qty_khoan: 4, money: "50000", custom_values: null, tag_ids: null },
+    { user_id: other, display_name: "Đồng nghiệp", email: "other@example.test", avatar_url: null, team_id: null, team_name: null, points_official: "20", points_khoan: "1", qty_khoan: 2, money: "30000", custom_values: null, tag_ids: null }
+  ];
+  const matrix = async (overrides: Record<string, string[]>) => {
+    const { defaultFeaturePermissions } = await import("../../contracts/production-catalog.js");
+    return { ...defaultFeaturePermissions, ...overrides };
+  };
+
+  it("without view_others_scores: the ranking, someone else's person page / forecast / KPI rows → 403 SCORES_PRIVATE; one's own stays open", async () => {
+    fixtures.settings = { moneyPublic: false, featurePermissions: await matrix({ view_others_scores: ["ADMIN", "LEADER"] }) };
+    db.state.handler = (call) => (call.text.startsWith("WITH sums AS") ? boardRows : scoreQueries([me, other])(call));
+    const staff = contextWith(["STAFF", "QC"]);
+    const refused = { code: "SCORES_PRIVATE", status: 403 };
+    expect(await failure(getScoreBoard(staff, {}))).toEqual(refused);
+    expect(await failure(getUserScores(staff, other, {}))).toEqual(refused);
+    expect(await failure(getUserScoreForecast(staff, other, {}))).toEqual(refused);
+    expect(await failure(listKpiSettlements(staff, { period: "2026-09", userId: other }))).toEqual(refused);
+    expect(await failure(getKpiReport(staff, { from: "2026-09", to: "2026-09", userId: other }))).toEqual(refused);
+    // Nothing of the other person was read.
+    expect(db.state.calls.some((call) => call.values.includes(other))).toBe(false);
+    // Own scores, own forecast and own KPI rows stay open.
+    expect((await getUserScores(staff, me, {})).user.id).toBe(me);
+    await getUserScoreForecast(staff, me, {});
+    await listKpiSettlements(staff, { period: "2026-09", userId: me });
+    // A role of the matrix (LEADER) and the superadmin still see the board.
+    expect((await getScoreBoard(contextWith(["LEADER"]), {})).items).toHaveLength(2);
+    expect((await getScoreBoard(contextWith([], true), {})).items).toHaveLength(2);
+  });
+
+  it("others' money: view_others_money (default Admin + Director), moneyPublic, or one's own; ADMIN only through the matrix", async () => {
+    db.state.handler = (call) => (call.text.startsWith("WITH sums AS") ? boardRows : scoreQueries([me, other])(call));
+    fixtures.settings = { moneyPublic: false, featurePermissions: await matrix({}) };
+    const director = await getScoreBoard(contextWith(["DIRECTOR"]), {});
+    expect([director.moneyVisible, director.items.map((item) => item.money)]).toEqual([true, [30000, 50000]]);
+    expect((await getUserScores(contextWith(["DIRECTOR"]), other, {})).moneyVisible).toBe(true);
+
+    // The superadmin removes ADMIN from "view_others_money": a production Admin no longer sees others' money.
+    fixtures.settings = { moneyPublic: false, featurePermissions: await matrix({ view_others_money: ["DIRECTOR"] }) };
+    const admin = await getScoreBoard(contextWith(["ADMIN"]), {});
+    expect([admin.moneyVisible, admin.items.map((item) => item.money)]).toEqual([false, [null, 50000]]);
+    expect((await getUserScores(contextWith(["ADMIN"]), other, {})).moneyVisible).toBe(false);
+    expect((await getUserScoreForecast(contextWith(["ADMIN"]), other, {})).moneyKhoanProvisional).toBeNull();
+    // ...the superadmin always does, and moneyPublic still opens it to everyone.
+    expect((await getScoreBoard(contextWith([], true), {})).moneyVisible).toBe(true);
+    fixtures.settings = { moneyPublic: true, featurePermissions: await matrix({ view_others_money: [] }) };
+    expect((await getScoreBoard(contextWith(["STAFF"]), {})).moneyVisible).toBe(true);
   });
 });

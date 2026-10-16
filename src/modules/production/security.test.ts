@@ -86,11 +86,13 @@ vi.mock("./notifications.js", async (importOriginal) => ({
   enqueueProductionEvents: vi.fn(() => Promise.resolve())
 }));
 vi.mock("./catalog.service.js", async (importOriginal) => {
-  const { defaultJobPermissions } = await import("../../contracts/production-catalog.js");
+  const { defaultFeaturePermissions, defaultJobPermissions } = await import("../../contracts/production-catalog.js");
   return {
     ...(await importOriginal<typeof CatalogModule>()),
-    // The default job permission matrix (PD-036) unless a test sets its own.
-    loadSettings: vi.fn(() => Promise.resolve({ jobPermissions: defaultJobPermissions, ...fixtures.settings } as ProductionSettings))
+    // The default job (PD-036) and feature (PD-065) permission matrices unless a test sets its own.
+    loadSettings: vi.fn(() =>
+      Promise.resolve({ jobPermissions: defaultJobPermissions, featurePermissions: defaultFeaturePermissions, ...fixtures.settings } as ProductionSettings)
+    )
   };
 });
 vi.mock("./jobs.repo.js", async (importOriginal) => ({
@@ -342,6 +344,20 @@ describe("SEC2-04 — job-leader powers need the LEADER (or ADMIN) role", () => 
     await getTaskScores(contextWith(["LEADER", "QC"]), taskId);
     expect(scoreQuery().text).not.toContain("AND e.user_id = $");
   });
+
+  it("PD-065: without view_others_scores only the caller's own rows of a task are read", async () => {
+    const { defaultFeaturePermissions } = await import("../../contracts/production-catalog.js");
+    fixtures.settings = { ...fixtures.settings, featurePermissions: { ...defaultFeaturePermissions, view_others_scores: ["LEADER"] } };
+    const task = taskRow({ job_leader_id: other, assignee_id: third, qc_id: me });
+    const scoreQuery = () => db.state.calls.find((call) => call.text.includes("FROM production.score_entries e"))!;
+    db.state.handler = taskQueries(task);
+    await getTaskScores(contextWith(["STAFF", "QC"]), taskId);
+    expect(scoreQuery().text).toContain("AND e.user_id = $");
+    expect(scoreQuery().values).toContain(me);
+    db.state.calls = [];
+    await getTaskScores(contextWith(["LEADER", "QC"]), taskId);
+    expect(scoreQuery().text).not.toContain("AND e.user_id = $");
+  });
 });
 
 describe("SEC2-08 — deleting a production comment has the same checks as editing", () => {
@@ -420,6 +436,12 @@ describe("SEC2-09 — colleagues' e-mails in production responses", () => {
 describe("SEC2-11 — anomaly reviews", () => {
   const leader = contextWith(["LEADER"]);
   const admin = contextWith(["ADMIN"]);
+  // PD-065: "Bất thường" is the Director's by default; here the superadmin opened it to Leaders and Admins, whose scopes
+  // (the jobs they lead + unled jobs / every job) are what these checks are about.
+  beforeEach(async () => {
+    const { defaultFeaturePermissions } = await import("../../contracts/production-catalog.js");
+    fixtures.settings = { ...fixtures.settings, featurePermissions: { ...defaultFeaturePermissions, anomalies: ["ADMIN", "LEADER", "DIRECTOR"] } };
+  });
   const fastRow = {
     task_id: taskId,
     task_number: "7",

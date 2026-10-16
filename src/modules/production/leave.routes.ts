@@ -35,11 +35,11 @@ export const createProductionLeaveRoutes = (): ExpressRouter => {
     "/production/leave",
     handle(async (context, req) => LeaveCalendarSchema.parse(await getLeaveCalendar(context, LeaveCalendarQuerySchema.parse(req.query))))
   );
-  // PD-057: payroll attendance workbook (ADMIN only — checked before the query, so others always get 403/404).
+  // PD-057: payroll attendance workbook (the `leave_approval` feature, PD-065 — checked before the query, so others always get 403/404).
   routes.get(
     "/production/leave/export",
     handle(async (context, req, res) => {
-      assertLeaveExporter(context);
+      await assertLeaveExporter(context);
       await exportLeaveAttendance(context, res, LeaveExportQuerySchema.parse(req.query));
     })
   );
@@ -53,11 +53,11 @@ export const createProductionLeaveRoutes = (): ExpressRouter => {
     "/production/leave/:leaveId/cancel",
     handle(async (context, req) => LeaveRequestSchema.parse(await cancelLeaveRequest(context, param(req, "leaveId"))))
   );
-  // PD-057: ADMIN only — checked before the body, so Leaders / Staff always get 403.
+  // PD-057: the `leave_approval` feature (PD-065) — checked before the body, so the others always get 403.
   routes.post(
     "/production/leave/:leaveId/decide",
     handle(async (context, req) => {
-      assertLeaveDecider(context);
+      await assertLeaveDecider(context);
       return LeaveRequestSchema.parse(await decideLeaveRequest(context, param(req, "leaveId"), DecideLeaveRequestSchema.parse(req.body)));
     })
   );

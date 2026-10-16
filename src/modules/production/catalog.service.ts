@@ -23,7 +23,14 @@ import type {
   ReplaceTransitionsRequestSchema,
   UpdateProductionSettingsRequestSchema
 } from "../../contracts/production-catalog.js";
-import { defaultJobPermissions, effectiveJobScopes, productionRoleCodes } from "../../contracts/production-catalog.js";
+import {
+  defaultFeaturePermissions,
+  defaultJobPermissions,
+  effectiveJobScopes,
+  normalizeFeaturePermissions,
+  normalizeJobPermissions,
+  productionRoleCodes
+} from "../../contracts/production-catalog.js";
 import { closeDayOfPeriod, kpiPeriodOfDay } from "../../contracts/production-scores.js";
 import { getSql } from "../../db/client.js";
 import { AppError } from "../../lib/app-error.js";
@@ -34,7 +41,15 @@ import { departmentMemberSql, effectiveDepartments, productionRolesNotAllowed } 
 import { visibleUserIdSql, visibleUserSql } from "../access/test-accounts.js";
 import { scheduleGoogleAuthUserProvisioning } from "../auth/google-auth.service.js";
 import { toColor } from "../work/mappers.js";
-import { assertConfigEditor, assertProductionAdmin, assertProductionMember, assertProductionRole, isProductionAdmin, productionRolesOf } from "./access.js";
+import {
+  assertConfigEditor,
+  assertProductionAdmin,
+  assertProductionMember,
+  assertProductionRole,
+  featuresOf,
+  isProductionAdmin,
+  productionRolesOf
+} from "./access.js";
 import { cachedConfig, invalidateProductionConfig } from "./catalog-cache.js";
 import { deleteCreditRuleVersion, importCreditRules, listRuleHistory, listRulesAt, setCreditRule, startNewVersion } from "./credit-rules.js";
 import { matchesCustomFieldFilters, resolveCustomFieldFilters, resolveCustomValues, setEntityTags } from "./custom-fields.js";
@@ -58,6 +73,7 @@ const settingKeys: Record<Exclude<keyof ProductionSettings, "kpiCloseDays">, str
   kpiDefaultLeader: "kpi_default_leader",
   chatAttachmentsEnabled: "chat_attachments_enabled",
   jobPermissions: "job_permissions",
+  featurePermissions: "feature_permissions",
   timezone: "timezone"
 };
 
@@ -76,6 +92,8 @@ const defaults: ProductionSettings = {
   chatAttachmentsEnabled: true,
   // PD-036: the owner's defaults; migration 20261013_0110 seeds them.
   jobPermissions: defaultJobPermissions,
+  // PD-065: the owner's defaults; nothing is stored until the superadmin saves the matrix.
+  featurePermissions: defaultFeaturePermissions,
   timezone: "Asia/Ho_Chi_Minh"
 };
 
@@ -112,6 +130,9 @@ const readSettings = async (sql: QuerySql, organizationId: string): Promise<Prod
   }
   const settings = result as ProductionSettings;
   settings.kpiCloseDays = closeDays.length > 0 ? closeDays : [{ fromPeriod: null, closeDay: settings.kpiCloseDay }];
+  // PD-065: a job matrix saved before DIRECTOR existed reads DIRECTOR's default; a missing / invalid feature key its default.
+  settings.jobPermissions = normalizeJobPermissions(settings.jobPermissions);
+  settings.featurePermissions = normalizeFeaturePermissions(settings.featurePermissions);
   return settings;
 };
 
@@ -208,6 +229,7 @@ export const getProductionMe = async (context: AccessContext): Promise<Productio
     isAdmin: isProductionAdmin(context),
     teamId: profile?.team_id ?? null,
     jobPermissions: effectiveJobScopes(roles, settings.jobPermissions),
+    features: [...featuresOf(context, settings.featurePermissions)],
     settings: {
       // The close day of the current period (a new day applies from the next period, G15); kpiCloseDays has them all.
       kpiCloseDay: closeDayOfPeriod(closeDaysOf(settings), kpiPeriodOfDay(businessDay(new Date()), closeDaysOf(settings))),
@@ -274,11 +296,12 @@ const toMember = (row: MemberRow) => ({
 });
 
 /**
- * Admins manage everyone (with their departments, PD-041); Leaders/Accounts need the list to assign work and pick QC
- * — they only get Photo Retouch members holding a production role.
+ * Admins manage everyone (with their departments, PD-041); Leaders/Accounts need the list to assign work and pick QC,
+ * the Director (PD-065) to pick a leader on the dashboards — they only get Photo Retouch members holding a production
+ * role.
  */
 export const listMembers = async (context: AccessContext, query: ProductionMemberQuery = { cf: [] }) => {
-  assertProductionRole(context, "LEADER", "ACCOUNT", "QC");
+  assertProductionRole(context, "LEADER", "ACCOUNT", "QC", "DIRECTOR");
   const admin = isProductionAdmin(context);
   const tagIds = query.tagId ?? [];
   // Members' custom values and tags are Admin data (others get them empty), so only Admins filter by them.
@@ -412,9 +435,24 @@ export const upsertTeam = async (context: AccessContext, id: string | null, inpu
 
 type ClientRow = { id: string; name: string; note: string | null; active: boolean; custom_values: CustomValues; tag_ids: string[] | null; project_count: number };
 
+/**
+ * PD-065: the roles of the `clients` feature ("Khách hàng"; by default Account and Admin) — and every production ADMIN,
+ * who reads every page of Cấu hình Photo Retouch (Cấu hình → Khách hàng, the fixed rule) — the superadmin always.
+ * Others: 403 FORBIDDEN (`details.feature` "clients").
+ */
+export const assertClientsReader = async (context: AccessContext, sql: QuerySql) => {
+  assertProductionMember(context);
+  if (isProductionAdmin(context)) {
+    return;
+  }
+  if (!featuresOf(context, (await loadSettings(sql, org(context))).featurePermissions).has("clients")) {
+    throw new AppError("FORBIDDEN", "Bạn không có quyền xem Khách hàng.", 403, { feature: "clients" });
+  }
+};
+
 export const listClients = async (context: AccessContext, query: ClientQuery = { cf: [] }) => {
-  assertProductionRole(context, "ACCOUNT", "LEADER");
   const sql = getSql();
+  await assertClientsReader(context, sql);
   const plans = await resolveCustomFieldFilters(sql, org(context), "CLIENT", query.cf);
   const tagIds = query.tagId ?? [];
   const rows = await sql<ClientRow[]>`
@@ -930,9 +968,14 @@ export const updateNotificationPreferences = async (context: AccessContext, inpu
 
 // Credit rules ------------------------------------------------------------------------------------
 
-/** Money per image is hidden from non-admins unless the organization made it public (SPEC §10). */
-const canSeeMoney = async (context: AccessContext) =>
-  isProductionAdmin(context) || (await loadSettings(getSql(), org(context))).moneyPublic;
+/**
+ * Money per image is hidden unless the organization made it public (SPEC §10) or the caller has `view_others_money`
+ * (PD-065; by default Admin and Director, the superadmin always).
+ */
+const canSeeMoney = async (context: AccessContext) => {
+  const settings = await loadSettings(getSql(), org(context));
+  return settings.moneyPublic || featuresOf(context, settings.featurePermissions).has("view_others_money");
+};
 
 const stripMoney = <T extends { moneyPerImage: number | null }>(rule: T, visible: boolean): T =>
   visible ? rule : { ...rule, moneyPerImage: null };

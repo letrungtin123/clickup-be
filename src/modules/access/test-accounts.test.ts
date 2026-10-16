@@ -268,8 +268,8 @@ describe("jobs created by test accounts", () => {
     expect(callWith("FROM production.jobs j JOIN production.job_statuses js")!.text).not.toContain("is_test_account");
   });
 
-  it("anomalies leave out test jobs and tasks of test accounts", async () => {
-    await listAnomalies(contextOf({ productionRoles: ["ADMIN"] }), { days: 7, includeReviewed: false });
+  it("anomalies leave out test jobs and tasks of test accounts (PD-065: the Director's by default)", async () => {
+    await listAnomalies(contextOf({ productionRoles: ["DIRECTOR"] }), { days: 7, includeReviewed: false });
     const taskQueries = db.state.calls.filter((call) => call.text.includes("FROM production.tasks t") || call.text.includes("FROM production.score_entries e"));
     expect(taskQueries.length).toBeGreaterThanOrEqual(5);
     for (const call of taskQueries) {
@@ -277,7 +277,7 @@ describe("jobs created by test accounts", () => {
       expect(call.text).toContain(createdByTest("t.assignee_id"));
     }
     db.state.calls = [];
-    await listAnomalies(contextOf({ productionRoles: ["ADMIN"], test: true }), { days: 7, includeReviewed: false });
+    await listAnomalies(contextOf({ productionRoles: ["DIRECTOR"], test: true }), { days: 7, includeReviewed: false });
     expect(db.state.calls.some((call) => call.text.includes("is_test_account"))).toBe(false);
   });
 });

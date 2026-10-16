@@ -161,11 +161,11 @@ describe("cancel / decide permissions", () => {
     expect(canCancelLeave({ status: "REJECTED", fromDate: "2026-10-20", own: true }, { admin: true, today })).toBe(false);
   });
 
-  it("PD-057: only ADMIN decides, PENDING requests only (Leaders no longer)", () => {
-    expect(canDecideLeave({ status: "PENDING" }, { admin: true })).toBe(true);
-    expect(canDecideLeave({ status: "PENDING" }, { admin: false })).toBe(false);
+  it("PD-057 / PD-065: only an approver (`leave_approval`) decides, PENDING requests only", () => {
+    expect(canDecideLeave({ status: "PENDING" }, { decider: true })).toBe(true);
+    expect(canDecideLeave({ status: "PENDING" }, { decider: false })).toBe(false);
     for (const status of ["APPROVED", "REJECTED", "CANCELLED"]) {
-      expect(canDecideLeave({ status }, { admin: true })).toBe(false);
+      expect(canDecideLeave({ status }, { decider: true })).toBe(false);
     }
   });
 });

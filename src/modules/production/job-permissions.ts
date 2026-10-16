@@ -26,7 +26,7 @@ export const loadJobScopes = async (sql: QuerySql, context: AccessContext): Prom
 /** Roles whose `action` scope is "all" (ADMIN always), e.g. who sees every job. */
 export const rolesWithAll = (matrix: JobPermissionMatrix, action: keyof JobScopes): ProductionRole[] => [
   "ADMIN",
-  ...jobPermissionRoles.filter((role) => matrix[role][action] === "all")
+  ...jobPermissionRoles.filter((role) => (matrix as Partial<JobPermissionMatrix>)[role]?.[action] === "all")
 ];
 
 /** May see a job: "all", or "own" when I work on / check one of its lines or lead it. */

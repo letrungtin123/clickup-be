@@ -1,10 +1,16 @@
-import { productionRoleCodes, type ProductionRole } from "../../contracts/production-catalog.js";
+import {
+  effectiveFeatures,
+  productionRoleCodes,
+  type FeaturePermissionKey,
+  type FeaturePermissionMatrix,
+  type ProductionRole
+} from "../../contracts/production-catalog.js";
 import { AppError } from "../../lib/app-error.js";
 import type { AccessContext } from "../access/access-context.js";
 
 /**
  * Production (retouch) authorization (PD-011): multi-valued roles from the access context.
- * Organization superadmins are always production ADMIN. Checked server-side on every route.
+ * Organization superadmins are always production ADMIN and DIRECTOR (PD-065). Checked server-side on every route.
  */
 const known = new Set<string>(productionRoleCodes);
 
@@ -14,6 +20,7 @@ export const productionRolesOf = (context: AccessContext): Set<ProductionRole> =
   );
   if (context.hasFullOrganizationAuthority) {
     roles.add("ADMIN");
+    roles.add("DIRECTOR");
   }
   return roles;
 };
@@ -24,6 +31,19 @@ export const hasProductionRole = (context: AccessContext, ...roles: ProductionRo
 };
 
 export const isProductionAdmin = (context: AccessContext) => productionRolesOf(context).has("ADMIN");
+
+/**
+ * PD-065 data scope of the dashboards and anomalies: ADMIN and DIRECTOR (the superadmin holds both) see every job;
+ * anyone else who has the feature sees the jobs they lead plus the jobs without a leader.
+ */
+export const seesWholeOrganization = (context: AccessContext) => hasProductionRole(context, "ADMIN", "DIRECTOR");
+
+/**
+ * PD-065: the caller's features in the feature permission matrix (union over their roles; the organization superadmin has
+ * all). Services load the matrix with the settings (`loadFeatures` in features.ts) and call this.
+ */
+export const featuresOf = (context: AccessContext, matrix: FeaturePermissionMatrix): Set<FeaturePermissionKey> =>
+  new Set(effectiveFeatures(productionRolesOf(context), matrix, context.hasFullOrganizationAuthority));
 
 /**
  * The caller leads this job AND still holds LEADER (or ADMIN). Job-leader powers (split, reassign, correct
@@ -49,7 +69,7 @@ export const assertProductionMember = (context: AccessContext) => {
   }
 };
 
-/** At least one of the given roles; ADMIN always passes. */
+/** At least one of the given roles; ADMIN always passes (DIRECTOR does not: it has no Quản trị power, PD-065). */
 export const assertProductionRole = (context: AccessContext, ...roles: ProductionRole[]) => {
   assertProductionMember(context);
   if (!isProductionAdmin(context) && !hasProductionRole(context, ...roles)) {

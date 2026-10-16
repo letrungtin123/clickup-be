@@ -11,11 +11,14 @@ import { AppError } from "../../lib/app-error.js";
 import { toIso, type QuerySql } from "../../lib/db-types.js";
 import type { AccessContext } from "../access/access-context.js";
 import { visibleUserIdSql, type TestAccountViewer } from "../access/test-accounts.js";
-import { assertProductionRole, isProductionAdmin } from "./access.js";
+import { seesWholeOrganization } from "./access.js";
 import { loadSettings } from "./catalog.service.js";
+import { assertFeature } from "./features.js";
 
 /**
- * Anomalies report (SPEC Phase 5 §5, PLAN §10) — LEADER: tasks of the jobs they lead; ADMIN: every job.
+ * Anomalies report (SPEC Phase 5 §5, PLAN §10) — PD-065: the roles of the `anomalies` feature (by default Director only;
+ * the superadmin always; others 403 FORBIDDEN). ADMIN / DIRECTOR: every job; anyone else: the jobs they lead (and the
+ * jobs without a leader).
  * Window: the last `days` days (default 30) by first Done (tasks) / recording time (scores).
  *  - QTY_MISMATCH: Done with qty_done ≠ qty_assigned; who set the quantity = latest QTY correction log,
  *    else the Done log that recorded it. Key "<task>:<qty_done>" (a new correction shows it again). PD-058: a task
@@ -42,13 +45,13 @@ const taskRef = (row: TaskCols) => ({ id: row.task_id, number: Number(row.task_n
 type ReviewRow = { kind: AnomalyKind; subject_key: string; reviewed_at: Date; note: string | null; reviewer: UserCols | null };
 
 /**
- * Whose anomalies: `leaderId` a Leader's jobs (null: every job, ADMIN); `viewer` (PD-063): for a viewer who is not a
+ * Whose anomalies: `leaderId` a Leader's jobs (null: every job, ADMIN / DIRECTOR); `viewer` (PD-063): for a viewer who is not a
  * temporary QA test account, the jobs test accounts created and the tasks they work on are left out.
  */
 type AnomalyScope = { leaderId: string | null; viewer: TestAccountViewer };
 
 const scopeOf = (context: AccessContext): AnomalyScope => ({
-  leaderId: isProductionAdmin(context) ? null : context.user.id,
+  leaderId: seesWholeOrganization(context) ? null : context.user.id,
   viewer: { isTestAccount: context.isTestAccount }
 });
 
@@ -250,8 +253,8 @@ export const listAnomalies = async (
   context: AccessContext,
   query: { kind?: AnomalyKind | undefined; days: number; includeReviewed: boolean }
 ): Promise<AnomalyList> => {
-  assertProductionRole(context, "LEADER");
   const sql = getSql();
+  await assertFeature(context, "anomalies", { sql });
   const organizationId = org(context);
   const scope = scopeOf(context);
   const leaderId = scope.leaderId;
@@ -337,7 +340,7 @@ export const workerFailRateKeys = (userId: string, tasks: readonly WorkerTaskSam
 
 /**
  * The anomaly a review names, computed for the caller's own scope (SEC2-11) — the jobs a LEADER leads, every
- * job for an ADMIN — over the longest window the list offers. Only an exact key from that computation is
+ * job for an ADMIN / DIRECTOR — over the longest window the list offers. Only an exact key from that computation is
  * accepted, never a key the client made up or one from someone else's (e.g. the ADMIN-wide) scope. Returns
  * the task id to store with the review (null for a worker), or throws 404.
  */
@@ -369,16 +372,16 @@ const resolveOwnAnomaly = async (sql: QuerySql, context: AccessContext, kind: An
 };
 
 /**
- * POST /production/anomalies/review — mark "Đã xem" (idempotent). A second mark by the same reviewer (or an
- * ADMIN) updates who/when/note; someone else's review stays theirs (only they or an ADMIN may change or undo
- * it, SEC2-11) and is returned unchanged.
+ * POST /production/anomalies/review — mark "Đã xem" (idempotent; `anomalies` feature, PD-065). A second mark by the
+ * same reviewer (or an ADMIN / DIRECTOR) updates who/when/note; someone else's review stays theirs (only they or an
+ * ADMIN / DIRECTOR may change or undo it, SEC2-11) and is returned unchanged.
  */
 export const reviewAnomaly = async (context: AccessContext, input: { kind: AnomalyKind; key: string; note?: string | undefined }) => {
-  assertProductionRole(context, "LEADER");
   const sql = getSql();
+  await assertFeature(context, "anomalies", { sql });
   const organizationId = org(context);
   const taskId = await resolveOwnAnomaly(sql, context, input.kind, input.key);
-  const admin = isProductionAdmin(context);
+  const admin = seesWholeOrganization(context);
   const row =
     (
       await sql<{ reviewed_at: Date }[]>`
@@ -400,12 +403,12 @@ export const reviewAnomaly = async (context: AccessContext, input: { kind: Anoma
 };
 
 /**
- * DELETE /production/anomalies/reviews?kind&key — undo "Đã xem": only the person who marked it or an ADMIN
- * (SEC2-11). Undoing a mark that does not exist is a no-op.
+ * DELETE /production/anomalies/reviews?kind&key — undo "Đã xem" (`anomalies` feature, PD-065): only the person who
+ * marked it or an ADMIN / DIRECTOR (SEC2-11). Undoing a mark that does not exist is a no-op.
  */
 export const unreviewAnomaly = async (context: AccessContext, input: { kind: AnomalyKind; key: string }) => {
-  assertProductionRole(context, "LEADER");
   const sql = getSql();
+  await assertFeature(context, "anomalies", { sql });
   const organizationId = org(context);
   const review = (
     await sql<{ reviewed_by: string | null }[]>`
@@ -414,7 +417,7 @@ export const unreviewAnomaly = async (context: AccessContext, input: { kind: Ano
     `
   )[0];
   if (review) {
-    if (!isProductionAdmin(context) && review.reviewed_by !== context.user.id) {
+    if (!seesWholeOrganization(context) && review.reviewed_by !== context.user.id) {
       throw new AppError("ANOMALY_REVIEW_NOT_OWNER", "Chỉ người đã đánh dấu \"Đã xem\" (hoặc Quản trị) được bỏ đánh dấu.", 403);
     }
     await sql`

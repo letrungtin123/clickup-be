@@ -9,7 +9,7 @@ import type {
   KpiSettlementRunResult
 } from "../../contracts/production-scores.js";
 import { closeDayOfPeriod } from "../../contracts/production-scores.js";
-import type { CustomFieldFilter, CustomValues, KhoanPayPolicy } from "../../contracts/production-catalog.js";
+import type { CustomFieldFilter, CustomValues, KhoanPayPolicy, ProductionSettings } from "../../contracts/production-catalog.js";
 import { getSql } from "../../db/client.js";
 import { AppError } from "../../lib/app-error.js";
 import { toIso, toNullableIso, type QuerySql, type SqlFragment } from "../../lib/db-types.js";
@@ -17,9 +17,10 @@ import type { AccessContext } from "../access/access-context.js";
 import { viewerIsTestAccount, visibleUserSql } from "../access/test-accounts.js";
 import { enqueueDomainEvents } from "../events/outbox.js";
 import { toUserRef, type UserRefJson } from "../work/mappers.js";
-import { assertConfigEditor, assertProductionAdmin, assertProductionMember, isProductionAdmin } from "./access.js";
+import { assertConfigEditor, assertProductionAdmin, assertProductionMember, featuresOf, isProductionAdmin } from "./access.js";
 import { matchesCustomFieldFilters, resolveCustomFieldFilters } from "./custom-fields.js";
 import { closeDaysOf, customFieldsForbidden, loadSettings } from "./catalog.service.js";
+import { featureForbidden } from "./features.js";
 import { kpiSettledEvent } from "./kpi-settlement-notifications.js";
 import { approvedLeaveDaysByUser } from "./leave.service.js";
 import { loadScoreSubject } from "./scores.service.js";
@@ -247,9 +248,28 @@ const selectSettlements = (
     ORDER BY ks.period_month, ks.total_points DESC, au.display_name
   `;
 
-/** Who reads the rows: money is visible to ADMIN, to the row's owner, and to everyone when settings.moneyPublic (PD-052). */
-type Viewer = { id: string; admin: boolean; moneyPublic: boolean };
-const seesMoney = (viewer: Viewer, userId: string) => viewer.admin || viewer.moneyPublic || userId === viewer.id;
+/**
+ * Who reads the rows: money is visible to the row's owner, to the roles of `view_others_money` (`money`, PD-065; by
+ * default Admin and Director, the superadmin always), and to everyone when settings.moneyPublic (PD-052). `admin`:
+ * colleagues' emails.
+ */
+type Viewer = { id: string; admin: boolean; money: boolean; moneyPublic: boolean };
+const seesMoney = (viewer: Viewer, userId: string) => viewer.money || viewer.moneyPublic || userId === viewer.id;
+
+/** The KPI viewer of the caller (settings loaded). */
+const viewerOf = (context: AccessContext, settings: ProductionSettings): Viewer => ({
+  id: context.user.id,
+  admin: isProductionAdmin(context),
+  money: featuresOf(context, settings.featurePermissions).has("view_others_money"),
+  moneyPublic: settings.moneyPublic
+});
+
+/** PD-065: someone else's KPI rows (`userId` ≠ me) need `view_others_scores`; 403 SCORES_PRIVATE otherwise. */
+const assertSeesScoresOf = (context: AccessContext, settings: ProductionSettings, userId: string | undefined) => {
+  if (userId !== undefined && userId !== context.user.id && !featuresOf(context, settings.featurePermissions).has("view_others_scores")) {
+    throw featureForbidden("view_others_scores");
+  }
+};
 
 const toSettlement = (row: SettlementRow, viewer: Viewer): KpiSettlement => {
   const own = row.id === viewer.id;
@@ -365,13 +385,13 @@ export const runKpiSettlement = async (context: AccessContext, input: { period: 
     selectRuns(sql, org(context), { ids: [runId], limit: 1 }),
     selectSettlements(sql, org(context), { fromPeriod: input.period, toPeriod: input.period, userIds: null, visible: visibleUserSql(sql, context) })
   ]);
-  const viewer = { id: context.user.id, admin: true, moneyPublic: settings.moneyPublic };
-  return { run: toRun(runs[0]!), items: rows.map((row) => toSettlement(row, viewer)) };
+  return { run: toRun(runs[0]!), items: rows.map((row) => toSettlement(row, viewerOf(context, settings))) };
 };
 
 /**
  * GET /production/kpi/settlements — ADMIN: every row + the current run; other members: their own row only. `userId`
- * ("Điểm cá nhân", PD-052): only that production member's row, for any production member.
+ * ("Điểm cá nhân", PD-052): only that production member's row — someone else's needs `view_others_scores` (PD-065,
+ * 403 SCORES_PRIVATE).
  */
 export const listKpiSettlements = async (
   context: AccessContext,
@@ -380,17 +400,16 @@ export const listKpiSettlements = async (
   assertProductionMember(context);
   const sql = getSql();
   const admin = isProductionAdmin(context);
-  const [settings, subject] = await Promise.all([
-    loadSettings(sql, org(context)),
-    query.userId ? loadScoreSubject(sql, org(context), query.userId) : Promise.resolve(null)
-  ]);
+  const settings = await loadSettings(sql, org(context));
+  assertSeesScoresOf(context, settings, query.userId);
+  const subject = query.userId ? await loadScoreSubject(sql, org(context), query.userId) : null;
   const period = query.period ?? latestClosedPeriod(new Date(), closeDaysOf(settings));
   const userIds = subject ? [subject.id] : admin ? null : [context.user.id];
   const [rows, runs] = await Promise.all([
     selectSettlements(sql, org(context), { fromPeriod: period, toPeriod: period, userIds, visible: visibleUserSql(sql, context) }),
     admin ? selectRuns(sql, org(context), { period, limit: 1 }) : Promise.resolve([])
   ]);
-  const viewer = { id: context.user.id, admin, moneyPublic: settings.moneyPublic };
+  const viewer = viewerOf(context, settings);
   return { period, run: runs[0] ? toRun(runs[0]) : null, items: rows.map((row) => toSettlement(row, viewer)) };
 };
 
@@ -444,8 +463,9 @@ const reportRow = (
  * ADMIN also gets team and organization totals (PLAN §6 "theo NV, team") and may filter people by team, USER tags
  * (any of them) and USER custom fields (e.g. cf.nang_luc=A). Others see only themselves and cannot use the
  * tag / custom-field filters (403 CUSTOM_FIELDS_FORBIDDEN: members' custom values are Admin data). `userId`
- * ("Điểm cá nhân", PD-052): only that production member, for any production member. Khoán money: ADMIN, the
- * owner, or settings.moneyPublic. Temporary QA test accounts are left out for a viewer who is not one (PD-063).
+ * ("Điểm cá nhân", PD-052): only that production member — someone else needs `view_others_scores` (PD-065, 403
+ * SCORES_PRIVATE). Khoán money: the roles of `view_others_money` (PD-065), the owner, or settings.moneyPublic.
+ * Temporary QA test accounts are left out for a viewer who is not one (PD-063).
  */
 export const getKpiReport = async (
   context: AccessContext,
@@ -457,8 +477,11 @@ export const getKpiReport = async (
     tagId?: string[] | undefined;
     cf?: CustomFieldFilter[] | undefined;
   },
-  /** rollups: false skips the quarter / year rollups and the extra months they read (dashboard card). */
-  options: { rollups?: boolean } = {}
+  /**
+   * rollups: false skips the quarter / year rollups and the extra months they read (dashboard card). everyone: every
+   * person whatever the caller's role ("Quản trị số liệu", whose access the caller checked — PD-065).
+   */
+  options: { rollups?: boolean; everyone?: boolean } = {}
 ): Promise<KpiReport> => {
   assertProductionMember(context);
   const periods = periodsBetween(query.from, query.to);
@@ -472,11 +495,10 @@ export const getKpiReport = async (
   }
   const sql = getSql();
   const organizationId = org(context);
-  const [settings, subject] = await Promise.all([
-    loadSettings(sql, organizationId),
-    query.userId ? loadScoreSubject(sql, organizationId, query.userId) : Promise.resolve(null)
-  ]);
-  const onlyUserIds = subject ? [subject.id] : admin ? null : [context.user.id];
+  const settings = await loadSettings(sql, organizationId);
+  assertSeesScoresOf(context, settings, query.userId);
+  const subject = query.userId ? await loadScoreSubject(sql, organizationId, query.userId) : null;
+  const onlyUserIds = subject ? [subject.id] : admin || options.everyone ? null : [context.user.id];
   const closeDays = closeDaysOf(settings);
   const today = businessDay(new Date());
   const started = (period: string) => periodRange(period, closeDays).from <= today;
@@ -508,7 +530,7 @@ export const getKpiReport = async (
     firstData[0]?.first_target ?? null
   ].filter((value): value is string => value !== null);
   const dataFrom = firstPeriods.length > 0 ? firstPeriods.sort()[0]! : null;
-  const viewer = { id: context.user.id, admin, moneyPublic: settings.moneyPublic };
+  const viewer = viewerOf(context, settings);
   const rows: KpiReportRow[] = settledRows.map((row) => {
     const settlement = toSettlement(row, viewer);
     return reportRow(row.id, row.period, true, { ...settlement, khoanMoney: Number(row.khoan_money) }, seesMoney(viewer, row.id));
@@ -600,8 +622,14 @@ export const getKpiReport = async (
     }
   }
 
-  // Team and organization totals (ADMIN): per month of the range and per quarter / year.
+  // Team and organization totals (ADMIN): per month of the range and per quarter / year. Their money only for a viewer
+  // who sees everyone's (PD-065: an ADMIN without `view_others_money` and moneyPublic off gets null, never a partial sum).
   const totals: KpiReportTotal[] = [];
+  const totalMoney = viewer.money || viewer.moneyPublic;
+  const sumFigures = (items: Parameters<typeof sumKpiFigures>[0]) => {
+    const figures = sumKpiFigures(items);
+    return totalMoney ? figures : { ...figures, khoanMoney: null };
+  };
   if (admin) {
     const groups: { scope: "TEAM" | "ORG"; teamId: string | null; teamName: string | null; members: Set<string> }[] = [];
     const teams = new Map<string, { teamId: string | null; teamName: string | null; members: Set<string> }>();
@@ -621,7 +649,7 @@ export const getKpiReport = async (
       for (const period of periods) {
         const items = finalRows.filter((row) => row.period === period && group.members.has(row.userId));
         if (items.length > 0) {
-          totals.push({ scope: group.scope, teamId: group.teamId, teamName: group.teamName, periodType: "MONTH", key: period, ...sumKpiFigures(items) });
+          totals.push({ scope: group.scope, teamId: group.teamId, teamName: group.teamName, periodType: "MONTH", key: period, ...sumFigures(items) });
         }
       }
       for (const periodType of ["QUARTER", "YEAR"] as const) {
@@ -629,7 +657,7 @@ export const getKpiReport = async (
         for (const key of keys) {
           const items = rollups.filter((item) => item.periodType === periodType && item.key === key && group.members.has(item.userId));
           if (items.length > 0) {
-            totals.push({ scope: group.scope, teamId: group.teamId, teamName: group.teamName, periodType, key, ...sumKpiFigures(items) });
+            totals.push({ scope: group.scope, teamId: group.teamId, teamName: group.teamName, periodType, key, ...sumFigures(items) });
           }
         }
       }

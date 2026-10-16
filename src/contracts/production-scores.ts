@@ -187,10 +187,11 @@ export type ScoreEntryView = z.infer<typeof ScoreEntryViewSchema>;
 
 /**
  * GET /production/scores/user/:userId — "Điểm cá nhân" of one production member (PD-052): what GET
- * /production/scores/me gives its owner (same query, same paging), for that person, plus who they are. Every
- * production member may ask; a user who is not an active production member of the organization → 404
- * SCORE_USER_NOT_FOUND. Money (`moneyKhoanProvisional` of the summary and the cards, `money` of the entries) is
- * null unless the person is the caller, the caller is ADMIN, or settings.moneyPublic (`moneyVisible`).
+ * /production/scores/me gives its owner (same query, same paging), for that person, plus who they are. Someone else's
+ * needs the `view_others_scores` feature (PD-065; by default every role) — 403 SCORES_PRIVATE otherwise; a user who is
+ * not an active production member of the organization → 404 SCORE_USER_NOT_FOUND. Money (`moneyKhoanProvisional` of
+ * the summary and the cards, `money` of the entries) is null unless the person is the caller, the caller has
+ * `view_others_money` (PD-065), or settings.moneyPublic (`moneyVisible`).
  */
 export const UserScoresSchema = MyScoresSchema.extend({
   /** The person (e-mail only for themselves and the people who organise the work, SEC2-09). */
@@ -281,15 +282,16 @@ export const ScoreBoardQuerySchema = z.object({
 });
 
 /**
- * GET /production/scores/board — public points (SPEC §5.4), open to every production member (PD-052: no longer
- * gated by settings.scoresPublic). `money` is null unless the row is the caller's own, the caller is ADMIN, or
- * settings.moneyPublic. Each row opens that person's "Điểm cá nhân" (GET /production/scores/user/:userId).
+ * GET /production/scores/board — public points (SPEC §5.4) for the roles of `view_others_scores` (PD-065; by default
+ * every role, the superadmin always; others 403 SCORES_PRIVATE — settings.scoresPublic stays retired, PD-052). `money`
+ * is null unless the row is the caller's own, the caller has `view_others_money` (PD-065), or settings.moneyPublic.
+ * Each row opens that person's "Điểm cá nhân" (GET /production/scores/user/:userId).
  */
 export const ScoreBoardSchema = z.object({
   period: PeriodKeySchema,
   from: DateOnly,
   to: DateOnly,
-  /** Money is visible for every row (ADMIN or money public). */
+  /** Money is visible for every row (`view_others_money` or money public). */
   moneyVisible: z.boolean(),
   items: z.array(
     z.object({
@@ -405,8 +407,9 @@ export type ApplyDefaultKpiResult = z.infer<typeof ApplyDefaultKpiResultSchema>;
 // Task scores ------------------------------------------------------------------------------------------------
 
 /**
- * Score rows of one task (task detail): everyone's rows, for whoever may see the task (PD-052). `money` is null unless
- * the row is the caller's, the caller is ADMIN, or money is public.
+ * Score rows of one task (task detail): everyone's rows, for whoever may see the task (PD-052) — only the caller's own
+ * without `view_others_scores` (PD-065). `money` is null unless the row is the caller's, the caller has
+ * `view_others_money`, or money is public.
  */
 export const TaskScoreEntrySchema = ScoreEntrySchema.extend({ user: UserRefSchema, money: z.number().int().nullable() });
 export type TaskScoreEntry = z.infer<typeof TaskScoreEntrySchema>;
@@ -470,7 +473,10 @@ export const KpiSettlementRunSchema = z.object({
 });
 export type KpiSettlementRun = z.infer<typeof KpiSettlementRunSchema>;
 
-/** One person's settled period (SPEC §8.1). Money fields are null unless the caller is ADMIN or the owner, or settings.moneyPublic. */
+/**
+ * One person's settled period (SPEC §8.1). Money fields are null unless the caller has `view_others_money` (PD-065) or is
+ * the owner, or settings.moneyPublic.
+ */
 export const KpiSettlementSchema = z.object({
   id: Id,
   user: UserRefSchema,
@@ -509,7 +515,8 @@ export const KpiSettlementRunResultSchema = z.object({ run: KpiSettlementRunSche
 export type KpiSettlementRunResult = z.infer<typeof KpiSettlementRunResultSchema>;
 
 /**
- * Default period: the latest closed one. `userId` (PD-052, "Điểm cá nhân"): only that production member's row, for
+ * Default period: the latest closed one. `userId` (PD-052, "Điểm cá nhân"): only that production member's row (someone
+ * else's needs `view_others_scores`, PD-065: 403 SCORES_PRIVATE), for
  * any production member (404 SCORE_USER_NOT_FOUND when the user is not an active production member).
  */
 export const KpiSettlementQuerySchema = z.object({ period: PeriodKeySchema.optional(), userId: Id.optional() });
@@ -532,9 +539,9 @@ export const KpiSettlementRunCollectionSchema = z.object({ items: z.array(KpiSet
 /**
  * At most 24 periods. ADMIN sees everyone (optionally one team, USER tags `tagId` and USER custom fields
  * `cf.<key>=…`); other members only themselves (tag / custom-field filters → 403 CUSTOM_FIELDS_FORBIDDEN).
- * `userId` (PD-052, "Điểm cá nhân"): only that production member, for any production member (404
- * SCORE_USER_NOT_FOUND when the user is not an active production member). Khoán money: ADMIN, the owner, or
- * settings.moneyPublic.
+ * `userId` (PD-052, "Điểm cá nhân"): only that production member — someone else needs `view_others_scores` (PD-065,
+ * 403 SCORES_PRIVATE); 404 SCORE_USER_NOT_FOUND when the user is not an active production member. Khoán money:
+ * `view_others_money` (PD-065), the owner, or settings.moneyPublic.
  */
 export const KpiReportQuerySchema = z.object({
   from: PeriodKeySchema,
@@ -594,7 +601,8 @@ export type KpiReportRollup = z.infer<typeof KpiReportRollupSchema>;
  * team) and for everyone shown (scope ORG), per month of the range (periodType MONTH, key "YYYY-MM") and per
  * quarter / year (keys as the rollups). Sums over the people shown: target = Σ targets (null when nobody has
  * one), points, converted Khoán points, total; percent = total / target; difference = total − target;
- * khoanMoney = Σ. ADMIN only ([] for others).
+ * khoanMoney = Σ (null unless the caller sees everyone's money: `view_others_money` or moneyPublic, PD-065). ADMIN only
+ * ([] for others).
  */
 export const KpiReportTotalSchema = z.object({
   scope: z.enum(["TEAM", "ORG"]),

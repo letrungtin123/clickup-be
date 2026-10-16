@@ -251,7 +251,7 @@ export const WorkspaceContextSchema = z.object({
   /** Set for admin-created accounts until the user replaces the temporary password (PD-005). */
   mustChangePassword: z.boolean().default(false),
   /**
-   * Effective production (Photo Retouch) roles: ADMIN | ACCOUNT | LEADER | QC | STAFF (PD-011). Empty when the user is
+   * Effective production (Photo Retouch) roles: ADMIN | ACCOUNT | LEADER | QC | STAFF | DIRECTOR (PD-011, PD-065). Empty when the user is
    * not in the PHOTO_RETOUCH department (PD-041) — the module is then closed to them like to anyone without a role.
    */
   productionRoles: z.array(z.string().min(1).max(20)).default([]),

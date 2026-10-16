@@ -13,8 +13,9 @@ import { toIso, type QuerySql } from "../../lib/db-types.js";
 import type { AccessContext } from "../access/access-context.js";
 import { visibleUserSql } from "../access/test-accounts.js";
 import { toUserRef, type UserRefJson } from "../work/mappers.js";
-import { assertProductionMember, isProductionAdmin } from "./access.js";
+import { assertProductionMember, featuresOf, isProductionAdmin } from "./access.js";
 import { closeDaysOf, customFieldsForbidden, loadSettings } from "./catalog.service.js";
+import { featureForbidden } from "./features.js";
 import { matchesCustomFieldFilters, resolveCustomFieldFilters } from "./custom-fields.js";
 import { cursorInstantSql, cursorTextSql, decodeTimeCursor, encodeTimeCursor } from "./cursor.js";
 import { assertTaskVisible, loadTask } from "./jobs.repo.js";
@@ -217,9 +218,30 @@ export const loadScoreSubject = async (sql: QuerySql, organizationId: string, us
   return subject;
 };
 
-/** Khoán money of `userId` for the caller: their own, ADMIN, or settings.moneyPublic (board, task scores, KPI). */
-export const seesMoneyOf = (context: AccessContext, settings: { moneyPublic: boolean }, userId: string) =>
-  userId === context.user.id || isProductionAdmin(context) || settings.moneyPublic;
+/**
+ * Everyone's Khoán money for the caller (board, task scores, "Điểm cá nhân", PD-065): settings.moneyPublic or the
+ * `view_others_money` feature (by default Admin and Director; the superadmin always).
+ */
+export const seesOthersMoney = (context: AccessContext, settings: Pick<ProductionSettings, "moneyPublic" | "featurePermissions">) =>
+  settings.moneyPublic || featuresOf(context, settings.featurePermissions).has("view_others_money");
+
+/** Khoán money of `userId` for the caller: their own, or `seesOthersMoney`. */
+export const seesMoneyOf = (context: AccessContext, settings: Pick<ProductionSettings, "moneyPublic" | "featurePermissions">, userId: string) =>
+  userId === context.user.id || seesOthersMoney(context, settings);
+
+/**
+ * PD-065: someone else's scores ("Xếp hạng", "Điểm cá nhân", forecast, a task's rows) need `view_others_scores` (by default
+ * every role; the superadmin always). One's own scores are always visible.
+ */
+export const seesOthersScores = (context: AccessContext, settings: Pick<ProductionSettings, "featurePermissions">) =>
+  featuresOf(context, settings.featurePermissions).has("view_others_scores");
+
+/** 403 SCORES_PRIVATE when `userId` is someone else and the caller lacks `view_others_scores`. */
+const assertSeesScoresOf = (context: AccessContext, settings: Pick<ProductionSettings, "featurePermissions">, userId: string) => {
+  if (userId !== context.user.id && !seesOthersScores(context, settings)) {
+    throw featureForbidden("view_others_scores");
+  }
+};
 
 /**
  * Summary, fixed today / week / period cards and a page of entries of one person (`subjectId`) — GET /production/scores/me
@@ -288,14 +310,16 @@ const hideTotalsMoney = <T extends { moneyKhoanProvisional: number }>(totals: T,
 });
 
 /**
- * GET /production/scores/user/:userId — "Điểm cá nhân" of any production member for every production member (PD-052):
- * what /scores/me shows its owner, money hidden unless `seesMoneyOf`.
+ * GET /production/scores/user/:userId — "Điểm cá nhân" of any production member (PD-052): what /scores/me shows its
+ * owner, money hidden unless `seesMoneyOf`. Someone else's needs `view_others_scores` (PD-065, 403 SCORES_PRIVATE).
  */
 export const getUserScores = async (context: AccessContext, userId: string, query: ScoresQuery): Promise<UserScores> => {
   assertProductionMember(context);
   const sql = getSql();
   const organizationId = org(context);
-  const [settings, subject] = await Promise.all([loadSettings(sql, organizationId), loadScoreSubject(sql, organizationId, userId)]);
+  const settings = await loadSettings(sql, organizationId);
+  assertSeesScoresOf(context, settings, userId);
+  const subject = await loadScoreSubject(sql, organizationId, userId);
   const scores = await loadScores(sql, organizationId, subject.id, settings, query);
   const moneyVisible = seesMoneyOf(context, settings, subject.id);
   return {
@@ -401,7 +425,10 @@ export const getScoreForecast = async (context: AccessContext, query: { period?:
   return await computeForecast(sql, org(context), context.user.id, settings, query);
 };
 
-/** GET /production/scores/user/:userId/forecast — the KPI forecast of any production member (PD-052), money per `seesMoneyOf`. */
+/**
+ * GET /production/scores/user/:userId/forecast — the KPI forecast of any production member (PD-052), money per
+ * `seesMoneyOf`; someone else's needs `view_others_scores` (PD-065, 403 SCORES_PRIVATE).
+ */
 export const getUserScoreForecast = async (
   context: AccessContext,
   userId: string,
@@ -410,7 +437,9 @@ export const getUserScoreForecast = async (
   assertProductionMember(context);
   const sql = getSql();
   const organizationId = org(context);
-  const [settings, subject] = await Promise.all([loadSettings(sql, organizationId), loadScoreSubject(sql, organizationId, userId)]);
+  const settings = await loadSettings(sql, organizationId);
+  assertSeesScoresOf(context, settings, userId);
+  const subject = await loadScoreSubject(sql, organizationId, userId);
   const result = await computeForecast(sql, organizationId, subject.id, settings, query);
   return hideTotalsMoney(result, seesMoneyOf(context, settings, subject.id));
 };
@@ -434,9 +463,10 @@ type BoardRow = {
 
 /**
  * GET /production/scores/board — every production worker (STAFF/LEADER/QC) and anyone who scored in
- * the period, ranked by official points. Open to every production member (PD-052: settings.scoresPublic no
- * longer hides it); money only for the row's owner, ADMIN, or when settings.moneyPublic. Temporary QA test accounts
- * are left out for a viewer who is not one (PD-063).
+ * the period, ranked by official points. PD-065: the roles of `view_others_scores` (by default every role; the
+ * superadmin always), others 403 SCORES_PRIVATE (settings.scoresPublic stays retired, PD-052); money only for the row's
+ * owner, `view_others_money`, or when settings.moneyPublic. Temporary QA test accounts are left out for a viewer who is
+ * not one (PD-063).
  */
 export const getScoreBoard = async (
   context: AccessContext,
@@ -446,6 +476,9 @@ export const getScoreBoard = async (
   const sql = getSql();
   const organizationId = org(context);
   const settings = await loadSettings(sql, organizationId);
+  if (!seesOthersScores(context, settings)) {
+    throw featureForbidden("view_others_scores");
+  }
   const admin = isProductionAdmin(context);
   // USER tags / custom fields (e.g. "Năng lực") are Admin data: only an Admin filters the board by them.
   const tagIds = query.tagId ?? [];
@@ -494,7 +527,7 @@ export const getScoreBoard = async (
     LIMIT 5000
   `;
 
-  const moneyVisible = admin || settings.moneyPublic;
+  const moneyVisible = seesOthersMoney(context, settings);
   const ranked = rankByPoints(
     rows
       .filter((row) => matchesCustomFieldFilters(row.custom_values, plans) && (tagIds.length === 0 || (row.tag_ids ?? []).some((id) => tagIds.includes(id))))
@@ -527,8 +560,9 @@ export const getScoreBoard = async (
 
 /**
  * GET /production/scores/task/:taskId — the ledger rows of one task (task detail), everyone's, for anyone who may
- * see the task. Points are public (PD-052 retired the settings.scoresPublic filter of PR-11, like the board and
- * "Điểm cá nhân"); money only for the row's owner, ADMIN, or when settings.moneyPublic.
+ * see the task (PD-052 retired the settings.scoresPublic filter of PR-11). PD-065: someone without
+ * `view_others_scores` gets only their own rows (totals and per-process figures of those rows); money only for the row's
+ * owner, `view_others_money`, or when settings.moneyPublic.
  */
 export const getTaskScores = async (context: AccessContext, taskId: string): Promise<TaskScores> => {
   assertProductionMember(context);
@@ -538,7 +572,8 @@ export const getTaskScores = async (context: AccessContext, taskId: string): Pro
   await assertTaskVisible(sql, context, task);
   const settings = await loadSettings(sql, organizationId);
   const admin = isProductionAdmin(context);
-  const moneyVisible = admin || settings.moneyPublic;
+  const moneyVisible = seesOthersMoney(context, settings);
+  const onlyMine = !seesOthersScores(context, settings);
   const rows = await sql<(EntryRow & { owner: UserRefJson })[]>`
     SELECT e.id, e.role, e.task_id, t.number::text AS task_number, (${parentNumberSql(sql)})::text AS task_parent_number,
       t.sub_seq AS task_sub_seq, e.job_id, j.code AS job_code, e.project_id, p.code AS project_code,
@@ -560,6 +595,7 @@ export const getTaskScores = async (context: AccessContext, taskId: string): Pro
         SELECT st.id FROM production.tasks st
         WHERE st.organization_id = ${organizationId} AND st.parent_task_id = ${taskId} AND st.kind = 'NORMAL' AND st.deleted_at IS NULL
       ))
+      ${onlyMine ? sql`AND e.user_id = ${context.user.id}` : sql``}
     ORDER BY e.created_at, e.adjusts_entry_id NULLS FIRST, e.recorded_at, e.id
   `;
   const visible = (userId: string) => moneyVisible || userId === context.user.id;

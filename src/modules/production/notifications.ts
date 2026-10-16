@@ -189,7 +189,10 @@ export const productionRecipients = {
    */
   jobComment: (job: JobPeople, writerId: string | null, mentionedIds: readonly string[] = []) =>
     distinct([job.leaderId, job.creatorId, ...job.workerIds], [writerId, ...mentionedIds]),
-  /** LEAVE_REQUESTED → the approvers: production Admins incl. organization superadmins (PD-057: no Leaders), never the requester. */
+  /**
+   * LEAVE_REQUESTED → the approvers: holders of a role of the `leave_approval` feature (PD-065; by default production
+   * Admins — PD-057: no Leaders) and the organization superadmins, never the requester.
+   */
   leaveRequested: (approverIds: readonly string[], requesterId: string) => distinct(approverIds, [requesterId]),
   /** LEAVE_DECIDED → the requester. */
   leaveDecided: (requesterId: string) => distinct([requesterId]),
@@ -731,9 +734,9 @@ const leavePayload = (leaveId: string, leave: LeaveInfo) => ({
 
 Object.assign(productionNotificationHandlers, {
   /**
-   * New leave request → the people who can approve it: active production Admins and organization superadmins
-   * (PD-057 — only Quản trị decides; Leaders are no longer notified, they still see pending requests in the
-   * calendar). Never the requester. The body says what, when and why (`leaveRequestedBody`).
+   * New leave request → the people who can approve it: active holders of a role of the `leave_approval` feature
+   * (PD-065; by default Quản trị — PD-057: Leaders are not notified, they still see pending requests in the calendar)
+   * and the organization superadmins. Never the requester. The body says what, when and why (`leaveRequestedBody`).
    */
   "production.leave.requested": async (envelope: DomainEventEnvelope) => {
     const leaveId = str(envelope.payload.leaveId);
@@ -741,7 +744,9 @@ Object.assign(productionNotificationHandlers, {
     if (!leaveId || !leave) {
       return;
     }
-    const approverIds = await loadProductionAdminIds(getSql(), envelope.organizationId);
+    const sql = getSql();
+    const approverRoles = (await loadSettings(sql, envelope.organizationId)).featurePermissions.leave_approval;
+    const approverIds = await loadProductionRoleHolderIds(sql, envelope.organizationId, approverRoles);
     await deliverNotifications({
       organizationId: envelope.organizationId,
       recipientIds: productionRecipients.leaveRequested(approverIds, leave.user_id),

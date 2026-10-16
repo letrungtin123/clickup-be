@@ -303,7 +303,8 @@ describe("job permission matrix (PD-036)", () => {
     expect(effectiveJobScopes(["ACCOUNT", "STAFF"], strict)).toEqual({ view: "all", create: "own", update: "own", delete: "none" });
     expect(effectiveJobScopes(["ADMIN"], strict)).toEqual({ view: "all", create: "all", update: "all", delete: "all" });
     expect(effectiveJobScopes([], strict)).toEqual({ view: "none", create: "none", update: "none", delete: "none" });
-    expect(rolesWithAll(strict, "view")).toEqual(["ADMIN", "ACCOUNT", "LEADER"]);
+    // PD-065: DIRECTOR sees every job by default.
+    expect(rolesWithAll(strict, "view")).toEqual(["ADMIN", "ACCOUNT", "LEADER", "DIRECTOR"]);
     expect(rolesWithAll(strict, "create")).toEqual(["ADMIN", "LEADER"]);
   });
 

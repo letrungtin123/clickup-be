@@ -31,18 +31,22 @@ export const leaveLimits = {
   maxRequestDays: 31,
   /** Inclusive length of one calendar query / export window, in days (PD-057: one year, for "Khoảng ngày"). */
   maxCalendarDays: 366,
-  /** A new request's reason ("Lý do nghỉ", PD-057) is required: trimmed, at least this many characters. */
+  /** Unused since PD-065 (the reason is optional again); kept for compatibility. */
   noteMinLength: 3,
+  /** A request's reason ("Lý do nghỉ"), trimmed: at most this many characters. */
   noteMaxLength: 1000
 } as const;
 
-/** PD-057: the reason is required on new requests (older rows may have none; they export as "(không ghi lý do)"). */
+/**
+ * @deprecated PD-065: the reason is optional again — the server no longer uses this message (PD-057 had made it
+ * required). Kept only until the FE stops importing it. Requests without a reason export as "(không ghi lý do)".
+ */
 export const leaveNoteRequiredMessage = "Nhập lý do nghỉ (ít nhất 3 ký tự).";
 
 /**
  * One leave request as the caller may see it. `note`, `decisionNote`, `decidedBy` and the owner's
- * email are null unless the caller owns the request or is LEADER/ADMIN (Leaders keep seeing the
- * details read-only: only ADMIN decides, PD-057).
+ * email are null unless the caller owns the request, is LEADER/ADMIN or an approver (`leave_approval`, PD-065;
+ * Leaders keep seeing the details read-only, PD-057).
  */
 export const LeaveRequestSchema = z.object({
   id: Id,
@@ -64,7 +68,10 @@ export const LeaveRequestSchema = z.object({
   updatedAt: IsoDate,
   /** The caller may cancel it now: owner or ADMIN, only before it starts (PD-059). */
   canCancel: z.boolean(),
-  /** The caller may approve/reject it now: ADMIN (organization superadmins included), PENDING only (PD-057). */
+  /**
+   * The caller may approve/reject it now: the roles of the `leave_approval` feature (PD-065; by default ADMIN, organization
+   * superadmins always), PENDING only (PD-057).
+   */
   canDecide: z.boolean()
 });
 export type LeaveRequest = z.infer<typeof LeaveRequestSchema>;
@@ -77,7 +84,7 @@ export const LeaveCalendarQuerySchema = z.object({ from: DateOnly, to: DateOnly,
 
 /**
  * Everyone: APPROVED requests of all members + own requests in any status.
- * LEADER/ADMIN: also every PENDING request (Leaders read-only — `canDecide` is ADMIN only, PD-057).
+ * LEADER/ADMIN and the approvers (`leave_approval`, PD-065): also every PENDING request (`canDecide` only for approvers).
  */
 export const LeaveCalendarSchema = z.object({
   from: DateOnly,
@@ -89,11 +96,12 @@ export const LeaveCalendarSchema = z.object({
 export type LeaveCalendar = z.infer<typeof LeaveCalendarSchema>;
 
 /**
- * GET /production/leave/export?from&to[&teamId] — ADMIN only (PD-057; organization superadmins included): the
+ * GET /production/leave/export?from&to[&teamId] — the roles of the `leave_approval` feature (PD-065; by default ADMIN,
+ * organization superadmins always; PD-057): the
  * payroll attendance workbook ("Bảng chấm công nghỉ phép") of the inclusive window, at most
  * leaveLimits.maxCalendarDays days. Response: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet with
  * `Content-Disposition: attachment; filename="cham-cong-nghi-phep_<from>_<to>.xlsx"` (+ RFC 5987 filename*).
- * Errors are JSON: 404 not a production member / unknown team, 403 FORBIDDEN not ADMIN, 400 invalid window.
+ * Errors are JSON: 404 not a production member / unknown team, 403 FORBIDDEN without the feature, 400 invalid window.
  * Sheet "Chấm công": every active production member (team filter: that report team) × every day, APPROVED requests
  * only — P = nghỉ cả ngày, S = buổi sáng, C = buổi chiều, S+C = cả hai buổi (1 ngày). Sheet "Chi tiết đơn nghỉ":
  * APPROVED, PENDING and REJECTED requests overlapping the window (never CANCELLED).
@@ -101,23 +109,28 @@ export type LeaveCalendar = z.infer<typeof LeaveCalendarSchema>;
 export const LeaveExportQuerySchema = z.object({ from: DateOnly, to: DateOnly, teamId: Id.optional() });
 export type LeaveExportQuery = z.infer<typeof LeaveExportQuerySchema>;
 
-/** POST /production/leave — always for the signed-in user. The reason (`note`) is required (PD-057). */
+/**
+ * POST /production/leave — always for the signed-in user. The reason (`note`) is optional again (PD-065 reverts the
+ * PD-057 rule): trimmed, at most leaveLimits.noteMaxLength characters; missing, null or blank → null.
+ */
 export const CreateLeaveRequestSchema = z
   .object({
     fromDate: DateOnly,
     toDate: DateOnly,
     part: LeavePartSchema.default("FULL_DAY"),
     note: z
-      .string({ error: leaveNoteRequiredMessage })
+      .string()
       .refine(hasNoNul, "Không được chứa ký tự NUL.")
       .trim()
-      .min(leaveLimits.noteMinLength, leaveNoteRequiredMessage)
       .max(leaveLimits.noteMaxLength, `Lý do nghỉ tối đa ${leaveLimits.noteMaxLength} ký tự.`)
+      .nullable()
+      .optional()
+      .transform((note) => (note ? note : null))
   })
   .strict();
 export type CreateLeaveRequest = z.infer<typeof CreateLeaveRequestSchema>;
 
-/** POST /production/leave/:id/decide — ADMIN only (PD-057: 403 "Chỉ Quản trị mới duyệt được đơn nghỉ."). */
+/** POST /production/leave/:id/decide — the `leave_approval` feature (PD-065; others 403 "Bạn không có quyền duyệt đơn nghỉ."). */
 export const DecideLeaveRequestSchema = z
   .object({
     decision: z.enum(["APPROVED", "REJECTED"]),

@@ -127,7 +127,8 @@ export const canCancelLeave = (
   (viewer.admin || request.own);
 
 /**
- * Only ADMIN (organization superadmins included) decides, and only PENDING requests — their own too (PD-057:
- * Leaders no longer approve; they still see pending requests read-only).
+ * Only the roles of the `leave_approval` feature (`decider`, PD-065; by default Quản trị, organization superadmins always)
+ * decide, and only PENDING requests — their own too (PD-057: Leaders no longer approve; they still see pending requests
+ * read-only).
  */
-export const canDecideLeave = (request: { status: string }, viewer: { admin: boolean }) => request.status === "PENDING" && viewer.admin;
+export const canDecideLeave = (request: { status: string }, viewer: { decider: boolean }) => request.status === "PENDING" && viewer.decider;

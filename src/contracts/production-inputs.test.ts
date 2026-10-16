@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   CustomValuesSchema,
+  defaultFeaturePermissions,
   defaultJobPermissions,
   IsoDateInputSchema,
   isKpiCloseDay,
@@ -165,6 +166,7 @@ describe("production settings: close day and Khoán pay policy", () => {
       kpiDefaultLeader: 80,
       chatAttachmentsEnabled: true,
       jobPermissions: defaultJobPermissions,
+      featurePermissions: defaultFeaturePermissions,
       timezone: "Asia/Ho_Chi_Minh"
     };
     expect(ProductionSettingsSchema.safeParse(settings).success).toBe(true);

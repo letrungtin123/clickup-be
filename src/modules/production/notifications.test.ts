@@ -59,6 +59,7 @@ vi.mock("../notifications/notifications.service.js", () => ({
 }));
 
 const { productionRecipients, productionNotificationHandlers, notifyDeadline, leaveRequestedBody, leaveReasonExcerpt } = await import("./notifications.js");
+const { clearProductionConfigCache } = await import("./catalog-cache.js");
 
 const org = "11111111-1111-4111-8111-111111111111";
 const assignee = "22222222-2222-4222-8222-222222222222";
@@ -107,6 +108,7 @@ beforeEach(() => {
   db.state.calls = [];
   db.state.handler = () => [];
   delivered.drafts = [];
+  clearProductionConfigCache();
 });
 
 describe("productionRecipients (SPEC Phase 4 / PLAN §8)", () => {
@@ -430,7 +432,8 @@ describe("worker handlers load the people the rules need", () => {
       if (call.text.includes("FROM production.leave_requests lr")) {
         return [{ user_id: assignee, display_name: "NV", from_date: "2026-10-12", to_date: "2026-10-12", part: "FULL_DAY", status: "PENDING", note: "Việc gia đình", decision_note: null }];
       }
-      if (call.text.includes("ur.role_code = 'ADMIN'")) {
+      // PD-065: the roles of the leave_approval feature (default ["ADMIN"]) plus the superadmins.
+      if (call.text.includes("ur.role_code = ANY(")) {
         return [{ user_id: admin }, { user_id: superadmin }, { user_id: assignee }];
       }
       return undefined;
@@ -441,11 +444,34 @@ describe("worker handlers load the people the rules need", () => {
     // What, when and why for the approver (PD-057).
     expect(draft!.body).toBe("Nghỉ cả ngày 12/10: Việc gia đình");
     expect(draft!.payload).toMatchObject({ requesterName: "NV", fromDate: "2026-10-12", part: "FULL_DAY", reason: "Việc gia đình", note: null });
-    const approverQuery = db.state.calls.find((call) => call.text.includes("ur.role_code = 'ADMIN'"))!;
+    const approverQuery = db.state.calls.find((call) => call.text.includes("ur.role_code = ANY("))!;
     // Admins must be active members; superadmins are implicit Admins; Leaders are not asked any more.
     expect(approverQuery.text).toContain("om.status = 'active'");
     expect(approverQuery.text).toContain("r.key = 'superadmin'");
+    expect(approverQuery.values).toContainEqual(["ADMIN"]);
     expect(db.state.calls.some((call) => call.text.includes("LEADER"))).toBe(false);
+  });
+
+  it("PD-065: leave requested → the roles the superadmin gave leave_approval (e.g. Leader and Director)", async () => {
+    const { defaultFeaturePermissions } = await import("../../contracts/production-catalog.js");
+    db.state.handler = (call) => {
+      if (call.text.includes("FROM production.settings")) {
+        return [{ key: "feature_permissions", value: { ...defaultFeaturePermissions, leave_approval: ["LEADER", "DIRECTOR"] } }];
+      }
+      if (call.text.includes("FROM production.leave_requests lr")) {
+        return [{ user_id: assignee, display_name: "NV", from_date: "2026-10-12", to_date: "2026-10-12", part: "FULL_DAY", status: "PENDING", note: null, decision_note: null }];
+      }
+      if (call.text.includes("ur.role_code = ANY(")) {
+        return [{ user_id: leader }, { user_id: superadmin }];
+      }
+      return undefined;
+    };
+    await productionNotificationHandlers["production.leave.requested"]!(envelope("production.leave.requested", { leaveId: "ffffffff-ffff-4fff-8fff-ffffffffffff" }, assignee));
+    const [draft] = draftsOf("production.leave_requested");
+    expect(sorted(draft!.recipientIds)).toEqual(sorted([leader, superadmin]));
+    // No reason (optional again): the body says what and when only.
+    expect(draft!.body).toBe("Nghỉ cả ngày 12/10");
+    expect(db.state.calls.find((call) => call.text.includes("ur.role_code = ANY("))!.values).toContainEqual(["LEADER", "DIRECTOR"]);
   });
 
   it("leave request body: part, dates and the reason, cut to 200 characters on one line", () => {

@@ -36,9 +36,20 @@ export const isAcceptedInstant = (value: string) => {
 /** Instant from a request: ISO 8601 with an offset, within isAcceptedInstant. */
 export const IsoDateInputSchema = z.string().datetime({ offset: true }).refine(isAcceptedInstant, "Thời điểm không hợp lệ.");
 
-export const productionRoleCodes = ["ADMIN", "ACCOUNT", "LEADER", "QC", "STAFF"] as const;
+/**
+ * Production roles (PD-011). DIRECTOR ("Director", PD-065) is the company director: by default the only role with
+ * "Quản trị số liệu" and "Bất thường", and it sees every job; it has no Quản trị (ADMIN) power otherwise. The
+ * organization superadmin holds ADMIN and DIRECTOR implicitly.
+ */
+export const productionRoleCodes = ["ADMIN", "ACCOUNT", "LEADER", "QC", "STAFF", "DIRECTOR"] as const;
 export const ProductionRoleSchema = z.enum(productionRoleCodes);
 export type ProductionRole = z.infer<typeof ProductionRoleSchema>;
+
+/** Known production role codes of a list, de-duplicated, in the stable order of `productionRoleCodes`. */
+export const sortProductionRoles = (roles: Iterable<string>): ProductionRole[] => {
+  const given = new Set(roles);
+  return productionRoleCodes.filter((code) => given.has(code));
+};
 
 export const customFieldEntities = ["JOB", "TASK", "USER", "CLIENT"] as const;
 export const CustomFieldEntitySchema = z.enum(customFieldEntities);
@@ -171,12 +182,8 @@ export const JobScopesSchema = z
   .strict();
 export type JobScopes = z.infer<typeof JobScopesSchema>;
 /** The roles an Admin configures; ADMIN is always "all" everywhere and is not stored. */
-export const jobPermissionRoles = ["ACCOUNT", "LEADER", "QC", "STAFF"] as const satisfies readonly ProductionRole[];
+export const jobPermissionRoles = ["ACCOUNT", "LEADER", "QC", "STAFF", "DIRECTOR"] as const satisfies readonly ProductionRole[];
 export type JobPermissionRole = (typeof jobPermissionRoles)[number];
-export const JobPermissionMatrixSchema = z
-  .object({ ACCOUNT: JobScopesSchema, LEADER: JobScopesSchema, QC: JobScopesSchema, STAFF: JobScopesSchema })
-  .strict();
-export type JobPermissionMatrix = z.infer<typeof JobPermissionMatrixSchema>;
 
 const allScopes: JobScopes = { view: "all", create: "all", update: "all", delete: "all" };
 const noScopes: JobScopes = { view: "none", create: "none", update: "none", delete: "none" };
@@ -187,8 +194,51 @@ const noScopes: JobScopes = { view: "none", create: "none", update: "none", dele
 const staffScopes: JobScopes = { view: "all", create: "none", update: "own", delete: "none" };
 /** PD-051: QC people are staff too — no own work entry and no task delete; they see and update their own tasks. */
 const qcScopes: JobScopes = { view: "own", create: "none", update: "own", delete: "none" };
-/** The owner's defaults (seeded by migration 20261013_0110; STAFF by 20261015_0200, PD-047; QC by 20261015_0300, PD-051). */
-export const defaultJobPermissions: JobPermissionMatrix = { ACCOUNT: allScopes, LEADER: allScopes, QC: qcScopes, STAFF: staffScopes };
+/** PD-065: the Director sees every job and changes none. */
+const directorScopes: JobScopes = { view: "all", create: "none", update: "none", delete: "none" };
+
+/**
+ * "Phân quyền Job" matrix. DIRECTOR (PD-065) may be left out of a request or a stored value (matrices saved before it):
+ * it then reads its default (view all, nothing else).
+ */
+export const JobPermissionMatrixSchema = z
+  .object({
+    ACCOUNT: JobScopesSchema,
+    LEADER: JobScopesSchema,
+    QC: JobScopesSchema,
+    STAFF: JobScopesSchema,
+    DIRECTOR: JobScopesSchema.default(directorScopes)
+  })
+  .strict();
+export type JobPermissionMatrix = z.infer<typeof JobPermissionMatrixSchema>;
+
+/**
+ * The owner's defaults (seeded by migration 20261013_0110; STAFF by 20261015_0200, PD-047; QC by 20261015_0300, PD-051;
+ * DIRECTOR by PD-065, not stored until the matrix is saved again).
+ */
+export const defaultJobPermissions: JobPermissionMatrix = {
+  ACCOUNT: allScopes,
+  LEADER: allScopes,
+  QC: qcScopes,
+  STAFF: staffScopes,
+  DIRECTOR: directorScopes
+};
+
+/**
+ * A stored `job_permissions` value as the API uses it: each role column that is missing or invalid (e.g. DIRECTOR in a
+ * matrix saved before PD-065) reads its default.
+ */
+export const normalizeJobPermissions = (value: unknown): JobPermissionMatrix => {
+  const stored = typeof value === "object" && value !== null && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
+  const result = { ...defaultJobPermissions };
+  for (const role of jobPermissionRoles) {
+    const parsed = JobScopesSchema.safeParse(stored[role]);
+    if (parsed.success) {
+      result[role] = parsed.data;
+    }
+  }
+  return result;
+};
 
 const scopeRank: Record<JobPermissionScope, number> = { none: 0, own: 1, all: 2 };
 /** The more permissive of two scopes. */
@@ -207,6 +257,90 @@ export const effectiveJobScopes = (roles: Iterable<ProductionRole>, matrix: JobP
     }
   }
   return result;
+};
+
+// Feature permission matrix (PD-065) ---------------------------------------------------------------
+
+/**
+ * "Phân quyền Photo Retouch": which production roles use each feature, edited by the organization superadmin (PD-050)
+ * in Cài đặt → Vai trò & phân quyền (setting `feature_permissions`). A user has a feature when one of their roles is
+ * listed; the organization superadmin always has every feature. ADMIN gets a feature only through the matrix.
+ *  - qc_queue            "Hàng chờ QC" (GET /production/tasks/qc-queue).
+ *  - view_others_scores  others' scores: "Xếp hạng" (+ export), "Điểm cá nhân" of others (+ forecast), others' KPI rows
+ *                        (`userId` on /kpi/settlements, /kpi/report, /kpi/export) and others' rows of a task's scores.
+ *                        One's own scores are always visible.
+ *  - view_others_money   others' Khoán money (board, task scores, "Điểm cá nhân", KPI) and money per image of the
+ *                        credit grid ("Bảng đơn giá"). Setting `moneyPublic` opens it to everyone; one's own always.
+ *  - leader_dashboard    "Bảng điều khiển" (GET /production/dashboard/leader).
+ *  - admin_dashboard     "Quản trị số liệu" (GET /production/dashboard/admin) and running its pinned reports.
+ *  - anomalies           "Bất thường" (GET /production/anomalies, "Đã xem" review / undo).
+ *  - leave_approval      approve / reject leave requests and the attendance Excel export (GET /production/leave/export);
+ *                        the approvers are notified of new requests.
+ *  - clients             "Khách hàng" (GET /production/clients; writes stay the superadmin's, PD-050).
+ * Data scopes do not change: on the dashboards and anomalies ADMIN and DIRECTOR (and the superadmin) see every job,
+ * anyone else the jobs they lead plus the jobs without a leader. "Cấu hình Photo Retouch" stays fixed (not in the matrix).
+ */
+export const featurePermissionKeys = [
+  "qc_queue",
+  "view_others_scores",
+  "view_others_money",
+  "leader_dashboard",
+  "admin_dashboard",
+  "anomalies",
+  "leave_approval",
+  "clients"
+] as const;
+export const FeaturePermissionKeySchema = z.enum(featurePermissionKeys);
+export type FeaturePermissionKey = z.infer<typeof FeaturePermissionKeySchema>;
+
+/** Roles of one feature: known codes, de-duplicated, in the stable order of `productionRoleCodes`. */
+const FeatureRolesSchema = z
+  .array(ProductionRoleSchema)
+  .max(productionRoleCodes.length * 2)
+  .transform((roles) => sortProductionRoles(roles));
+/** Every key is required (unknown keys are rejected). */
+export const FeaturePermissionMatrixSchema = z.record(FeaturePermissionKeySchema, FeatureRolesSchema);
+export type FeaturePermissionMatrix = z.infer<typeof FeaturePermissionMatrixSchema>;
+
+/** The owner's defaults (PD-065); used until the superadmin saves the matrix. */
+export const defaultFeaturePermissions: FeaturePermissionMatrix = {
+  qc_queue: ["ADMIN", "QC"],
+  view_others_scores: ["ADMIN", "ACCOUNT", "LEADER", "QC", "STAFF", "DIRECTOR"],
+  view_others_money: ["ADMIN", "DIRECTOR"],
+  leader_dashboard: ["ADMIN", "LEADER", "DIRECTOR"],
+  admin_dashboard: ["DIRECTOR"],
+  anomalies: ["DIRECTOR"],
+  leave_approval: ["ADMIN"],
+  clients: ["ADMIN", "ACCOUNT"]
+};
+
+/** A stored `feature_permissions` value as the API uses it: a missing or invalid key reads its default; unknown keys are dropped. */
+export const normalizeFeaturePermissions = (value: unknown): FeaturePermissionMatrix => {
+  const stored = typeof value === "object" && value !== null && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
+  const result = { ...defaultFeaturePermissions };
+  for (const key of featurePermissionKeys) {
+    const parsed = FeatureRolesSchema.safeParse(stored[key]);
+    if (parsed.success) {
+      result[key] = parsed.data;
+    }
+  }
+  return result;
+};
+
+/**
+ * The features of someone holding `roles` (union over the roles, in `featurePermissionKeys` order). `superadmin`: the
+ * organization superadmin (hasFullOrganizationAuthority) has every feature.
+ */
+export const effectiveFeatures = (
+  roles: Iterable<ProductionRole>,
+  matrix: FeaturePermissionMatrix,
+  superadmin = false
+): FeaturePermissionKey[] => {
+  if (superadmin) {
+    return [...featurePermissionKeys];
+  }
+  const mine = new Set<string>(roles);
+  return featurePermissionKeys.filter((key) => (matrix[key] ?? []).some((role) => mine.has(role)));
 };
 
 // Members -----------------------------------------------------------------------------------------
@@ -237,7 +371,7 @@ export type ProductionMemberQuery = z.infer<typeof ProductionMemberQuerySchema>;
 
 export const UpdateProductionMemberRequestSchema = z
   .object({
-    roles: z.array(ProductionRoleSchema).max(5).optional(),
+    roles: z.array(ProductionRoleSchema).max(productionRoleCodes.length).optional(),
     teamId: Id.nullable().optional(),
     customValues: CustomValuesSchema.optional(),
     tagIds: z.array(Id).max(50).optional()
@@ -251,6 +385,12 @@ export const ProductionMeSchema = z.object({
   teamId: Id.nullable(),
   /** My scopes in the job permission matrix (PD-036): the job menu, "Tạo job", "Nhập công việc", the assignee picker. */
   jobPermissions: JobScopesSchema,
+  /**
+   * PD-065: my features in the feature permission matrix (`featurePermissionKeys` order): the menus "Hàng chờ QC",
+   * "Bảng điều khiển", "Quản trị số liệu", "Bất thường", "Khách hàng", "Xếp hạng", leave approval / export. The
+   * superadmin has all of them. Others' money also opens with settings.moneyPublic.
+   */
+  features: z.array(FeaturePermissionKeySchema),
   settings: z.object({
     /**
      * Close day of the CURRENT KPI period (an Admin's change applies from the next period, see kpiCloseDays);
@@ -461,7 +601,7 @@ export const UpsertStatusRequestSchema = z
     countsDone: z.boolean().default(false),
     countsChecked: z.boolean().default(false),
     isTerminal: z.boolean().default(false),
-    setByRoles: z.array(ProductionRoleSchema).max(5).default([]),
+    setByRoles: z.array(ProductionRoleSchema).max(productionRoleCodes.length).default([]),
     active: z.boolean().optional()
   })
   .strict();
@@ -609,7 +749,7 @@ export const ProductionSettingsSchema = z.object({
    * Still stored and accepted for compatibility; it gates nothing.
    */
   scoresPublic: z.boolean(),
-  /** Others' Khoán money for every production member; otherwise ADMIN and the owner only. */
+  /** Others' Khoán money for every production member; otherwise the roles of `view_others_money` (PD-065) and the owner only. */
   moneyPublic: z.boolean(),
   kpiProrateLeave: z.boolean(),
   /** Khoán pay policy of the settlement (PD-033); applies to the next run (automatic or manual) and to provisional figures. */
@@ -621,6 +761,11 @@ export const ProductionSettingsSchema = z.object({
   chatAttachmentsEnabled: z.boolean(),
   /** "Phân quyền Job" (PD-036): role × action scopes; ADMIN is always "all" (not part of the value). */
   jobPermissions: JobPermissionMatrixSchema,
+  /**
+   * "Phân quyền Photo Retouch" (PD-065): feature → roles, every key present (see `featurePermissionKeys`). Written by the
+   * superadmin only (PATCH, PD-050); the superadmin always has every feature whatever the value.
+   */
+  featurePermissions: FeaturePermissionMatrixSchema,
   timezone: z.string()
 });
 export type ProductionSettings = z.infer<typeof ProductionSettingsSchema>;

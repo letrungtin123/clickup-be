@@ -654,7 +654,8 @@ describe("Done needs the numbers", () => {
 
 describe("anomalies never call an empty quantity 'lệch số lượng'", () => {
   it("QTY_MISMATCH reads tasks that have both numbers only", async () => {
-    await listAnomalies(contextWith(["LEADER"], leader), { kind: "QTY_MISMATCH", days: 30, includeReviewed: false });
+    // PD-065: "Bất thường" is the Director's by default.
+    await listAnomalies(contextWith(["DIRECTOR"], leader), { kind: "QTY_MISMATCH", days: 30, includeReviewed: false });
     const query = callsLike(/t\.qty_done <> t\.qty_assigned/)[0]!;
     expect(query.text).toContain("AND t.qty_done IS NOT NULL AND t.qty_assigned IS NOT NULL AND t.qty_done <> t.qty_assigned");
   });

@@ -42,7 +42,7 @@ export const DepartmentListSchema = z
  * Thành viên). Kept identical to `productionRoleCodes` (contracts/production-catalog.ts; a test checks it) — this file
  * must not import the production contracts (import cycle through schemas.ts).
  */
-export const memberProductionRoleCodes = ["ADMIN", "ACCOUNT", "LEADER", "QC", "STAFF"] as const;
+export const memberProductionRoleCodes = ["ADMIN", "ACCOUNT", "LEADER", "QC", "STAFF", "DIRECTOR"] as const;
 export const MemberProductionRolesSchema = z
   .array(z.enum(memberProductionRoleCodes))
   .max(memberProductionRoleCodes.length * 2)

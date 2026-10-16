@@ -21,6 +21,7 @@ import type { QuerySql } from "../../lib/db-types.js";
 import type { AccessContext } from "../access/access-context.js";
 import { assertProductionMember } from "./access.js";
 import { cursorInstantSql, decodeTimeCursor, encodeTimeCursor } from "./cursor.js";
+import { assertFeature } from "./features.js";
 import {
   anyTagSql,
   customFieldFilterSql,
@@ -565,11 +566,12 @@ export const listMyProductionTasks = async (context: AccessContext, query: MyPro
 
 /**
  * QC queue: lines waiting for my check or that I am checking ("Chờ QC", "Đang check" — PD-044), oldest Done first
- * (archived jobs left out, BUG-PR-04). Subtasks come with their line.
+ * (archived jobs left out, BUG-PR-04). Subtasks come with their line. PD-065: the roles of the `qc_queue` feature only
+ * (by default QC and Admin; the superadmin always) — others 403 FORBIDDEN.
  */
 export const listQcQueue = async (context: AccessContext, query: QcQueueQuery = { cf: [] }) => {
-  assertProductionMember(context);
   const sql = getSql();
+  await assertFeature(context, "qc_queue", { sql });
   const workflow = await loadWorkflowModel(sql, context.organization.id);
   const waiting = workflow.statuses.filter((status) => qcStageCodes.has(status.code)).map((status) => status.id);
   const filters = await taskListFilters(sql, context.organization.id, query);
