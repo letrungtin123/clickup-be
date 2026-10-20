@@ -64,9 +64,8 @@ const org = (context: AccessContext) => context.organization.id;
 const settingKeys: Record<Exclude<keyof ProductionSettings, "kpiCloseDays">, string> = {
   kpiCloseDay: "kpi_close_day",
   scoresPublic: "scores_public",
-  moneyPublic: "money_public",
+  // PD-066: "money_public" and "khoan_pay_policy" are no longer settings (their stored rows are ignored).
   kpiProrateLeave: "kpi_prorate_leave",
-  khoanPayPolicy: "khoan_pay_policy",
   anomalyFailRate: "anomaly_fail_rate",
   dueSoonHours: "due_soon_hours",
   kpiDefaultMember: "kpi_default_member",
@@ -81,10 +80,7 @@ const defaults: ProductionSettings = {
   kpiCloseDay: 25,
   kpiCloseDays: [{ fromPeriod: null, closeDay: 25 }],
   scoresPublic: true,
-  moneyPublic: false,
   kpiProrateLeave: false,
-  // PD-033: the owner's choice of 2026-10-12 (like the company's Excel); migration 20261012_0110 seeds it.
-  khoanPayPolicy: "ALWAYS",
   anomalyFailRate: 0.15,
   dueSoonHours: 2,
   kpiDefaultMember: 2600,
@@ -186,8 +182,8 @@ export const getSettings = async (context: AccessContext) => {
 
 /**
  * PATCH /production/settings (superadmin, PD-050). Every key keeps who changed it last and when (production.settings updated_by /
- * updated_at); the form re-sends unchanged keys, which are not touched so that trail stays the real change — e.g. who
- * switched the Khoán pay policy (PD-033). The close day also writes its history (kpi_close_days.created_by).
+ * updated_at); the form re-sends unchanged keys, which are not touched so that trail stays the real change. The close day
+ * also writes its history (kpi_close_days.created_by).
  */
 export const updateSettings = async (context: AccessContext, input: In<typeof UpdateProductionSettingsRequestSchema>) => {
   assertConfigEditor(context);
@@ -234,9 +230,10 @@ export const getProductionMe = async (context: AccessContext): Promise<Productio
       // The close day of the current period (a new day applies from the next period, G15); kpiCloseDays has them all.
       kpiCloseDay: closeDayOfPeriod(closeDaysOf(settings), kpiPeriodOfDay(businessDay(new Date()), closeDaysOf(settings))),
       kpiCloseDays: closeDaysOf(settings),
-      khoanPayPolicy: settings.khoanPayPolicy,
+      // Deprecated (PD-066): fixed values, only so app builds from before PD-066 still load.
+      khoanPayPolicy: "IF_KPI",
       scoresPublic: settings.scoresPublic,
-      moneyPublic: settings.moneyPublic,
+      moneyPublic: false,
       chatAttachmentsEnabled: settings.chatAttachmentsEnabled,
       timezone: settings.timezone
     }
@@ -969,12 +966,12 @@ export const updateNotificationPreferences = async (context: AccessContext, inpu
 // Credit rules ------------------------------------------------------------------------------------
 
 /**
- * Money per image is hidden unless the organization made it public (SPEC §10) or the caller has `view_others_money`
- * (PD-065; by default Admin and Director, the superadmin always).
+ * Money per image is hidden unless the caller has `view_others_money` (PD-065; by default Admin and Director, the
+ * superadmin always). PD-066: the retired `moneyPublic` no longer opens it.
  */
 const canSeeMoney = async (context: AccessContext) => {
   const settings = await loadSettings(getSql(), org(context));
-  return settings.moneyPublic || featuresOf(context, settings.featurePermissions).has("view_others_money");
+  return featuresOf(context, settings.featurePermissions).has("view_others_money");
 };
 
 const stripMoney = <T extends { moneyPerImage: number | null }>(rule: T, visible: boolean): T =>

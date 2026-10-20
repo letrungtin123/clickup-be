@@ -7,6 +7,7 @@ import {
   countWorkingDays,
   effectiveTarget,
   forecast,
+  khoanTopUp,
   kpiProgress,
   latestClosedPeriod,
   percentKpi,
@@ -16,6 +17,7 @@ import {
   periodRange,
   periodsIn,
   prorateTarget,
+  proportionalMoney,
   rankByPoints,
   rollupKpi,
   rollupKpiPeriod,
@@ -396,25 +398,113 @@ describe("rankByPoints", () => {
   });
 });
 
-// Phase 6 — KPI settlement on the close day (SPEC §8, PLAN §6) ------------------------------------------
+// Phase 6 — KPI settlement on the close day (SPEC §8, PLAN §6, PD-066 TOP_UP) -----------------------------
 
 const base = { prorateLeave: false, workingDays: 25, leaveDays: 0 };
-const ifKpi = { ...base, khoanPolicy: "IF_KPI" as const };
-const always = { ...base, khoanPolicy: "ALWAYS" as const };
 
-describe("settleUser — policy IF_KPI: Khoán paid only when the KPI is met (SPEC §8.6)", () => {
+describe("khoanTopUp — PD-066 “thiếu bao nhiêu bù bấy nhiêu”", () => {
+  it("no shortfall → nothing converted, all the Khoán money paid, KPI met", () => {
+    expect(khoanTopUp({ target: 2600, pointsOfficial: 2700, khoanCredits: 100, khoanMoney: 1_000_000 })).toEqual({
+      shortfall: 0,
+      khoanPointsConverted: 0,
+      khoanMoneyEarned: 1_000_000,
+      khoanMoneyPaid: 1_000_000,
+      met: true
+    });
+    // Exactly on target is no shortfall.
+    expect(khoanTopUp({ target: 2600, pointsOfficial: 2600, khoanCredits: 100, khoanMoney: 1_000_000 })).toMatchObject({ shortfall: 0, khoanMoneyPaid: 1_000_000 });
+  });
+
+  it("shortfall within the Khoán credits → the shortfall is converted, the money left is paid pro rata, KPI met", () => {
+    // Owner's example: 50 points short, 200 Khoán points worth 1 000 000 → 150/200 of it = 750 000.
+    expect(khoanTopUp({ target: 2600, pointsOfficial: 2550, khoanCredits: 200, khoanMoney: 1_000_000 })).toEqual({
+      shortfall: 50,
+      khoanPointsConverted: 50,
+      khoanMoneyEarned: 1_000_000,
+      khoanMoneyPaid: 750_000,
+      met: true
+    });
+    // The whole Khoán exactly covers the shortfall: everything converted, nothing paid, still met.
+    expect(khoanTopUp({ target: 100, pointsOfficial: 70, khoanCredits: 30, khoanMoney: 150_000 })).toEqual({
+      shortfall: 30,
+      khoanPointsConverted: 30,
+      khoanMoneyEarned: 150_000,
+      khoanMoneyPaid: 0,
+      met: true
+    });
+  });
+
+  it("shortfall beyond the Khoán credits → all of them converted, nothing paid, KPI not met", () => {
+    expect(khoanTopUp({ target: 100, pointsOfficial: 40, khoanCredits: 30, khoanMoney: 150_000 })).toEqual({
+      shortfall: 60,
+      khoanPointsConverted: 30,
+      khoanMoneyEarned: 150_000,
+      khoanMoneyPaid: 0,
+      met: false
+    });
+  });
+
+  it("rounds the money to the nearest đồng (halves up), exactly, credits to the cent", () => {
+    // 100 000 × (3 − 1) / 3 = 66 666,67 → 66 667.
+    expect(khoanTopUp({ target: 10, pointsOfficial: 9, khoanCredits: 3, khoanMoney: 100_000 }).khoanMoneyPaid).toBe(66_667);
+    // 100 001 × 0,5 = 50 000,5 → 50 001.
+    expect(khoanTopUp({ target: 10, pointsOfficial: 9, khoanCredits: 2, khoanMoney: 100_001 }).khoanMoneyPaid).toBe(50_001);
+    // 0,01-point shortfall, cent arithmetic (no float tails): 999 999 × 1 233,45 / 1 233,46 = 999 990,89 → 999 991.
+    expect(khoanTopUp({ target: 2600, pointsOfficial: 2599.99, khoanCredits: 1233.46, khoanMoney: 999_999 })).toMatchObject({
+      shortfall: 0.01,
+      khoanPointsConverted: 0.01,
+      khoanMoneyPaid: 999_991
+    });
+    // Large amounts stay exact (money × cents beyond 2^53).
+    expect(khoanTopUp({ target: 1_000_000, pointsOfficial: 0, khoanCredits: 9_999_999.99, khoanMoney: 9_007_199_254 }).khoanMoneyPaid).toBe(8_106_479_328);
+  });
+
+  it("no Khoán work: a shortfall stays a shortfall (nothing converted, nothing paid)", () => {
+    expect(khoanTopUp({ target: 100, pointsOfficial: 80, khoanCredits: 0, khoanMoney: 0 })).toEqual({
+      shortfall: 20,
+      khoanPointsConverted: 0,
+      khoanMoneyEarned: 0,
+      khoanMoneyPaid: 0,
+      met: false
+    });
+    expect(khoanTopUp({ target: 100, pointsOfficial: 120, khoanCredits: 0, khoanMoney: 0 })).toMatchObject({ shortfall: 0, met: true, khoanMoneyPaid: 0 });
+  });
+
+  it("no target → met, nothing converted, the money paid", () => {
+    expect(khoanTopUp({ target: null, pointsOfficial: 0, khoanCredits: 12.5, khoanMoney: 40_000 })).toEqual({
+      shortfall: 0,
+      khoanPointsConverted: 0,
+      khoanMoneyEarned: 40_000,
+      khoanMoneyPaid: 40_000,
+      met: true
+    });
+  });
+});
+
+describe("proportionalMoney", () => {
+  it("is exact and rounds halves away from zero", () => {
+    expect(proportionalMoney(1_000_000, 15_000, 20_000)).toBe(750_000);
+    expect(proportionalMoney(3, 1, 2)).toBe(2);
+    expect(proportionalMoney(-3, 1, 2)).toBe(-2);
+    expect(proportionalMoney(500, 0, 100)).toBe(0);
+    expect(proportionalMoney(500, 100, 100)).toBe(500);
+    expect(proportionalMoney(500, 10, 0)).toBe(0);
+  });
+});
+
+describe("settleUser — Khoán rule TOP_UP (PD-066)", () => {
   it("target 100, official 120, Khoán 30 credits / 150 000 → met, money paid, nothing converted", () => {
-    expect(settleUser({ ...ifKpi, targetBase: 100, pointsOfficial: 120, khoanCredits: 30, khoanMoneyRaw: 150000 })).toEqual({
+    expect(settleUser({ ...base, targetBase: 100, pointsOfficial: 120, khoanCredits: 30, khoanMoneyRaw: 150000 })).toEqual({
       targetBase: 100,
       target: 100,
       prorateLeave: false,
       workingDays: 25,
       leaveDays: 0,
       pointsOfficial: 120,
+      shortfall: 0,
       met: true,
       khoanCredits: 30,
       khoanMoneyRaw: 150000,
-      khoanPolicy: "IF_KPI",
       khoanMoney: 150000,
       khoanPointsConverted: 0,
       totalPoints: 120,
@@ -423,20 +513,34 @@ describe("settleUser — policy IF_KPI: Khoán paid only when the KPI is met (SP
     });
   });
 
-  it("target 100, official 80, Khoán 30 → not met, money 0, 30 converted, KPI total 110", () => {
-    expect(settleUser({ ...ifKpi, targetBase: 100, pointsOfficial: 80, khoanCredits: 30, khoanMoneyRaw: 150000 })).toMatchObject({
+  it("target 100, official 80, Khoán 30 / 150 000 → 20 converted, 10/30 of the money paid (50 000), met at 100", () => {
+    expect(settleUser({ ...base, targetBase: 100, pointsOfficial: 80, khoanCredits: 30, khoanMoneyRaw: 150000 })).toMatchObject({
+      shortfall: 20,
+      met: true,
+      khoanMoney: 50000,
+      khoanPointsConverted: 20,
+      totalPoints: 100,
+      percent: 100,
+      difference: 0
+    });
+  });
+
+  it("target 100, official 40, Khoán 30 → all 30 converted, nothing paid, not met (total 70)", () => {
+    expect(settleUser({ ...base, targetBase: 100, pointsOfficial: 40, khoanCredits: 30, khoanMoneyRaw: 150000 })).toMatchObject({
+      shortfall: 60,
       met: false,
       khoanMoney: 0,
       khoanPointsConverted: 30,
-      totalPoints: 110,
-      percent: 110,
-      difference: 10
+      totalPoints: 70,
+      percent: 70,
+      difference: -30
     });
   });
 
   it("no target → met (Khoán money paid)", () => {
-    expect(settleUser({ ...ifKpi, targetBase: null, pointsOfficial: 0, khoanCredits: 12.5, khoanMoneyRaw: 40000 })).toMatchObject({
+    expect(settleUser({ ...base, targetBase: null, pointsOfficial: 0, khoanCredits: 12.5, khoanMoneyRaw: 40000 })).toMatchObject({
       target: null,
+      shortfall: 0,
       met: true,
       khoanMoney: 40000,
       khoanPointsConverted: 0,
@@ -446,82 +550,17 @@ describe("settleUser — policy IF_KPI: Khoán paid only when the KPI is met (SP
     });
   });
 
-  it("exactly on target is met; official points only decide (Khoán credits never count toward 'met')", () => {
-    expect(settleUser({ ...ifKpi, targetBase: 100, pointsOfficial: 100, khoanCredits: 0, khoanMoneyRaw: 0 }).met).toBe(true);
-    expect(settleUser({ ...ifKpi, targetBase: 100, pointsOfficial: 99.99, khoanCredits: 50, khoanMoneyRaw: 1 }).met).toBe(false);
-  });
-
-  it("leave proration (Mon–Sat working days, half days allowed) only when enabled", () => {
-    const prorated = settleUser({ ...ifKpi, targetBase: 2600, prorateLeave: true, leaveDays: 2.5, pointsOfficial: 2400, khoanCredits: 0, khoanMoneyRaw: 0 });
-    expect(prorated).toMatchObject({ targetBase: 2600, target: 2340, met: true, leaveDays: 2.5 });
-    expect(settleUser({ ...ifKpi, targetBase: 2600, leaveDays: 2.5, pointsOfficial: 2400, khoanCredits: 0, khoanMoneyRaw: 0 })).toMatchObject({
+  it("leave proration (Mon–Sat working days, half days allowed) lowers the target before the top-up, only when enabled", () => {
+    const prorated = settleUser({ ...base, targetBase: 2600, prorateLeave: true, leaveDays: 2.5, pointsOfficial: 2300, khoanCredits: 100, khoanMoneyRaw: 500_000 });
+    // 2600 × 22,5 / 25 = 2340 → 40 short → 40 converted, 60/100 of the money paid.
+    expect(prorated).toMatchObject({ targetBase: 2600, target: 2340, shortfall: 40, met: true, khoanPointsConverted: 40, khoanMoney: 300_000, totalPoints: 2340 });
+    expect(settleUser({ ...base, targetBase: 2600, leaveDays: 2.5, pointsOfficial: 2300, khoanCredits: 100, khoanMoneyRaw: 500_000 })).toMatchObject({
       target: 2600,
-      met: false
-    });
-  });
-});
-
-describe("settleUser — policy ALWAYS: Khoán money always paid, like the Excel (PD-033)", () => {
-  it("not met → the money is still paid, nothing is converted, the KPI total is the official points", () => {
-    expect(settleUser({ ...always, targetBase: 100, pointsOfficial: 80, khoanCredits: 30, khoanMoneyRaw: 150000 })).toEqual({
-      targetBase: 100,
-      target: 100,
-      prorateLeave: false,
-      workingDays: 25,
-      leaveDays: 0,
-      pointsOfficial: 80,
+      shortfall: 300,
       met: false,
-      khoanCredits: 30,
-      khoanMoneyRaw: 150000,
-      khoanPolicy: "ALWAYS",
-      khoanMoney: 150000,
-      khoanPointsConverted: 0,
-      totalPoints: 80,
-      percent: 80,
-      difference: -20
+      khoanPointsConverted: 100,
+      khoanMoney: 0
     });
-  });
-
-  it("met, or no target → money paid, nothing converted (same as IF_KPI)", () => {
-    const met = { targetBase: 100, pointsOfficial: 120, khoanCredits: 30, khoanMoneyRaw: 150000 };
-    expect(settleUser({ ...always, ...met })).toEqual({ ...settleUser({ ...ifKpi, ...met }), khoanPolicy: "ALWAYS" });
-    expect(settleUser({ ...always, targetBase: null, pointsOfficial: 0, khoanCredits: 12.5, khoanMoneyRaw: 40000 })).toMatchObject({
-      met: true,
-      khoanMoney: 40000,
-      khoanPointsConverted: 0,
-      totalPoints: 0
-    });
-  });
-
-  it("met = official points (Chính thức + OT + QC) ≥ target: Khoán credits never help, even when they would reach it", () => {
-    const result = settleUser({ ...always, targetBase: 100, pointsOfficial: 99.99, khoanCredits: 500, khoanMoneyRaw: 2_500_000 });
-    expect(result).toMatchObject({ met: false, khoanMoney: 2_500_000, khoanPointsConverted: 0, totalPoints: 99.99, percent: 99.99, difference: -0.01 });
-    expect(settleUser({ ...always, targetBase: 100, pointsOfficial: 100, khoanCredits: 0, khoanMoneyRaw: 0 }).met).toBe(true);
-  });
-
-  it("leave proration applies the same way", () => {
-    expect(settleUser({ ...always, targetBase: 2600, prorateLeave: true, leaveDays: 2.5, pointsOfficial: 2300, khoanCredits: 10, khoanMoneyRaw: 50000 })).toMatchObject({
-      target: 2340,
-      met: false,
-      khoanMoney: 50000,
-      khoanPointsConverted: 0,
-      totalPoints: 2300
-    });
-  });
-
-  it("the two policies differ only for people who miss the KPI with Khoán work", () => {
-    const cases = [
-      { targetBase: 100, pointsOfficial: 120, khoanCredits: 30, khoanMoneyRaw: 150000 },
-      { targetBase: null, pointsOfficial: 5, khoanCredits: 30, khoanMoneyRaw: 150000 },
-      { targetBase: 100, pointsOfficial: 40, khoanCredits: 0, khoanMoneyRaw: 0 },
-      { targetBase: 100, pointsOfficial: 40, khoanCredits: 30, khoanMoneyRaw: 150000 }
-    ];
-    const differs = cases.map((input) => {
-      const a = settleUser({ ...always, ...input });
-      const b = settleUser({ ...ifKpi, ...input });
-      return a.met === b.met && (a.khoanMoney !== b.khoanMoney || a.totalPoints !== b.totalPoints);
-    });
-    expect(differs).toEqual([false, false, false, true]);
   });
 });
 
@@ -532,30 +571,22 @@ describe("settlePeriod", () => {
   ];
 
   it("uses the target effective for the period and the period's working days; re-running gives the same result", () => {
-    const first = settlePeriod({ period: "2026-10", closeDay: 25, prorateLeave: false, khoanPolicy: "IF_KPI", users });
+    const first = settlePeriod({ period: "2026-10", closeDay: 25, prorateLeave: false, users });
     expect(first).toMatchObject({ period: "2026-10", from: "2026-09-26", to: "2026-10-25", workingDays: 25 });
     expect(first.items.map((item) => [item.userId, item.target, item.met, item.khoanMoney])).toEqual([
       ["u1", 100, true, 150000],
       // u2's target only starts in 2026-11 → no target for 2026-10 → met.
       ["u2", null, true, 150000]
     ]);
-    expect(settlePeriod({ period: "2026-10", closeDay: 25, prorateLeave: false, khoanPolicy: "IF_KPI", users })).toEqual(first);
+    expect(settlePeriod({ period: "2026-10", closeDay: 25, prorateLeave: false, users })).toEqual(first);
   });
 
-  it("prorates per user when the setting is on", () => {
-    const result = settlePeriod({ period: "2026-11", closeDay: 25, prorateLeave: true, khoanPolicy: "IF_KPI", users });
-    // 2026-11 = 26/10–25/11: 31 days, 4 Sundays (1, 8, 15, 22/11) → 27 working days; 1 leave day → 100 × 26/27.
+  it("prorates per user when the setting is on, then tops up the shortfall", () => {
+    const result = settlePeriod({ period: "2026-11", closeDay: 25, prorateLeave: true, users });
+    // 2026-11 = 26/10–25/11: 31 days, 4 Sundays (1, 8, 15, 22/11) → 27 working days; 1 leave day → 100 × 26/27 = 96,30.
     expect(result.workingDays).toBe(27);
-    expect(result.items[1]).toMatchObject({ targetBase: 100, target: 96.3, met: false, khoanPointsConverted: 30, totalPoints: 110 });
-  });
-
-  it("passes the Khoán pay policy to every person: re-running with the other policy changes only the not-met rows", () => {
-    const ifKpiRun = settlePeriod({ period: "2026-11", closeDay: 25, prorateLeave: true, khoanPolicy: "IF_KPI", users });
-    const alwaysRun = settlePeriod({ period: "2026-11", closeDay: 25, prorateLeave: true, khoanPolicy: "ALWAYS", users });
-    expect(alwaysRun.items.every((item) => item.khoanPolicy === "ALWAYS")).toBe(true);
-    expect(alwaysRun.items[0]).toEqual({ ...ifKpiRun.items[0], khoanPolicy: "ALWAYS" });
-    expect(alwaysRun.items[1]).toMatchObject({ met: false, khoanMoney: 150000, khoanPointsConverted: 0, totalPoints: 80 });
-    expect(ifKpiRun.items[1]).toMatchObject({ met: false, khoanMoney: 0, khoanPointsConverted: 30, totalPoints: 110 });
+    // 16,30 short → converted; 150 000 × 13,70 / 30 = 68 500.
+    expect(result.items[1]).toMatchObject({ targetBase: 100, target: 96.3, shortfall: 16.3, met: true, khoanPointsConverted: 16.3, khoanMoney: 68500, totalPoints: 96.3 });
   });
 });
 
@@ -591,9 +622,9 @@ describe("settlement periods and the close-day schedule", () => {
 
 describe("KPI report rollups (quarter / year = sum of months)", () => {
   const months = [
-    { period: "2026-10", target: 100, pointsOfficial: 120, khoanPointsConverted: 0, totalPoints: 120, khoanMoney: 150000 },
-    { period: "2026-11", target: 100, pointsOfficial: 80, khoanPointsConverted: 30, totalPoints: 110, khoanMoney: 0 },
-    { period: "2026-12", target: null, pointsOfficial: 10, khoanPointsConverted: 0, totalPoints: 10, khoanMoney: 5000 }
+    { period: "2026-10", target: 100, pointsOfficial: 120, shortfall: 0, khoanPointsConverted: 0, totalPoints: 120, khoanMoneyEarned: 150000, khoanMoneyPaid: 150000 },
+    { period: "2026-11", target: 100, pointsOfficial: 70, shortfall: 30, khoanPointsConverted: 30, totalPoints: 100, khoanMoneyEarned: 150000, khoanMoneyPaid: 0 },
+    { period: "2026-12", target: null, pointsOfficial: 10, shortfall: 0, khoanPointsConverted: 0, totalPoints: 10, khoanMoneyEarned: 5000, khoanMoneyPaid: 5000 }
   ];
 
   it("keys", () => {
@@ -603,15 +634,17 @@ describe("KPI report rollups (quarter / year = sum of months)", () => {
 
   it("explicit QUARTER/YEAR target wins, otherwise the sum of monthly targets", () => {
     expect(rollupKpi(months, 250)).toEqual({
-      pointsOfficial: 210,
+      pointsOfficial: 200,
+      shortfall: 30,
       khoanPointsConverted: 30,
-      totalPoints: 240,
-      khoanMoney: 155000,
+      totalPoints: 230,
+      khoanMoneyEarned: 305000,
+      khoanMoneyPaid: 155000,
       target: 250,
-      percent: 96,
-      difference: -10
+      percent: 92,
+      difference: -20
     });
-    expect(rollupKpi(months, null)).toMatchObject({ target: 200, percent: 120, difference: 40 });
+    expect(rollupKpi(months, null)).toMatchObject({ target: 200, percent: 115, difference: 30 });
     expect(rollupKpi([months[2]!], null)).toMatchObject({ target: null, percent: null, difference: null });
   });
 });
@@ -659,7 +692,7 @@ describe("G15 — changing the close day mid-period: a new close day applies fro
   });
 
   it("settlement and forecast cover the period's own days", () => {
-    expect(settlePeriod({ period: "2026-11", closeDay: versions, prorateLeave: false, khoanPolicy: "ALWAYS", users: [] })).toMatchObject({
+    expect(settlePeriod({ period: "2026-11", closeDay: versions, prorateLeave: false, users: [] })).toMatchObject({
       from: "2026-10-26",
       to: "2026-11-20"
     });
@@ -763,7 +796,7 @@ describe("PD-032 — close day 31 “Cuối tháng”: a period is the calendar 
     expect(february).toMatchObject({ from: "2026-02-01", to: "2026-02-28", daysLeft: 9 });
     const april = forecast({ target: 100, pointsOfficial: 0, period: "2026-04", closeDay: 31, today: "2026-04-30", prorateLeave: false, leaveDays: null });
     expect(april).toMatchObject({ to: "2026-04-30", daysLeft: 1 });
-    expect(settlePeriod({ period: "2028-02", closeDay: 31, prorateLeave: false, khoanPolicy: "ALWAYS", users: [] })).toMatchObject({
+    expect(settlePeriod({ period: "2028-02", closeDay: 31, prorateLeave: false, users: [] })).toMatchObject({
       from: "2028-02-01",
       to: "2028-02-29",
       workingDays: 25
@@ -776,9 +809,11 @@ describe("G8 — KPI report quarters / years always cover the whole quarter / ye
     period,
     target,
     pointsOfficial: totalPoints,
+    shortfall: 0,
     khoanPointsConverted: 0,
     totalPoints,
-    khoanMoney: 0
+    khoanMoneyEarned: 0,
+    khoanMoneyPaid: 0
   });
   const started = (period: string) => period <= "2026-10";
   const settled = (period: string) => period <= "2026-09";
@@ -813,26 +848,33 @@ describe("G8 — KPI report quarters / years always cover the whole quarter / ye
 
   it("team / organization totals sum the people; percent = total / target; money only when visible", () => {
     const totalsRow = sumKpiFigures([
-      { target: 100, pointsOfficial: 120, khoanPointsConverted: 0, totalPoints: 120, khoanMoney: 150000, met: true, percent: 120 },
-      { target: 100, pointsOfficial: 80, khoanPointsConverted: 30, totalPoints: 110, khoanMoney: 0, met: false, percent: 110 },
-      { target: null, pointsOfficial: 5, khoanPointsConverted: 0, totalPoints: 5, khoanMoney: 0, met: true, percent: null }
+      { target: 100, pointsOfficial: 120, shortfall: 0, khoanPointsConverted: 0, totalPoints: 120, khoanMoneyEarned: 150000, khoanMoneyPaid: 150000, met: true, percent: 120 },
+      { target: 100, pointsOfficial: 40, shortfall: 60, khoanPointsConverted: 30, totalPoints: 70, khoanMoneyEarned: 90000, khoanMoneyPaid: 0, met: false, percent: 70 },
+      { target: null, pointsOfficial: 5, shortfall: 0, khoanPointsConverted: 0, totalPoints: 5, khoanMoneyEarned: 0, khoanMoneyPaid: 0, met: true, percent: null }
     ]);
     expect(totalsRow).toEqual({
       memberCount: 3,
       withTargetCount: 2,
       metCount: 2,
       target: 200,
-      pointsOfficial: 205,
+      pointsOfficial: 165,
+      shortfall: 60,
       khoanPointsConverted: 30,
-      totalPoints: 235,
-      percent: 117.5,
-      difference: 35,
-      khoanMoney: 150000
+      totalPoints: 195,
+      percent: 97.5,
+      difference: -5,
+      khoanMoneyEarned: 240000,
+      khoanMoneyPaid: 150000
     });
-    expect(sumKpiFigures([{ target: null, pointsOfficial: 1, khoanPointsConverted: 0, totalPoints: 1, khoanMoney: null, percent: null }])).toMatchObject({
+    expect(
+      sumKpiFigures([
+        { target: null, pointsOfficial: 1, shortfall: 0, khoanPointsConverted: 0, totalPoints: 1, khoanMoneyEarned: null, khoanMoneyPaid: null, percent: null }
+      ])
+    ).toMatchObject({
       target: null,
       percent: null,
-      khoanMoney: null,
+      khoanMoneyEarned: null,
+      khoanMoneyPaid: null,
       metCount: 1
     });
   });

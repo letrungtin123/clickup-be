@@ -9,8 +9,8 @@ import type * as NotificationsModule from "./notifications.js";
 /**
  * PD-052 — "Điểm cá nhân" for everyone: the ranking is open to every production member whatever
  * settings.scoresPublic says, and GET /production/scores/user/:userId (+ /forecast, KPI `userId`) shows any active
- * production member's scores with money only for the owner, ADMIN, or settings.moneyPublic. No database: a fake
- * tagged-template `sql` records every statement and answers from a per-test handler (fake ids only).
+ * production member's scores with money only for the owner or `view_others_money` (PD-066: moneyPublic is retired). No
+ * database: a fake tagged-template `sql` records every statement and answers from a per-test handler (fake ids only).
  */
 type Call = { text: string; values: unknown[] };
 type Fragment = { readonly isFragment: true; text: string; values: unknown[] };
@@ -202,11 +202,12 @@ describe("PD-052 — the ranking is open to every production member", () => {
     expect(board.items.find((item) => item.user.id === other)?.user.email).toBeNull();
   });
 
-  it("money of everyone with moneyPublic on; the tag / custom-field filters stay Admin only", async () => {
+  it("PD-066: a stored moneyPublic opens nobody's money; the tag / custom-field filters stay Admin only", async () => {
     fixtures.settings = { scoresPublic: false, moneyPublic: true };
     db.state.handler = (call) => (call.text.startsWith("WITH sums AS") ? boardRows : undefined);
     const board = await getScoreBoard(contextWith(["LEADER"]), {});
-    expect(board.items.map((item) => item.money)).toEqual([30000, 50000]);
+    expect(board.moneyVisible).toBe(false);
+    expect(board.items.map((item) => item.money)).toEqual([null, 50000]);
     expect(await failure(getScoreBoard(contextWith(["STAFF"]), { tagId: [ids.team] }))).toEqual({ code: "CUSTOM_FIELDS_FORBIDDEN", status: 403 });
   });
 
@@ -237,11 +238,11 @@ describe("PD-052 — GET /production/scores/user/:userId", () => {
     }
   });
 
-  it("money shows with moneyPublic on, for an Admin, and for oneself", async () => {
+  it("money shows for an Admin, the superadmin and oneself — never through moneyPublic (PD-066)", async () => {
     db.state.handler = scoreQueries([me, other]);
     fixtures.settings = { scoresPublic: false, moneyPublic: true };
     const shared = await getUserScores(contextWith(["STAFF"]), other, {});
-    expect([shared.moneyVisible, shared.summary.moneyKhoanProvisional, shared.entries[0]?.money]).toEqual([true, 150000, 150000]);
+    expect([shared.moneyVisible, shared.summary.moneyKhoanProvisional, shared.entries[0]?.money]).toEqual([false, null, null]);
 
     fixtures.settings = { scoresPublic: false, moneyPublic: false };
     const admin = await getUserScores(contextWith(["ADMIN"]), other, {});
@@ -269,13 +270,18 @@ describe("PD-052 — GET /production/scores/user/:userId", () => {
     expect(db.state.calls).toHaveLength(0);
   });
 
-  it("the forecast of another member hides the Khoán money by the same rule", async () => {
+  it("the forecast of another member hides the Khoán money and “Nếu chốt hôm nay” by the same rule", async () => {
     db.state.handler = scoreQueries([me, other]);
     const hidden = UserScoreForecastSchema.parse(await getUserScoreForecast(contextWith(["QC"]), other, {}));
     expect(hidden.pointsKhoan).toBe(12.5);
     expect(hidden.moneyKhoanProvisional).toBeNull();
+    expect(hidden.ifSettledToday).toBeNull();
     fixtures.settings = { scoresPublic: false, moneyPublic: true };
-    expect((await getUserScoreForecast(contextWith(["QC"]), other, {})).moneyKhoanProvisional).toBe(150000);
+    expect((await getUserScoreForecast(contextWith(["QC"]), other, {})).moneyKhoanProvisional).toBeNull();
+    // The owner and an Admin see it: no KPI here (and none required by this fake data) → nothing to top up, all paid.
+    const own = UserScoreForecastSchema.parse(await getUserScoreForecast(contextWith(["QC"]), me, {}));
+    expect(own.ifSettledToday).toEqual({ shortfall: 0, khoanPointsConverted: 0, khoanMoneyEarned: 150000, khoanMoneyPaid: 150000, met: true });
+    expect((await getUserScoreForecast(contextWith(["ADMIN"]), other, {})).ifSettledToday?.khoanMoneyPaid).toBe(150000);
     expect(await failure(getUserScoreForecast(contextWith(["QC"]), stranger, {}))).toEqual({ code: "SCORE_USER_NOT_FOUND", status: 404 });
   });
 });
@@ -296,6 +302,8 @@ describe("PD-052 — KPI settlements / report of one member (userId)", () => {
     working_days: 26,
     leave_days: "0",
     points_official: "120",
+    // A row of a run before PD-066: no stored shortfall.
+    shortfall_points: null,
     met: true,
     khoan_credits: "10",
     khoan_money_raw: "200000",
@@ -314,17 +322,29 @@ describe("PD-052 — KPI settlements / report of one member (userId)", () => {
     return undefined;
   };
 
-  it("a staff member reads another member's settled period; money hidden unless moneyPublic", async () => {
+  it("a staff member reads another member's settled period; money hidden (moneyPublic opens nothing, PD-066)", async () => {
     db.state.handler = settlementQueries;
     const list = await listKpiSettlements(contextWith(["STAFF"]), { period: "2026-09", userId: other });
     const select = db.state.calls.find((call) => call.text.includes("FROM production.kpi_settlements ks"))!;
     expect(select.values).toContainEqual([other]);
     expect(list.items).toHaveLength(1);
-    expect(list.items[0]).toMatchObject({ met: true, totalPoints: 120, khoanMoney: null, khoanMoneyRaw: null });
+    // A row of a run before PD-066 (no stored shortfall): computed max(0, 100 − 120) = 0.
+    expect(list.items[0]).toMatchObject({
+      met: true,
+      totalPoints: 120,
+      shortfall: 0,
+      khoanMoneyEarned: null,
+      khoanMoneyPaid: null,
+      khoanMoney: null,
+      khoanMoneyRaw: null,
+      khoanPolicy: "ALWAYS"
+    });
 
     fixtures.settings = { scoresPublic: false, moneyPublic: true };
     const shared = await listKpiSettlements(contextWith(["STAFF"]), { period: "2026-09", userId: other });
-    expect(shared.items[0]?.khoanMoney).toBe(200000);
+    expect(shared.items[0]?.khoanMoneyPaid).toBeNull();
+    const director = await listKpiSettlements(contextWith(["DIRECTOR"]), { period: "2026-09", userId: other });
+    expect(director.items[0]).toMatchObject({ khoanMoneyEarned: 200000, khoanMoneyPaid: 200000, khoanMoney: 200000 });
   });
 
   it("without userId a member still reads only their own row; a non-member userId → 404", async () => {
@@ -373,7 +393,7 @@ describe("PD-065 — others' scores and money follow the feature permission matr
     expect((await getScoreBoard(contextWith([], true), {})).items).toHaveLength(2);
   });
 
-  it("others' money: view_others_money (default Admin + Director), moneyPublic, or one's own; ADMIN only through the matrix", async () => {
+  it("others' money: view_others_money (default Admin + Director) or one's own; ADMIN only through the matrix", async () => {
     db.state.handler = (call) => (call.text.startsWith("WITH sums AS") ? boardRows : scoreQueries([me, other])(call));
     fixtures.settings = { moneyPublic: false, featurePermissions: await matrix({}) };
     const director = await getScoreBoard(contextWith(["DIRECTOR"]), {});
@@ -386,9 +406,10 @@ describe("PD-065 — others' scores and money follow the feature permission matr
     expect([admin.moneyVisible, admin.items.map((item) => item.money)]).toEqual([false, [null, 50000]]);
     expect((await getUserScores(contextWith(["ADMIN"]), other, {})).moneyVisible).toBe(false);
     expect((await getUserScoreForecast(contextWith(["ADMIN"]), other, {})).moneyKhoanProvisional).toBeNull();
-    // ...the superadmin always does, and moneyPublic still opens it to everyone.
+    // ...the superadmin always does; PD-066: moneyPublic no longer opens it to anyone.
     expect((await getScoreBoard(contextWith([], true), {})).moneyVisible).toBe(true);
     fixtures.settings = { moneyPublic: true, featurePermissions: await matrix({ view_others_money: [] }) };
-    expect((await getScoreBoard(contextWith(["STAFF"]), {})).moneyVisible).toBe(true);
+    expect((await getScoreBoard(contextWith(["STAFF"]), {})).moneyVisible).toBe(false);
+    expect((await getScoreBoard(contextWith(["ADMIN"]), {})).items.map((item) => item.money)).toEqual([null, 50000]);
   });
 });

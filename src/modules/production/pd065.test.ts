@@ -420,7 +420,7 @@ describe("PD-065 gated endpoints follow the matrix", () => {
     expect(await outcome(runReport(contextWith(["DIRECTOR"]), money))).toMatchObject({ code: "FORBIDDEN", status: 403 });
   });
 
-  it("Bảng đơn giá money per image: view_others_money or moneyPublic", async () => {
+  it("Bảng đơn giá money per image: view_others_money only (PD-066: a stored moneyPublic opens nothing)", async () => {
     const rule = { id: other, project_id: other, process_id: other, credit_per_image: "1", money_per_image: "500", effective_from: "2026-10-01", effective_to: null };
     db.state.handler = (call) => (call.text.includes("FROM production.credit_rules") ? [rule] : []);
     const moneyOf = async (roles: string[]) => {
@@ -432,7 +432,8 @@ describe("PD-065 gated endpoints follow the matrix", () => {
     storeFeatures({ view_others_money: ["DIRECTOR"] });
     expect(await moneyOf(["ADMIN"])).toEqual([null]);
     db.state.settings = [...db.state.settings, { key: "money_public", value: true }];
-    expect(await moneyOf(["STAFF"])).toEqual([500]);
+    expect(await moneyOf(["STAFF"])).toEqual([null]);
+    expect(await moneyOf(["DIRECTOR"])).toEqual([500]);
   });
 });
 

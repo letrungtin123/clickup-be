@@ -150,17 +150,18 @@ export const KpiCloseDayVersionSchema = z.object({
 });
 export type KpiCloseDayVersion = z.infer<typeof KpiCloseDayVersionSchema>;
 
-// Khoán pay policy (PD-033) -------------------------------------------------------------------------
+// Khoán rule of a KPI settlement run (PD-033, PD-066) -------------------------------------------------
 
 /**
- * What the KPI settlement does with Khoán (MONEY_IF_KPI) work. Both: met = official points (Chính thức + OT + QC)
- * ≥ target, no target → met.
- * - ALWAYS (default, like the company's Excel): the Khoán money is always paid; Khoán credits are never converted
- *   and never count toward the KPI.
- * - IF_KPI: met → the money is paid; not met → no money, the Khoán credits are converted into KPI points.
- * Each settlement run records the policy it used (KpiSettlementRun.khoanPolicy).
+ * What a KPI settlement run did with Khoán (MONEY_IF_KPI) work; each run records it (KpiSettlementRun.khoanPolicy).
+ * - TOP_UP (PD-066, every run since — no setting any more): "thiếu bao nhiêu bù bấy nhiêu". shortfall = max(0, target −
+ *   official points); K = the Khoán credits (points equivalent from "Bảng đơn giá"), M = the Khoán money earned.
+ *   shortfall 0 → M paid, nothing converted; 0 < shortfall ≤ K → shortfall converted, round(M × (K − shortfall) / K)
+ *   paid, KPI met; shortfall > K → K converted, nothing paid, KPI not met. No target → met, M paid.
+ * - ALWAYS / IF_KPI (PD-033, retired): only on runs made before PD-066 — ALWAYS paid M and converted nothing; IF_KPI
+ *   paid M when official ≥ target, else converted K and paid nothing.
  */
-export const KhoanPayPolicySchema = z.enum(["ALWAYS", "IF_KPI"]);
+export const KhoanPayPolicySchema = z.enum(["ALWAYS", "IF_KPI", "TOP_UP"]);
 export type KhoanPayPolicy = z.infer<typeof KhoanPayPolicySchema>;
 
 // Job permission matrix (PD-036) ------------------------------------------------------------------
@@ -269,8 +270,9 @@ export const effectiveJobScopes = (roles: Iterable<ProductionRole>, matrix: JobP
  *  - view_others_scores  others' scores: "Xếp hạng" (+ export), "Điểm cá nhân" of others (+ forecast), others' KPI rows
  *                        (`userId` on /kpi/settlements, /kpi/report, /kpi/export) and others' rows of a task's scores.
  *                        One's own scores are always visible.
- *  - view_others_money   others' Khoán money (board, task scores, "Điểm cá nhân", KPI) and money per image of the
- *                        credit grid ("Bảng đơn giá"). Setting `moneyPublic` opens it to everyone; one's own always.
+ *  - view_others_money   others' Khoán money (board, task scores, "Điểm cá nhân", KPI rows, totals and run totals) and
+ *                        money per image of the credit grid ("Bảng đơn giá"). One's own money always (PD-066: nothing
+ *                        else opens it — the retired setting `moneyPublic` gates nothing).
  *  - leader_dashboard    "Bảng điều khiển" (GET /production/dashboard/leader).
  *  - admin_dashboard     "Quản trị số liệu" (GET /production/dashboard/admin) and running its pinned reports.
  *  - anomalies           "Bất thường" (GET /production/anomalies, "Đã xem" review / undo).
@@ -388,7 +390,7 @@ export const ProductionMeSchema = z.object({
   /**
    * PD-065: my features in the feature permission matrix (`featurePermissionKeys` order): the menus "Hàng chờ QC",
    * "Bảng điều khiển", "Quản trị số liệu", "Bất thường", "Khách hàng", "Xếp hạng", leave approval / export. The
-   * superadmin has all of them. Others' money also opens with settings.moneyPublic.
+   * superadmin has all of them. Others' Khoán money needs `view_others_money` (PD-066: nothing else opens it).
    */
   features: z.array(FeaturePermissionKeySchema),
   settings: z.object({
@@ -399,11 +401,18 @@ export const ProductionMeSchema = z.object({
     kpiCloseDay: z.number().int(),
     /** Close-day versions, oldest first (the first has fromPeriod null): compute any period's dates with them. */
     kpiCloseDays: z.array(KpiCloseDayVersionSchema).min(1),
-    /** What the next settlement does with Khoán money (PD-033); the scores pages word their hints after it. */
-    khoanPayPolicy: KhoanPayPolicySchema,
+    /**
+     * Deprecated (PD-066): the Khoán pay policy setting is gone — every settlement uses TOP_UP. Sent only so app builds
+     * from before PD-066 still load; always "IF_KPI" (their closest wording). Read nothing from it.
+     */
+    khoanPayPolicy: z.literal("IF_KPI"),
     /** Retired (PD-052): scores are always visible to every production member; kept for compatibility, gates nothing. */
     scoresPublic: z.boolean(),
-    moneyPublic: z.boolean(),
+    /**
+     * Deprecated (PD-066): money is never public any more (one's own, or `view_others_money`). Sent only so app builds
+     * from before PD-066 still load; always false.
+     */
+    moneyPublic: z.literal(false),
     chatAttachmentsEnabled: z.boolean(),
     timezone: z.string()
   })
@@ -749,11 +758,12 @@ export const ProductionSettingsSchema = z.object({
    * Still stored and accepted for compatibility; it gates nothing.
    */
   scoresPublic: z.boolean(),
-  /** Others' Khoán money for every production member; otherwise the roles of `view_others_money` (PD-065) and the owner only. */
-  moneyPublic: z.boolean(),
+  /**
+   * Approved leave lowers the KPI target (SPEC §6.3). PD-066: `moneyPublic` ("Công khai tiền công") and `khoanPayPolicy`
+   * (PD-033) are no longer settings — money is one's own or `view_others_money`'s, and every settlement uses TOP_UP; their
+   * stored values are ignored and a PATCH naming them is refused (400).
+   */
   kpiProrateLeave: z.boolean(),
-  /** Khoán pay policy of the settlement (PD-033); applies to the next run (automatic or manual) and to provisional figures. */
-  khoanPayPolicy: KhoanPayPolicySchema,
   anomalyFailRate: z.number().min(0).max(1),
   dueSoonHours: z.number().int().min(1).max(72),
   kpiDefaultMember: z.number().min(0).max(1_000_000),

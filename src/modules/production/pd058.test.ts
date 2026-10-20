@@ -473,6 +473,7 @@ describe("totals over known numbers", () => {
       created_by: null,
       created_at: new Date("2026-10-16T01:00:00Z"),
       created_cursor: "2026-10-16T01:00:00.000000Z",
+      received_cursor: "2026-10-16T01:00:00.000000Z",
       archived_at: null
     } satisfies JobRow;
     const summary = JobSummarySchema.parse(toJobSummary(row));

@@ -17,10 +17,11 @@ import type {
 } from "../../contracts/production-jobs.js";
 import { getSql } from "../../db/client.js";
 import { AppError } from "../../lib/app-error.js";
-import type { QuerySql } from "../../lib/db-types.js";
+import { decodeCursor, encodeCursor, escapeLike, invalidCursor, type QuerySql } from "../../lib/db-types.js";
 import type { AccessContext } from "../access/access-context.js";
 import { assertProductionMember } from "./access.js";
-import { cursorInstantSql, decodeTimeCursor, encodeTimeCursor } from "./cursor.js";
+import { loadSettings } from "./catalog.service.js";
+import { cursorInstantSql, decodeTimeCursor, encodeTimeCursor, isUuid, isValidCursorInstant } from "./cursor.js";
 import { assertFeature } from "./features.js";
 import {
   anyTagSql,
@@ -41,6 +42,7 @@ import {
   loadMemberRoles,
   loadTask,
   loadTaskExtras,
+  loadTaskPoints,
   loadWorkflowModel,
   notSubtaskSql,
   relationOf,
@@ -516,8 +518,11 @@ export const getProductionTask = async (context: AccessContext, taskId: string, 
   assertProductionMember(context);
   const [task, workflow] = await Promise.all([loadTask(sql, context.organization.id, taskId), loadWorkflowModel(sql, context.organization.id)]);
   const scopes = await assertTaskVisible(sql, context, task);
-  const extras = await loadTaskExtras(sql, context.organization.id, context.user.id, [task]);
-  return toProductionTask(task, workflow, relationOf(context, task), { scopes, userId: context.user.id }, extras.get(task.id));
+  const [extras, points] = await Promise.all([
+    loadTaskExtras(sql, context.organization.id, context.user.id, [task]),
+    loadTaskPoints(sql, context, [task])
+  ]);
+  return toProductionTask(task, workflow, relationOf(context, task), { scopes, userId: context.user.id }, extras.get(task.id), points);
 };
 
 /**
@@ -533,34 +538,110 @@ const taskListFilters = async (sql: QuerySql, organizationId: string, query: { t
 };
 
 /**
- * Personal board: tasks I work on and/or check, soonest deadline first (full-precision keyset, BUG-PR-05). Subtasks are
- * listed inside their line (`subtasks`), not as cards of their own (PD-044). Without `includeFinished`, finished lines
- * are left out (PD-045: "Đã check" or later; a Checking line once Done — lineFinishedSql).
+ * PD-068 search of "Việc của tôi" on the line `t` and its job `j`, project `p`, process `pr` — accents and case ignored
+ * (the job list's helper): the line's code ("1286", "#1286"; a subtask's "1286a" finds its line), Gói công việc / job
+ * name, project code / name, process name, note.
+ */
+export const myTaskSearchSql = (sql: QuerySql, q: string) => {
+  const term = q.trim();
+  const like = `%${escapeLike(term.toLowerCase())}%`;
+  const code = /^#?(\d{1,9})[a-z]{0,3}$/i.exec(term);
+  return sql`AND (
+    ${code ? sql`t.number = ${Number(code[1])} OR` : sql``}
+    public.immutable_unaccent(lower(concat_ws(' ', j.code, j.name, p.code, p.name, pr.name, t.note))) LIKE public.immutable_unaccent(${like})
+  )`;
+};
+
+/**
+ * PD-068 date filter of "Việc của tôi": the line's Ngày nhận (`assigned_at`, default) or Ngày giao (`deadline`) within
+ * [from 00:00, to + 1 day 00:00) in the organization timezone (inclusive calendar days, the database's zone rules).
+ */
+export const myTaskDateSql = (
+  sql: QuerySql,
+  query: Pick<MyProductionTasksQuery, "dateBy" | "from" | "to">,
+  timeZone: string
+) => {
+  const column = () => (query.dateBy === "deadline" ? sql`t.deadline` : sql`t.assigned_at`);
+  return sql`
+    ${query.from ? sql`AND ${column()} >= ((${query.from}::date)::timestamp AT TIME ZONE ${timeZone}::text)` : sql``}
+    ${query.to ? sql`AND ${column()} < (((${query.to}::date) + 1)::timestamp AT TIME ZONE ${timeZone}::text)` : sql``}
+  `;
+};
+
+type MyTasksCursor = { finished: boolean; at: string; id: string };
+const cursorGroups = { open: false, finished: true } as const;
+
+/** The `includeFinished` cursor: [group, deadline (full precision), id]; anything else (an older cursor) → 400. */
+const decodeMyTasksCursor = (cursor: string | undefined): MyTasksCursor | null => {
+  if (!cursor) {
+    return null;
+  }
+  const [group, at, id] = decodeCursor(cursor, 3) ?? [];
+  if ((group !== "open" && group !== "finished") || typeof at !== "string" || typeof id !== "string" || !isValidCursorInstant(at) || !isUuid(id)) {
+    throw invalidCursor();
+  }
+  return { finished: cursorGroups[group], at, id };
+};
+
+/**
+ * Personal board: tasks I work on and/or check (full-precision keyset, BUG-PR-05). Subtasks are listed inside their line
+ * (`subtasks`), not as cards of their own (PD-044). Without `includeFinished`, finished lines are left out (PD-045: "Đã
+ * check" or later; a Checking line once Done — lineFinishedSql) and the rest come soonest Ngày giao first. PD-068: with
+ * `includeFinished` the open lines still come first (soonest Ngày giao first), then the finished ones, latest Ngày giao
+ * first — so old finished work never pushes open tasks to later pages; its cursor carries the group. Search (`q`) and
+ * the date range (`dateBy`, `from`, `to`) narrow both.
  */
 export const listMyProductionTasks = async (context: AccessContext, query: MyProductionTasksQuery): Promise<ProductionTaskPage> => {
   assertProductionMember(context);
   const sql = getSql();
   const organizationId = context.organization.id;
-  const cursor = decodeTimeCursor(query.cursor);
-  const workflow = await loadWorkflowModel(sql, organizationId);
+  const plainCursor = query.includeFinished ? null : decodeTimeCursor(query.cursor);
+  const groupCursor = query.includeFinished ? decodeMyTasksCursor(query.cursor) : null;
+  const [workflow, settings] = await Promise.all([loadWorkflowModel(sql, organizationId), loadSettings(sql, organizationId)]);
+  const finish = lineFinishStatusIds(workflow);
+  const finished = () => lineFinishedSql(sql, finish, "pr");
   const me = context.user.id;
   const filters = await taskListFilters(sql, organizationId, query);
+  const after = groupCursor
+    ? groupCursor.finished
+      ? sql`AND ${finished()} AND (t.deadline, t.id) < (${cursorInstantSql(sql, groupCursor.at)}, ${groupCursor.id}::uuid)`
+      : sql`AND (${finished()} OR (t.deadline, t.id) > (${cursorInstantSql(sql, groupCursor.at)}, ${groupCursor.id}::uuid))`
+    : plainCursor
+      ? sql`AND (t.deadline, t.id) > (${cursorInstantSql(sql, plainCursor.at)}, ${plainCursor.id}::uuid)`
+      : sql``;
+  const order = query.includeFinished
+    ? sql`${finished()},
+        CASE WHEN ${finished()} THEN NULL ELSE t.deadline END ASC, CASE WHEN ${finished()} THEN t.deadline END DESC,
+        CASE WHEN ${finished()} THEN NULL ELSE t.id END ASC, CASE WHEN ${finished()} THEN t.id END DESC`
+    : sql`t.deadline, t.id`;
   const rows = await sql<TaskRow[]>`
     ${taskSelectSql(sql)}
     WHERE t.organization_id = ${organizationId}
       AND ${query.role === "assignee" ? sql`t.assignee_id = ${me}` : query.role === "qc" ? sql`t.qc_id = ${me}` : sql`(t.assignee_id = ${me} OR t.qc_id = ${me})`}
-      ${query.includeFinished ? sql`` : sql`AND NOT ${lineFinishedSql(sql, lineFinishStatusIds(workflow), "pr")}`}
+      ${query.includeFinished ? sql`` : sql`AND NOT ${finished()}`}
       AND j.archived_at IS NULL AND ${notSubtaskSql(sql)}
       ${filters()}
-      ${cursor ? sql`AND (t.deadline, t.id) > (${cursorInstantSql(sql, cursor.at)}, ${cursor.id}::uuid)` : sql``}
-    ORDER BY t.deadline, t.id
+      ${query.q ? myTaskSearchSql(sql, query.q) : sql``}
+      ${myTaskDateSql(sql, query, settings.timezone)}
+      ${after}
+    ORDER BY ${order}
     LIMIT ${query.limit + 1}
   `;
   const page = rows.slice(0, query.limit);
   const last = page[page.length - 1];
+  const more = rows.length > query.limit && last !== undefined;
+  const nextCursor = !more
+    ? null
+    : query.includeFinished
+      ? encodeCursor([
+          isLineFinished(workflow, { statusId: last.status_id, isChecking: last.process_is_qc, doneAt: last.done_at }, finish) ? "finished" : "open",
+          last.deadline_cursor,
+          last.id
+        ])
+      : encodeTimeCursor(last.deadline_cursor, last.id);
   return {
     items: await toProductionTasks(sql, context, workflow, page),
-    pageInfo: { hasMore: rows.length > query.limit, nextCursor: rows.length > query.limit && last ? encodeTimeCursor(last.deadline_cursor, last.id) : null }
+    pageInfo: { hasMore: rows.length > query.limit, nextCursor }
   };
 };
 

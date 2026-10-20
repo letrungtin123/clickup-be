@@ -22,6 +22,7 @@ import { matchesCustomFieldFilters, resolveCustomFieldFilters } from "./custom-f
 import { closeDaysOf, customFieldsForbidden, loadSettings } from "./catalog.service.js";
 import { featureForbidden } from "./features.js";
 import { kpiSettledEvent } from "./kpi-settlement-notifications.js";
+import { findMissingKpiTargets, kpiTargetsMissingError, loadTargetVersionsByUser } from "./kpi-targets.service.js";
 import { approvedLeaveDaysByUser } from "./leave.service.js";
 import { loadScoreSubject } from "./scores.service.js";
 import {
@@ -33,58 +34,35 @@ import {
   periodsIn,
   rollupKey,
   rollupKpiPeriod,
+  settlementKhoanPolicy,
   sumKpiFigures,
   settlePeriod,
   shiftPeriod,
-  type KpiCloseDays,
-  type KpiPeriodType,
-  type SettlementResult,
-  type TargetVersion
+  type KpiCloseDays
 } from "./scoring.js";
 import { businessDay } from "./time.js";
 
 /**
  * KPI settlement on the close day (SPEC §8, PLAN §6). The rules are pure (scoring.ts settleUser /
- * settlePeriod); this module loads the period's figures, replaces the period's rows atomically, keeps
- * the run history and queues the KPI_SETTLED notifications. Runs of one organization are serialized
- * by a transaction-scoped advisory lock shared with the scheduler.
+ * settlePeriod — Khoán rule TOP_UP, PD-066); this module loads the period's figures, replaces the period's rows
+ * atomically, keeps the run history and queues the KPI_SETTLED notifications. Runs of one organization are serialized
+ * by a transaction-scoped advisory lock shared with the scheduler. PD-066: a run is refused (409 KPI_TARGETS_MISSING,
+ * nothing written) while someone who must have a KPI has no MONTH target for the period.
  */
 
 const org = (context: AccessContext) => context.organization.id;
 export const settlementLockKey = (organizationId: string) => `production:kpi-settlement:${organizationId}`;
 const maxReportPeriods = 24;
 
-type TargetRow = { user_id: string; period_type: KpiPeriodType; target_points: string; effective_from: string };
-
-const loadTargets = async (sql: QuerySql, organizationId: string, userIds: string[], types: KpiPeriodType[]) => {
-  const byUser = new Map<string, TargetVersion[]>();
-  if (userIds.length === 0) {
-    return byUser;
-  }
-  const rows = await sql<TargetRow[]>`
-    SELECT user_id, period_type, target_points::text AS target_points, to_char(effective_from, 'YYYY-MM') AS effective_from
-    FROM production.kpi_targets
-    WHERE organization_id = ${organizationId} AND user_id = ANY(${userIds}::uuid[]) AND period_type = ANY(${types}::text[])
-  `;
-  for (const row of rows) {
-    byUser.set(row.user_id, [
-      ...(byUser.get(row.user_id) ?? []),
-      { periodType: row.period_type, targetPoints: Number(row.target_points), effectiveFrom: row.effective_from }
-    ]);
-  }
-  return byUser;
-};
-
 /**
  * What settling `period` gives right now, without writing anything: everyone with a score entry in the
- * period plus active members with a MONTH target effective for it (optionally only `onlyUserIds`).
- * `khoanPolicy` is settings.khoanPayPolicy (PD-033).
+ * period plus active members with a MONTH target effective for it (optionally only `onlyUserIds`), Khoán rule TOP_UP.
  */
 export const computeSettlement = async (
   sql: QuerySql,
   organizationId: string,
   period: string,
-  options: { closeDay: KpiCloseDays; prorateLeave: boolean; khoanPolicy: KhoanPayPolicy; onlyUserIds?: string[] | null }
+  options: { closeDay: KpiCloseDays; prorateLeave: boolean; onlyUserIds?: string[] | null }
 ) => {
   const { from, to } = periodRange(period, options.closeDay);
   const only = options.onlyUserIds ?? null;
@@ -110,7 +88,7 @@ export const computeSettlement = async (
   ]);
   const userIds = [...new Set([...sums.map((row) => row.user_id), ...targeted.map((row) => row.user_id)])].sort();
   const [targets, leave] = await Promise.all([
-    loadTargets(sql, organizationId, userIds, ["MONTH"]),
+    loadTargetVersionsByUser(sql, organizationId, userIds, ["MONTH"]),
     approvedLeaveDaysByUser(sql, organizationId, userIds, from, to, { workdaysOnly: true })
   ]);
   const sumOf = new Map(sums.map((row) => [row.user_id, row]));
@@ -118,7 +96,6 @@ export const computeSettlement = async (
     period,
     closeDay: options.closeDay,
     prorateLeave: options.prorateLeave,
-    khoanPolicy: options.khoanPolicy,
     users: userIds.map((userId) => ({
       userId,
       targets: targets.get(userId) ?? [],
@@ -133,8 +110,9 @@ export const computeSettlement = async (
 /**
  * SPEC §8.2 settleMonth: settles `period` and replaces its rows (idempotent: the same data gives the
  * same rows, never duplicates), records the run, and queues the notifications. Call inside a transaction.
- * The run uses the settings at run time (close day of the period, leave proration, Khoán pay policy — PD-033) and
- * records them, so re-running a period after switching the policy replaces its rows with the other outcome.
+ * The run uses the settings at run time (close day of the period, leave proration) and the Khoán rule TOP_UP (PD-066),
+ * and records them. PD-066: throws 409 KPI_TARGETS_MISSING before writing anything while someone who must have a KPI
+ * (kpi-targets.service selectKpiRequiredMembers) has no MONTH target for the period.
  */
 export const settleMonth = async (
   tx: QuerySql,
@@ -143,11 +121,14 @@ export const settleMonth = async (
   options: { trigger: "AUTO" | "MANUAL"; runBy: string | null; reason: string | null }
 ) => {
   await tx`SELECT pg_advisory_xact_lock(hashtextextended(${settlementLockKey(organizationId)}, 0))`;
+  const { missing } = await findMissingKpiTargets(tx, organizationId, period);
+  if (missing.length > 0) {
+    throw kpiTargetsMissingError(missing);
+  }
   const settings = await loadSettings(tx, organizationId);
   const result = await computeSettlement(tx, organizationId, period, {
     closeDay: closeDaysOf(settings),
-    prorateLeave: settings.kpiProrateLeave,
-    khoanPolicy: settings.khoanPayPolicy
+    prorateLeave: settings.kpiProrateLeave
   });
   const met = result.items.filter((item) => item.met).length;
   const run = (
@@ -157,7 +138,7 @@ export const settleMonth = async (
         user_count, met_count, not_met_count, khoan_money_total, khoan_points_converted_total
       ) VALUES (
         ${organizationId}, ${`${period}-01`}::date, ${result.from}::date, ${result.to}::date, ${closeDayOfPeriod(closeDaysOf(settings), period)}, ${options.trigger},
-        ${options.runBy}, ${options.reason}, ${settings.kpiProrateLeave}, ${settings.khoanPayPolicy}, ${result.items.length}, ${met}, ${result.items.length - met},
+        ${options.runBy}, ${options.reason}, ${settings.kpiProrateLeave}, ${settlementKhoanPolicy}, ${result.items.length}, ${met}, ${result.items.length - met},
         ${result.items.reduce((sum, item) => sum + item.khoanMoney, 0)},
         ${Math.round(result.items.reduce((sum, item) => sum + item.khoanPointsConverted * 100, 0)) / 100}
       )
@@ -179,6 +160,7 @@ export const settleMonth = async (
     working_days: item.workingDays,
     leave_days: item.leaveDays,
     points_official: item.pointsOfficial,
+    shortfall_points: item.shortfall,
     met: item.met,
     khoan_credits: item.khoanCredits,
     khoan_money_raw: item.khoanMoneyRaw,
@@ -210,6 +192,8 @@ type SettlementRow = UserRefJson & {
   working_days: number;
   leave_days: string;
   points_official: string;
+  /** null: a row of a run before PD-066 (the shortfall is then computed). */
+  shortfall_points: string | null;
   met: boolean;
   khoan_credits: string;
   khoan_money_raw: string;
@@ -234,7 +218,8 @@ const selectSettlements = (
     SELECT ks.id AS settlement_id, au.id, au.display_name, au.email, au.avatar_url,
       to_char(ks.period_month, 'YYYY-MM') AS period, to_char(ks.period_from, 'YYYY-MM-DD') AS period_from,
       to_char(ks.period_to, 'YYYY-MM-DD') AS period_to, ks.target_base::text AS target_base, ks.target_points::text AS target_points,
-      ks.prorate_leave, ks.working_days, ks.leave_days::text AS leave_days, ks.points_official::text AS points_official, ks.met,
+      ks.prorate_leave, ks.working_days, ks.leave_days::text AS leave_days, ks.points_official::text AS points_official,
+      ks.shortfall_points::text AS shortfall_points, ks.met,
       ks.khoan_credits::text AS khoan_credits, ks.khoan_money_raw::text AS khoan_money_raw, ks.khoan_money::text AS khoan_money,
       ks.khoan_points_converted::text AS khoan_points_converted, ks.total_points::text AS total_points, r.khoan_policy,
       ks.run_id, ks.run_at, ks.note
@@ -249,20 +234,28 @@ const selectSettlements = (
   `;
 
 /**
- * Who reads the rows: money is visible to the row's owner, to the roles of `view_others_money` (`money`, PD-065; by
- * default Admin and Director, the superadmin always), and to everyone when settings.moneyPublic (PD-052). `admin`:
+ * Who reads the rows: money is visible to the row's owner and to the roles of `view_others_money` (`money`, PD-065; by
+ * default Admin and Director, the superadmin always) — nobody else (PD-066: `moneyPublic` is retired). `admin`:
  * colleagues' emails.
  */
-type Viewer = { id: string; admin: boolean; money: boolean; moneyPublic: boolean };
-const seesMoney = (viewer: Viewer, userId: string) => viewer.money || viewer.moneyPublic || userId === viewer.id;
+type Viewer = { id: string; admin: boolean; money: boolean };
+const seesMoney = (viewer: Viewer, userId: string) => viewer.money || userId === viewer.id;
 
 /** The KPI viewer of the caller (settings loaded). */
 const viewerOf = (context: AccessContext, settings: ProductionSettings): Viewer => ({
   id: context.user.id,
   admin: isProductionAdmin(context),
-  money: featuresOf(context, settings.featurePermissions).has("view_others_money"),
-  moneyPublic: settings.moneyPublic
+  money: featuresOf(context, settings.featurePermissions).has("view_others_money")
 });
+
+/** max(0, target − official) of a stored row; rows of runs before PD-066 have no stored value. */
+const shortfallOf = (row: Pick<SettlementRow, "shortfall_points" | "target_points" | "points_official">) => {
+  if (row.shortfall_points !== null) {
+    return Number(row.shortfall_points);
+  }
+  const target = nullableNumber(row.target_points);
+  return target === null ? 0 : Math.max(0, Math.round((target - Number(row.points_official)) * 100)) / 100 + 0;
+};
 
 /** PD-065: someone else's KPI rows (`userId` ≠ me) need `view_others_scores`; 403 SCORES_PRIVATE otherwise. */
 const assertSeesScoresOf = (context: AccessContext, settings: ProductionSettings, userId: string | undefined) => {
@@ -288,8 +281,11 @@ const toSettlement = (row: SettlementRow, viewer: Viewer): KpiSettlement => {
     workingDays: row.working_days,
     leaveDays: Number(row.leave_days),
     pointsOfficial: Number(row.points_official),
+    shortfall: shortfallOf(row),
     met: row.met,
     khoanCredits: Number(row.khoan_credits),
+    khoanMoneyEarned: money ? Number(row.khoan_money_raw) : null,
+    khoanMoneyPaid: money ? Number(row.khoan_money) : null,
     khoanMoneyRaw: money ? Number(row.khoan_money_raw) : null,
     khoanMoney: money ? Number(row.khoan_money) : null,
     khoanPointsConverted: Number(row.khoan_points_converted),
@@ -346,7 +342,8 @@ const selectRuns = (sql: QuerySql, organizationId: string, filter: { ids?: strin
   LIMIT ${filter.limit}
 `;
 
-const toRun = (row: RunRow): KpiSettlementRun => ({
+/** `money`: the caller sees everyone's money (`view_others_money`) — the run's money total is null otherwise (PD-066). */
+const toRun = (row: RunRow, money: boolean): KpiSettlementRun => ({
   id: row.id,
   period: row.period,
   from: row.period_from,
@@ -360,7 +357,7 @@ const toRun = (row: RunRow): KpiSettlementRun => ({
   userCount: row.user_count,
   metCount: row.met_count,
   notMetCount: row.not_met_count,
-  khoanMoneyTotal: Number(row.khoan_money_total),
+  khoanMoneyTotal: money ? Number(row.khoan_money_total) : null,
   khoanPointsConvertedTotal: Number(row.khoan_points_converted_total),
   replacedCount: row.replaced_count,
   startedAt: toIso(row.started_at),
@@ -385,7 +382,8 @@ export const runKpiSettlement = async (context: AccessContext, input: { period: 
     selectRuns(sql, org(context), { ids: [runId], limit: 1 }),
     selectSettlements(sql, org(context), { fromPeriod: input.period, toPeriod: input.period, userIds: null, visible: visibleUserSql(sql, context) })
   ]);
-  return { run: toRun(runs[0]!), items: rows.map((row) => toSettlement(row, viewerOf(context, settings))) };
+  const viewer = viewerOf(context, settings);
+  return { run: toRun(runs[0]!, viewer.money), items: rows.map((row) => toSettlement(row, viewer)) };
 };
 
 /**
@@ -410,13 +408,16 @@ export const listKpiSettlements = async (
     admin ? selectRuns(sql, org(context), { period, limit: 1 }) : Promise.resolve([])
   ]);
   const viewer = viewerOf(context, settings);
-  return { period, run: runs[0] ? toRun(runs[0]) : null, items: rows.map((row) => toSettlement(row, viewer)) };
+  return { period, run: runs[0] ? toRun(runs[0], viewer.money) : null, items: rows.map((row) => toSettlement(row, viewer)) };
 };
 
-/** GET /production/kpi/settlement-runs — run history (ADMIN). */
+/** GET /production/kpi/settlement-runs — run history (ADMIN; money totals for `view_others_money`). */
 export const listKpiSettlementRuns = async (context: AccessContext, query: { period?: string | undefined; limit: number }) => {
   assertProductionAdmin(context);
-  return { items: (await selectRuns(getSql(), org(context), { period: query.period, limit: query.limit })).map(toRun) };
+  const sql = getSql();
+  const [settings, runs] = await Promise.all([loadSettings(sql, org(context)), selectRuns(sql, org(context), { period: query.period, limit: query.limit })]);
+  const money = viewerOf(context, settings).money;
+  return { items: runs.map((row) => toRun(row, money)) };
 };
 
 const periodsBetween = (from: string, to: string) => {
@@ -427,19 +428,31 @@ const periodsBetween = (from: string, to: string) => {
   return periods;
 };
 
-const reportRow = (
-  userId: string,
-  period: string,
-  settled: boolean,
-  item: Omit<SettlementResult, "prorateLeave" | "workingDays" | "khoanMoneyRaw">,
-  moneyVisible: boolean
-): KpiReportRow => ({
+type ReportFigures = {
+  targetBase: number | null;
+  target: number | null;
+  pointsOfficial: number;
+  shortfall: number;
+  khoanCredits: number;
+  khoanPointsConverted: number;
+  totalPoints: number;
+  percent: number | null;
+  difference: number | null;
+  met: boolean;
+  leaveDays: number;
+  /** Khoán money earned / paid (always known here; hidden by `moneyVisible`). */
+  earned: number;
+  paid: number;
+};
+
+const reportRow = (userId: string, period: string, settled: boolean, item: ReportFigures, moneyVisible: boolean): KpiReportRow => ({
   userId,
   period,
   settled,
   targetBase: item.targetBase,
   target: item.target,
   pointsOfficial: item.pointsOfficial,
+  shortfall: item.shortfall,
   khoanCredits: item.khoanCredits,
   khoanPointsConverted: item.khoanPointsConverted,
   totalPoints: item.totalPoints,
@@ -447,13 +460,15 @@ const reportRow = (
   difference: item.difference,
   met: item.met,
   leaveDays: item.leaveDays,
-  khoanMoney: moneyVisible ? item.khoanMoney : null
+  khoanMoneyEarned: moneyVisible ? item.earned : null,
+  khoanMoneyPaid: moneyVisible ? item.paid : null,
+  khoanMoney: moneyVisible ? item.paid : null
 });
 
 /**
- * GET /production/kpi/report — user × period: target, official points, converted Khoán credits, total,
- * % đạt, vượt/thiếu, Khoán money (ADMIN and the owner). Settled periods come from kpi_settlements; periods
- * without a run yet show what a settlement would give now (`settled: false`).
+ * GET /production/kpi/report — user × period: target, official points, shortfall, Khoán points converted ("bù từ
+ * Khoán"), total, % đạt, vượt/thiếu, Khoán money earned / paid (the owner and `view_others_money`). Settled periods come
+ * from kpi_settlements; periods without a run yet show what a settlement would give now (`settled: false`, TOP_UP).
  *
  * Quarter / year rollups (SPEC §8.4 "Quý/năm = cộng các tháng", G8) always cover the WHOLE quarter / year the
  * range touches — the months outside the selected range are read too — so a Q3 column is the same whatever range
@@ -464,7 +479,7 @@ const reportRow = (
  * (any of them) and USER custom fields (e.g. cf.nang_luc=A). Others see only themselves and cannot use the
  * tag / custom-field filters (403 CUSTOM_FIELDS_FORBIDDEN: members' custom values are Admin data). `userId`
  * ("Điểm cá nhân", PD-052): only that production member — someone else needs `view_others_scores` (PD-065, 403
- * SCORES_PRIVATE). Khoán money: the roles of `view_others_money` (PD-065), the owner, or settings.moneyPublic.
+ * SCORES_PRIVATE). Khoán money: the roles of `view_others_money` (PD-065) and the owner (PD-066).
  * Temporary QA test accounts are left out for a viewer who is not one (PD-063).
  */
 export const getKpiReport = async (
@@ -533,7 +548,13 @@ export const getKpiReport = async (
   const viewer = viewerOf(context, settings);
   const rows: KpiReportRow[] = settledRows.map((row) => {
     const settlement = toSettlement(row, viewer);
-    return reportRow(row.id, row.period, true, { ...settlement, khoanMoney: Number(row.khoan_money) }, seesMoney(viewer, row.id));
+    return reportRow(
+      row.id,
+      row.period,
+      true,
+      { ...settlement, earned: Number(row.khoan_money_raw), paid: Number(row.khoan_money) },
+      seesMoney(viewer, row.id)
+    );
   });
   const userInfo = new Map<string, UserRefJson>(settledRows.map((row) => [row.id, row]));
 
@@ -541,11 +562,10 @@ export const getKpiReport = async (
     const provisional = await computeSettlement(sql, organizationId, period, {
       closeDay: closeDays,
       prorateLeave: settings.kpiProrateLeave,
-      khoanPolicy: settings.khoanPayPolicy,
       onlyUserIds
     });
     for (const item of provisional.items) {
-      rows.push(reportRow(item.userId, period, false, item, seesMoney(viewer, item.userId)));
+      rows.push(reportRow(item.userId, period, false, { ...item, earned: item.khoanMoneyRaw, paid: item.khoanMoney }, seesMoney(viewer, item.userId)));
     }
   }
 
@@ -590,7 +610,7 @@ export const getKpiReport = async (
     .filter((row) => visible.has(row.userId) && inRange.has(row.period))
     .sort((a, b) => (a.period < b.period ? -1 : a.period > b.period ? 1 : b.totalPoints - a.totalPoints));
 
-  const targets = await loadTargets(sql, organizationId, visibleUsers, ["MONTH", "QUARTER", "YEAR"]);
+  const targets = await loadTargetVersionsByUser(sql, organizationId, visibleUsers, ["MONTH", "QUARTER", "YEAR"]);
   const rollups: KpiReportRollup[] = [];
   for (const userId of withRollups ? visibleUsers : []) {
     const mine = rows.filter((row) => row.userId === userId);
@@ -605,30 +625,34 @@ export const getKpiReport = async (
         const rollup = rollupKpiPeriod({
           periodType,
           period: anchor,
-          months: months.map((month) => ({ ...month, khoanMoney: month.khoanMoney ?? 0 })),
+          months: months.map((month) => ({ ...month, khoanMoneyEarned: month.khoanMoneyEarned ?? 0, khoanMoneyPaid: month.khoanMoneyPaid ?? 0 })),
           monthTargets: targets.get(userId) ?? [],
           explicitTarget: explicit,
           started,
           settled: (period) => settledPeriods.has(period)
         });
+        const money = seesMoney(viewer, userId);
         rollups.push({
           userId,
           periodType,
           ...rollup,
           explicitTarget: explicit !== null,
-          khoanMoney: seesMoney(viewer, userId) ? rollup.khoanMoney : null
+          khoanMoneyEarned: money ? rollup.khoanMoneyEarned : null,
+          khoanMoneyPaid: money ? rollup.khoanMoneyPaid : null,
+          khoanMoney: money ? rollup.khoanMoneyPaid : null
         });
       }
     }
   }
 
   // Team and organization totals (ADMIN): per month of the range and per quarter / year. Their money only for a viewer
-  // who sees everyone's (PD-065: an ADMIN without `view_others_money` and moneyPublic off gets null, never a partial sum).
+  // who sees everyone's (PD-065 / PD-066: an ADMIN without `view_others_money` gets null, never a partial sum).
   const totals: KpiReportTotal[] = [];
-  const totalMoney = viewer.money || viewer.moneyPublic;
   const sumFigures = (items: Parameters<typeof sumKpiFigures>[0]) => {
     const figures = sumKpiFigures(items);
-    return totalMoney ? figures : { ...figures, khoanMoney: null };
+    return viewer.money
+      ? { ...figures, khoanMoney: figures.khoanMoneyPaid }
+      : { ...figures, khoanMoneyEarned: null, khoanMoneyPaid: null, khoanMoney: null };
   };
   if (admin) {
     const groups: { scope: "TEAM" | "ORG"; teamId: string | null; teamName: string | null; members: Set<string> }[] = [];

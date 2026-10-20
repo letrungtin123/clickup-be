@@ -16,6 +16,7 @@ import {
   DeleteTaskResultSchema,
   JobChatResultSchema,
   JobDetailSchema,
+  JobFacetsSchema,
   JobOptionsQuerySchema,
   JobOptionsSchema,
   JobPageSchema,
@@ -49,6 +50,7 @@ import {
   createJob,
   deleteJob,
   getJobDetail,
+  getJobFacets,
   listJobOptions,
   listJobs,
   reassignFeedback,
@@ -82,6 +84,11 @@ export const createProductionJobRoutes = (): ExpressRouter => {
   routes.post("/production/jobs", handle(async (context, req) => JobDetailSchema.parse(await createJob(context, CreateJobRequestSchema.parse(req.body))), 201));
   // "Gói công việc" picker of "Nhập công việc" (PD-038); registered before /production/jobs/:jobId.
   routes.get("/production/jobs/options", handle(async (context, req) => JobOptionsSchema.parse(await listJobOptions(context, JobOptionsQuerySchema.parse(req.query)))));
+  // Month / project counts of the job List view (PD-067); same query as GET /production/jobs. Before /:jobId.
+  routes.get(
+    "/production/jobs/facets",
+    handle(async (context, req) => JobFacetsSchema.parse(await getJobFacets(context, JobQuerySchema.parse(withCustomFieldFilters(req.query)))))
+  );
   routes.get("/production/jobs/:jobId", handle(async (context, req) => JobDetailSchema.parse(await getJobDetail(context, param(req, "jobId")))));
   routes.patch(
     "/production/jobs/:jobId",

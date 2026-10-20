@@ -145,6 +145,7 @@ const jobRow = (overrides: Partial<JobRow> = {}): JobRow => ({
   created_by: null,
   created_at: new Date("2026-10-01T01:00:00Z"),
   created_cursor: "2026-10-01T01:00:00.000000Z",
+  received_cursor: "2026-10-01T01:00:00.000000Z",
   archived_at: null,
   ...overrides
 });
@@ -238,7 +239,10 @@ describe("job people summary (Người làm)", () => {
     db.state.handler = (call) => (call.text.startsWith("WITH page AS MATERIALIZED") ? [jobRow()] : undefined);
     const page = JobPageSchema.parse(await listJobs(contextWith(["LEADER"]), JobQuerySchema.parse({})));
     expect(page.items[0]!.people.workers.map((worker) => worker.qty)).toEqual([25, 15]);
-    expect(dataCalls()).toHaveLength(1);
+    // PD-070: besides it, one batched statement reads the page's task rows for the "Điểm" column (never one per job).
+    const points = dataCalls().filter((call) => call.text.includes("t.job_id = ANY("));
+    expect(points).toHaveLength(1);
+    expect(dataCalls()).toHaveLength(2);
     expect(listQuery().text).toContain("people ON true");
     expect(listQuery().text).toContain("ORDER BY w.qty DESC");
   });

@@ -18,6 +18,7 @@ import { listJobs } from "./jobs.service.js";
 import { getKpiReport } from "./kpi-settlement.service.js";
 import { loadReportCustomFields, runReport, type ReportCustomFields } from "./reports.js";
 import { getScoreBoard } from "./scores.service.js";
+import { percentKpi } from "./scoring.js";
 import { businessDay } from "./time.js";
 
 /**
@@ -520,7 +521,15 @@ export const exportJobs = async (context: AccessContext, res: Response, query: J
 
 // Score board ----------------------------------------------------------------------------------------------
 
-/** GET /production/scores/board/export — the board's own visibility rules (`view_others_scores`, PD-065; money). */
+/** PD-069 "Chưa có KPI": in the KPI column of the team board export for someone who must have a KPI and has none. */
+export const noKpiLabel = "Chưa có KPI";
+
+/**
+ * GET /production/scores/board/export — "Bảng điểm → Toàn đội" (PD-069) with the board's own visibility rules
+ * (`view_others_scores`, PD-065; money): Họ tên, Team, Điểm chính thức, KPI ("Chưa có KPI" for someone who must have
+ * one, blank otherwise), % đạt, and Tiền Khoán only for a viewer who sees everyone's money (`moneyVisible`). PD-066:
+ * Khoán appears as money only (no "điểm khoán"); no rank (not a ranking).
+ */
 export const exportScoreBoard = async (
   context: AccessContext,
   res: Response,
@@ -529,32 +538,40 @@ export const exportScoreBoard = async (
   const board = await getScoreBoard(context, query);
   const peopleFilters = await peopleFilterRows(context, query);
   const { now, today } = exportedAt();
-  const showMoney = board.items.some((item) => item.money !== null);
+  const showMoney = board.moneyVisible;
   const columns: SheetColumn[] = [
-    { header: "Hạng", key: "rank", width: 8, numFmt: numberFormats.count },
-    { header: "Nhân viên", key: "name", width: 28 },
+    { header: "Họ tên", key: "name", width: 28 },
     { header: "Team", key: "team", width: 20 },
     { header: "Điểm chính thức", key: "pointsOfficial", width: 18, numFmt: numberFormats.points },
-    { header: "Điểm khoán", key: "pointsKhoan", width: 14, numFmt: numberFormats.points },
-    { header: "Số tấm khoán", key: "qtyKhoan", width: 14, numFmt: numberFormats.images },
-    ...(showMoney ? [{ header: "Tiền khoán tạm tính (VND)", key: "money", width: 24, numFmt: numberFormats.money }] : [])
+    { header: "KPI", key: "kpi", width: 14, numFmt: numberFormats.points },
+    { header: "% đạt", key: "percent", width: 10, numFmt: numberFormats.percent },
+    ...(showMoney ? [{ header: "Tiền Khoán (VND)", key: "money", width: 20, numFmt: numberFormats.money }] : [])
   ];
-  const rows = board.items.map((item) => ({
-    rank: item.rank,
-    name: item.user.displayName,
-    team: item.teamName ?? "",
-    pointsOfficial: item.pointsOfficial,
-    pointsKhoan: item.pointsKhoan,
-    qtyKhoan: item.qtyKhoan,
-    money: item.money
-  }));
-  await sendWorkbook(res, exportFilename("Bảng điểm", `kỳ ${board.period}`, today), [
-    { name: "Bảng điểm", columns, rows },
+  const rows = board.items.map((item) => {
+    const percent = percentKpi(item.pointsOfficial, item.kpiTarget);
+    return {
+      name: item.user.displayName,
+      team: item.teamName ?? "",
+      pointsOfficial: item.pointsOfficial,
+      kpi: item.kpiTarget ?? (item.kpiRequired ? noKpiLabel : null),
+      // Percent points with 2 decimals → a fraction for the "0.00%" cell, without float tails (PR-25).
+      percent: percent === null ? null : percentCell(percent / 100),
+      ...(showMoney ? { money: item.money } : {})
+    };
+  });
+  const totalCents = board.items.reduce((sum, item) => sum + Math.round(item.pointsOfficial * 100), 0);
+  const met = board.items.filter((item) => item.kpiTarget !== null && item.pointsOfficial >= item.kpiTarget).length;
+  const missing = board.items.filter((item) => item.kpiRequired && item.kpiTarget === null).length;
+  await sendWorkbook(res, exportFilename("Điểm toàn đội", `kỳ ${board.period}`, today), [
+    { name: "Toàn đội", columns, rows },
     infoSheet([
       ["Kỳ KPI", board.period],
       ["Khoảng ngày", `${formatDay(board.from)} – ${formatDay(board.to)}`],
       ...peopleFilters,
       ["Số người", rows.length],
+      ["Tổng điểm chính thức", totalCents / 100],
+      ["Đạt KPI", met],
+      ["Chưa có KPI", missing],
       ...exporterRows(context, now)
     ])
   ]);
@@ -584,7 +601,8 @@ const peopleFilterRows = async (
 /**
  * GET /production/kpi/export — the Phase 6 KPI report (GET /production/kpi/report, same query and
  * visibility: ADMIN every person, others only themselves, `userId` one production member (PD-052); Khoán money
- * for `view_others_money` (PD-065), the owner, or everyone when settings.moneyPublic).
+ * for the owner and `view_others_money` (PD-065, PD-066)). PD-066 columns: thiếu, điểm bù từ Khoán, tiền Khoán đã làm /
+ * nhận — no "điểm khoán".
  * One sheet per user × period, one for the quarter / year rollups (whole quarters / years, G8) and, for an
  * Admin, one with the team and organization totals per period / quarter / year.
  */
@@ -605,12 +623,19 @@ export const exportKpi = async (
   const { now, today } = exportedAt();
   const people = new Map(report.users.map((entry) => [entry.user.id, entry]));
   const person = (userId: string) => people.get(userId);
-  const showMoney = report.rows.some((row) => row.khoanMoney !== null) || report.rollups.some((row) => row.khoanMoney !== null);
-  const money: SheetColumn[] = showMoney ? [{ header: "Tiền khoán (VND)", key: "khoanMoney", width: 18, numFmt: numberFormats.money }] : [];
+  const showMoney =
+    report.rows.some((row) => row.khoanMoneyPaid !== null) || report.rollups.some((row) => row.khoanMoneyPaid !== null);
+  const money: SheetColumn[] = showMoney
+    ? [
+        { header: "Tiền Khoán đã làm (VND)", key: "khoanMoneyEarned", width: 20, numFmt: numberFormats.money },
+        { header: "Tiền Khoán nhận (VND)", key: "khoanMoneyPaid", width: 20, numFmt: numberFormats.money }
+      ]
+    : [];
   const figures: SheetColumn[] = [
     { header: "Chỉ tiêu KPI", key: "target", width: 14, numFmt: numberFormats.points },
     { header: "Điểm chính thức", key: "pointsOfficial", width: 16, numFmt: numberFormats.points },
-    { header: "Điểm khoán quy đổi", key: "khoanPointsConverted", width: 18, numFmt: numberFormats.points },
+    { header: "Thiếu", key: "shortfall", width: 12, numFmt: numberFormats.points },
+    { header: "Điểm bù từ Khoán", key: "khoanPointsConverted", width: 16, numFmt: numberFormats.points },
     { header: "Tổng điểm", key: "totalPoints", width: 14, numFmt: numberFormats.points },
     { header: "% đạt", key: "percent", width: 10, numFmt: numberFormats.percent },
     { header: "Vượt / thiếu", key: "difference", width: 14, numFmt: numberFormats.points }
@@ -627,9 +652,7 @@ export const exportKpi = async (
       { header: "Tình trạng", key: "settled", width: 12 },
       { header: "Chỉ tiêu gốc", key: "targetBase", width: 14, numFmt: numberFormats.points },
       { header: "Ngày nghỉ", key: "leaveDays", width: 10, numFmt: numberFormats.decimal },
-      ...figures.slice(0, 2),
-      { header: "Điểm khoán", key: "khoanCredits", width: 12, numFmt: numberFormats.points },
-      ...figures.slice(2),
+      ...figures,
       { header: "Đạt KPI", key: "met", width: 10 },
       ...money
     ],
@@ -642,13 +665,14 @@ export const exportKpi = async (
       leaveDays: row.leaveDays,
       target: row.target,
       pointsOfficial: row.pointsOfficial,
-      khoanCredits: row.khoanCredits,
+      shortfall: row.shortfall,
       khoanPointsConverted: row.khoanPointsConverted,
       totalPoints: row.totalPoints,
       percent: percentOf(row.percent),
       difference: row.difference,
       met: row.met ? "Có" : "Không",
-      khoanMoney: row.khoanMoney
+      khoanMoneyEarned: row.khoanMoneyEarned,
+      khoanMoneyPaid: row.khoanMoneyPaid
     }))
   };
   const rollups: SheetSpec = {
@@ -674,11 +698,13 @@ export const exportKpi = async (
       explicit: row.explicitTarget ? "Có" : "Không (cộng các tháng)",
       target: row.target,
       pointsOfficial: row.pointsOfficial,
+      shortfall: row.shortfall,
       khoanPointsConverted: row.khoanPointsConverted,
       totalPoints: row.totalPoints,
       percent: percentOf(row.percent),
       difference: row.difference,
-      khoanMoney: row.khoanMoney
+      khoanMoneyEarned: row.khoanMoneyEarned,
+      khoanMoneyPaid: row.khoanMoneyPaid
     }))
   };
   const totalTypes = { MONTH: "Tháng", QUARTER: "Quý", YEAR: "Năm" } as const;
@@ -703,11 +729,13 @@ export const exportKpi = async (
       metCount: row.metCount,
       target: row.target,
       pointsOfficial: row.pointsOfficial,
+      shortfall: row.shortfall,
       khoanPointsConverted: row.khoanPointsConverted,
       totalPoints: row.totalPoints,
       percent: percentOf(row.percent),
       difference: row.difference,
-      khoanMoney: row.khoanMoney
+      khoanMoneyEarned: row.khoanMoneyEarned,
+      khoanMoneyPaid: row.khoanMoneyPaid
     }))
   };
   const scope = report.from === report.to ? `kỳ ${report.from}` : `${report.from}_${report.to}`;

@@ -430,7 +430,8 @@ describe("PD-045 finished lines: closing and Việc của tôi", () => {
 
     db.state.calls = [];
     await listMyProductionTasks(contextWith(["STAFF"]), MyProductionTasksQuerySchema.parse({ includeFinished: "true" }));
-    expect(callsLike(/AS job_leader_id/)[0]!.text).not.toContain("t.done_at IS NOT NULL AND t.status_id = ANY(");
+    // PD-068: finished lines are kept (they only sort after the open ones).
+    expect(callsLike(/AS job_leader_id/)[0]!.text).not.toContain("AND NOT (t.status_id = ANY(");
   });
 });
 

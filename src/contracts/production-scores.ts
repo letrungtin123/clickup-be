@@ -5,8 +5,10 @@ import {
   IdListQuerySchema,
   KhoanPayPolicySchema,
   PayModeSchema,
+  ProductionRoleSchema,
   SafeText,
-  type KpiCloseDayVersion
+  type KpiCloseDayVersion,
+  type ProductionRole
 } from "./production-catalog.js";
 import { UserRefSchema } from "./work.js";
 
@@ -124,10 +126,11 @@ export const ScoreTotalsSchema = z.object({
   /** Credits of POINTS shifts (worker + QC): counts toward the KPI. */
   pointsOfficial: z.number(),
   /**
-   * Credits of Khoán (MONEY_IF_KPI) shifts. At the close (settings.khoanPayPolicy, PD-033): ALWAYS → the money is
-   * paid, the credits never count; IF_KPI → money if the KPI is met, else converted to points.
+   * Credits of Khoán (MONEY_IF_KPI) shifts: the points equivalent of the Khoán work ("Bảng đơn giá"). PD-066: internal
+   * only — the close converts up to this much to top up a KPI shortfall (TOP_UP); apps never show it as "điểm Khoán".
    */
   pointsKhoan: z.number(),
+  /** Khoán money earned so far ("Tiền Khoán tạm tính"); what is paid is decided at the close (TOP_UP, PD-066). */
   moneyKhoanProvisional: z.number().int(),
   /** Images of the person's own Khoán-shift lines (Checking lines included, PD-037). */
   qtyKhoan: z.number().int(),
@@ -190,8 +193,8 @@ export type ScoreEntryView = z.infer<typeof ScoreEntryViewSchema>;
  * /production/scores/me gives its owner (same query, same paging), for that person, plus who they are. Someone else's
  * needs the `view_others_scores` feature (PD-065; by default every role) — 403 SCORES_PRIVATE otherwise; a user who is
  * not an active production member of the organization → 404 SCORE_USER_NOT_FOUND. Money (`moneyKhoanProvisional` of
- * the summary and the cards, `money` of the entries) is null unless the person is the caller, the caller has
- * `view_others_money` (PD-065), or settings.moneyPublic (`moneyVisible`).
+ * the summary and the cards, `money` of the entries) is null unless the person is the caller or the caller has
+ * `view_others_money` (PD-065, PD-066 — `moneyVisible`).
  */
 export const UserScoresSchema = MyScoresSchema.extend({
   /** The person (e-mail only for themselves and the people who organise the work, SEC2-09). */
@@ -228,6 +231,24 @@ export type ForecastTone = z.infer<typeof ForecastToneSchema>;
 
 export const ForecastQuerySchema = z.object({ period: PeriodKeySchema.optional() });
 
+/**
+ * PD-066 TOP_UP ("thiếu bao nhiêu bù bấy nhiêu") applied to one person's figures — a settlement row, or "Nếu chốt hôm
+ * nay" before the close. shortfall = max(0, target − official points) (0 without a target); up to the Khoán credits
+ * (points equivalent per "Bảng đơn giá") are converted to cover it, and the Khoán money is paid in proportion to the
+ * credits left: round(earned × (K − converted) / K) VND. Met = official + converted ≥ target (no target → met).
+ */
+export const KhoanTopUpSchema = z.object({
+  shortfall: z.number(),
+  /** Khoán points that top up the KPI ("điểm bù từ Khoán"). */
+  khoanPointsConverted: z.number(),
+  /** Khoán money earned in the period ("Tiền Khoán đã làm"). */
+  khoanMoneyEarned: z.number().int(),
+  /** Khoán money paid ("Tiền Khoán nhận"). */
+  khoanMoneyPaid: z.number().int(),
+  met: z.boolean()
+});
+export type KhoanTopUp = z.infer<typeof KhoanTopUpSchema>;
+
 /** GET /production/scores/forecast — "Còn {remaining} điểm, còn {daysLeft} ngày, cần {avgPerDayNeeded}/ngày". */
 export const ScoreForecastSchema = z.object({
   period: PeriodKeySchema,
@@ -257,15 +278,26 @@ export const ScoreForecastSchema = z.object({
   /** settings.kpiProrateLeave; the target is prorated only when leave days are known (leaveDays ≠ null). */
   prorateLeave: z.boolean(),
   leaveDays: z.number().nullable(),
-  kpi: z.object({ month: KpiProgressSchema, quarter: KpiProgressSchema, year: KpiProgressSchema })
+  kpi: z.object({ month: KpiProgressSchema, quarter: KpiProgressSchema, year: KpiProgressSchema }),
+  /**
+   * PD-066: the person must have a MONTH KPI (`kpiRequiredRoles`). With `targetBase` null the apps say "Chưa có KPI kỳ
+   * này — liên hệ Quản trị", and the period cannot be settled until it is set.
+   */
+  kpiRequired: z.boolean(),
+  /** PD-066 "Nếu chốt hôm nay": TOP_UP on the period's figures so far (the target above, prorated like the close). */
+  ifSettledToday: KhoanTopUpSchema
 });
 export type ScoreForecast = z.infer<typeof ScoreForecastSchema>;
 
 /**
  * GET /production/scores/user/:userId/forecast — the KPI forecast of one production member (PD-052, same rules as
- * GET /production/scores/user/:userId); `moneyKhoanProvisional` is null unless the caller sees that person's money.
+ * GET /production/scores/user/:userId); `moneyKhoanProvisional` and `ifSettledToday` are null unless the caller sees that
+ * person's money (their own, or `view_others_money` — PD-066).
  */
-export const UserScoreForecastSchema = ScoreForecastSchema.extend({ moneyKhoanProvisional: HiddenMoney });
+export const UserScoreForecastSchema = ScoreForecastSchema.extend({
+  moneyKhoanProvisional: HiddenMoney,
+  ifSettledToday: KhoanTopUpSchema.nullable()
+});
 export type UserScoreForecast = z.infer<typeof UserScoreForecastSchema>;
 
 // Board ------------------------------------------------------------------------------------------------
@@ -282,16 +314,19 @@ export const ScoreBoardQuerySchema = z.object({
 });
 
 /**
- * GET /production/scores/board — public points (SPEC §5.4) for the roles of `view_others_scores` (PD-065; by default
- * every role, the superadmin always; others 403 SCORES_PRIVATE — settings.scoresPublic stays retired, PD-052). `money`
- * is null unless the row is the caller's own, the caller has `view_others_money` (PD-065), or settings.moneyPublic.
- * Each row opens that person's "Điểm cá nhân" (GET /production/scores/user/:userId).
+ * GET /production/scores/board — everyone's official points of a period ("Bảng điểm → Toàn đội", PD-069; SPEC §5.4) for
+ * the roles of `view_others_scores` (PD-065; by default every role, the superadmin always; others 403 SCORES_PRIVATE —
+ * settings.scoresPublic stays retired, PD-052). Rows: everyone who scored in the period, every active STAFF / LEADER / QC
+ * member and everyone who must have a KPI (PD-066 `kpiRequiredRoles`), by official points (highest first). `money`
+ * (Khoán money earned in the period) is null unless the row is the caller's own or the caller has `view_others_money`
+ * (PD-065, PD-066). Each row opens that person's "Điểm cá nhân" (GET /production/scores/user/:userId). `rank` and
+ * `pointsKhoan` stay for older app builds (PD-069: no ranking; PD-066: Khoán is shown as money only).
  */
 export const ScoreBoardSchema = z.object({
   period: PeriodKeySchema,
   from: DateOnly,
   to: DateOnly,
-  /** Money is visible for every row (`view_others_money` or money public). */
+  /** Money is visible for every row (`view_others_money`). */
   moneyVisible: z.boolean(),
   items: z.array(
     z.object({
@@ -302,7 +337,14 @@ export const ScoreBoardSchema = z.object({
       pointsOfficial: z.number(),
       pointsKhoan: z.number(),
       qtyKhoan: z.number().int(),
-      money: z.number().int().nullable()
+      money: z.number().int().nullable(),
+      /**
+       * PD-069: the person's effective MONTH target for the period, prorated by approved leave exactly like the forecast
+       * and the close (settings.kpiProrateLeave); null = no KPI.
+       */
+      kpiTarget: z.number().nullable(),
+      /** PD-066: the person must have a MONTH KPI (`kpiRequiredRoles`) — with `kpiTarget` null the apps say "Chưa có KPI". */
+      kpiRequired: z.boolean()
     })
   )
 });
@@ -394,6 +436,36 @@ export const KpiTargetImportResultSchema = z.object({
 });
 export type KpiTargetImportResult = z.infer<typeof KpiTargetImportResultSchema>;
 
+/**
+ * PD-066 — KPI is mandatory: every active Photo Retouch member holding one of these roles must have a MONTH target for
+ * each period — except the organization superadmin, members who are only DIRECTOR and temporary QA test accounts.
+ */
+export const kpiRequiredRoles = ["ADMIN", "ACCOUNT", "LEADER", "QC", "STAFF"] as const satisfies readonly ProductionRole[];
+
+export const KpiTargetsMissingQuerySchema = z.object({ period: PeriodKeySchema.optional() });
+/**
+ * GET /production/kpi-targets/missing?period — who must have a MONTH KPI for the period (default: the current one) and
+ * has none (ADMIN, like the KPI matrix). While anyone is listed, running the settlement of that period answers 409
+ * KPI_TARGETS_MISSING (details: KpiTargetsMissingDetailsSchema) and writes nothing.
+ */
+export const KpiTargetsMissingSchema = z.object({
+  period: PeriodKeySchema,
+  /** People who must have a MONTH KPI for the period (`kpiRequiredRoles`). */
+  requiredCount: z.number().int(),
+  items: z.array(
+    z.object({
+      user: UserRefSchema,
+      teamId: Id.nullable(),
+      teamName: z.string().nullable(),
+      roles: z.array(ProductionRoleSchema)
+    })
+  )
+});
+export type KpiTargetsMissing = z.infer<typeof KpiTargetsMissingSchema>;
+/** `details` of the 409 KPI_TARGETS_MISSING answer of a settlement run. */
+export const KpiTargetsMissingDetailsSchema = z.object({ users: z.array(z.object({ id: Id, displayName: z.string() })) });
+export type KpiTargetsMissingDetails = z.infer<typeof KpiTargetsMissingDetailsSchema>;
+
 export const ApplyDefaultKpiRequestSchema = z.object({ period: PeriodKeySchema }).strict();
 /** Members (STAFF/LEADER/QC) without a MONTH target for the period get kpiDefaultLeader (LEADER) or kpiDefaultMember. */
 export const ApplyDefaultKpiResultSchema = z.object({
@@ -408,8 +480,8 @@ export type ApplyDefaultKpiResult = z.infer<typeof ApplyDefaultKpiResultSchema>;
 
 /**
  * Score rows of one task (task detail): everyone's rows, for whoever may see the task (PD-052) — only the caller's own
- * without `view_others_scores` (PD-065). `money` is null unless the row is the caller's, the caller has
- * `view_others_money`, or money is public.
+ * without `view_others_scores` (PD-065). `money` is null unless the row is the caller's or the caller has
+ * `view_others_money` (PD-066). A Khoán row's `credits` are internal: apps show its money, never "điểm Khoán".
  */
 export const TaskScoreEntrySchema = ScoreEntrySchema.extend({ user: UserRefSchema, money: z.number().int().nullable() });
 export type TaskScoreEntry = z.infer<typeof TaskScoreEntrySchema>;
@@ -458,12 +530,13 @@ export const KpiSettlementRunSchema = z.object({
   runBy: UserRefSchema.nullable(),
   reason: z.string().nullable(),
   prorateLeave: z.boolean(),
-  /** Khoán pay policy the run used (settings.khoanPayPolicy at run time; runs before PD-033 used IF_KPI). */
+  /** Khoán rule the run used: TOP_UP since PD-066; older runs ALWAYS / IF_KPI (PD-033; runs before it IF_KPI). */
   khoanPolicy: KhoanPayPolicySchema,
   userCount: z.number().int(),
   metCount: z.number().int(),
   notMetCount: z.number().int(),
-  khoanMoneyTotal: z.number().int(),
+  /** Khoán money paid in total; null unless the caller sees everyone's money (`view_others_money`, PD-066). */
+  khoanMoneyTotal: z.number().int().nullable(),
   khoanPointsConvertedTotal: z.number(),
   replacedCount: z.number().int(),
   startedAt: IsoDate,
@@ -474,8 +547,8 @@ export const KpiSettlementRunSchema = z.object({
 export type KpiSettlementRun = z.infer<typeof KpiSettlementRunSchema>;
 
 /**
- * One person's settled period (SPEC §8.1). Money fields are null unless the caller has `view_others_money` (PD-065) or is
- * the owner, or settings.moneyPublic.
+ * One person's settled period (SPEC §8.1; PD-066 "Kết quả chốt": điểm chính thức, KPI, thiếu, điểm bù từ Khoán, tiền
+ * Khoán đã làm, tiền Khoán nhận). Money fields are null unless the caller is the owner or has `view_others_money`.
  */
 export const KpiSettlementSchema = z.object({
   id: Id,
@@ -490,17 +563,27 @@ export const KpiSettlementSchema = z.object({
   workingDays: z.number().int(),
   leaveDays: z.number(),
   pointsOfficial: z.number(),
+  /** max(0, target − pointsOfficial); 0 without a target (rows settled before PD-066: computed the same way). */
+  shortfall: z.number(),
   met: z.boolean(),
+  /** Points equivalent of the period's Khoán work ("Bảng đơn giá"): the most the close can convert. Internal. */
   khoanCredits: z.number(),
+  /** "Tiền Khoán đã làm": Khoán money earned in the period. */
+  khoanMoneyEarned: z.number().int().nullable(),
+  /** "Tiền Khoán nhận": Khoán money paid by the close. */
+  khoanMoneyPaid: z.number().int().nullable(),
+  /** Deprecated alias of khoanMoneyEarned (app builds before PD-066). */
   khoanMoneyRaw: z.number().int().nullable(),
+  /** Deprecated alias of khoanMoneyPaid (app builds before PD-066). */
   khoanMoney: z.number().int().nullable(),
+  /** "Điểm bù từ Khoán": Khoán points converted to top up the KPI. */
   khoanPointsConverted: z.number(),
   /** pointsOfficial + khoanPointsConverted. */
   totalPoints: z.number(),
   percent: z.number().nullable(),
   /** Vượt (+) / thiếu (−) versus the target. */
   difference: z.number().nullable(),
-  /** Khoán pay policy of the run that produced the row (PD-033). */
+  /** Khoán rule of the run that produced the row (TOP_UP since PD-066). */
   khoanPolicy: KhoanPayPolicySchema,
   runId: Id,
   runAt: IsoDate,
@@ -508,6 +591,10 @@ export const KpiSettlementSchema = z.object({
 });
 export type KpiSettlement = z.infer<typeof KpiSettlementSchema>;
 
+/**
+ * POST /production/kpi/settlements/run (superadmin). 409 KPI_TARGETS_MISSING ("Còn N người chưa có KPI kỳ này — set KPI
+ * trước khi chốt.", details: KpiTargetsMissingDetailsSchema) while someone who must have a KPI has none: nothing is written.
+ */
 export const RunKpiSettlementRequestSchema = z
   .object({ period: PeriodKeySchema, reason: SafeText().trim().min(3, "Nhập lý do (ít nhất 3 ký tự).").max(500) })
   .strict();
@@ -540,8 +627,8 @@ export const KpiSettlementRunCollectionSchema = z.object({ items: z.array(KpiSet
  * At most 24 periods. ADMIN sees everyone (optionally one team, USER tags `tagId` and USER custom fields
  * `cf.<key>=…`); other members only themselves (tag / custom-field filters → 403 CUSTOM_FIELDS_FORBIDDEN).
  * `userId` (PD-052, "Điểm cá nhân"): only that production member — someone else needs `view_others_scores` (PD-065,
- * 403 SCORES_PRIVATE); 404 SCORE_USER_NOT_FOUND when the user is not an active production member. Khoán money:
- * `view_others_money` (PD-065), the owner, or settings.moneyPublic.
+ * 403 SCORES_PRIVATE); 404 SCORE_USER_NOT_FOUND when the user is not an active production member. Khoán money: the
+ * owner or `view_others_money` (PD-065, PD-066).
  */
 export const KpiReportQuerySchema = z.object({
   from: PeriodKeySchema,
@@ -552,13 +639,19 @@ export const KpiReportQuerySchema = z.object({
   cf: CustomFieldFiltersSchema
 });
 
+/** PD-066 figures: shortfall, Khoán points converted ("bù từ Khoán"), Khoán money earned / paid (null while hidden). */
 const KpiFigures = {
   target: z.number().nullable(),
   pointsOfficial: z.number(),
+  /** Months: max(0, target − official); quarters / years / totals: the sum of the monthly shortfalls. */
+  shortfall: z.number(),
   khoanPointsConverted: z.number(),
   totalPoints: z.number(),
   percent: z.number().nullable(),
   difference: z.number().nullable(),
+  khoanMoneyEarned: z.number().int().nullable(),
+  khoanMoneyPaid: z.number().int().nullable(),
+  /** Deprecated alias of khoanMoneyPaid (app builds before PD-066). */
   khoanMoney: z.number().int().nullable()
 };
 
@@ -600,9 +693,9 @@ export type KpiReportRollup = z.infer<typeof KpiReportRollupSchema>;
  * Total rows of the KPI report (PLAN §6 "theo NV, team"): per team (scope TEAM; teamId null = people without a
  * team) and for everyone shown (scope ORG), per month of the range (periodType MONTH, key "YYYY-MM") and per
  * quarter / year (keys as the rollups). Sums over the people shown: target = Σ targets (null when nobody has
- * one), points, converted Khoán points, total; percent = total / target; difference = total − target;
- * khoanMoney = Σ (null unless the caller sees everyone's money: `view_others_money` or moneyPublic, PD-065). ADMIN only
- * ([] for others).
+ * one), points, shortfalls, converted Khoán points, total; percent = total / target; difference = total − target;
+ * Khoán money earned / paid = Σ (null unless the caller sees everyone's money: `view_others_money`, PD-065 / PD-066).
+ * ADMIN only ([] for others).
  */
 export const KpiReportTotalSchema = z.object({
   scope: z.enum(["TEAM", "ORG"]),

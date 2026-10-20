@@ -1,5 +1,5 @@
 import type { KhoanPayPolicy } from "../../contracts/production-catalog.js";
-import { kpiPeriodOfDay, kpiPeriodRange, type KpiCloseDays } from "../../contracts/production-scores.js";
+import { kpiPeriodOfDay, kpiPeriodRange, type KhoanTopUp, type KpiCloseDays } from "../../contracts/production-scores.js";
 import { addDays, businessDay } from "./time.js";
 
 export type { KhoanPayPolicy, KpiCloseDays };
@@ -15,8 +15,10 @@ export type { KhoanPayPolicy, KpiCloseDays };
  *   Admin can correct it with an adjustment. The workflow is never blocked by a missing price.
  * - One entry per line, at its first Done (PD-037): role WORKER for a work line, role QC for a Checking line (its
  *   process is the QC process). Both are priced the same way by the line's own (project, process) rule and follow the
- *   line's shift (pay mode, money) — a Checking line on a Khoán shift earns Khoán points, outside the official total,
- *   like the company's Excel. Checked no longer credits the task's QC (PD-010 superseded).
+ *   line's shift (pay mode, money) — a Checking line on a Khoán shift earns Khoán credits and money, outside the official
+ *   total, like the company's Excel. Checked no longer credits the task's QC (PD-010 superseded).
+ * - PD-066: a Khoán entry's credits are its points equivalent ("Bảng đơn giá"), internal — users see Khoán as money only;
+ *   at the close the credits top up a KPI shortfall (khoanTopUp).
  * - FB_WRONG lines earn nothing (PLAN §5 "FB sai → —"): the entry is recorded with its qty and 0 credits / 0 money.
  * - "Hình lỗi" (error images) never changes points or money (PD-035).
  * - Adjustments (qty edited after the entry) reuse the original entry's unit price — prices are
@@ -172,9 +174,9 @@ export type SummaryEntry = {
 export type ScoreTotals = {
   /** Credits of POINTS entries (worker and QC): what counts toward the KPI. */
   pointsOfficial: number;
-  /** Credits of Khoán (MONEY_IF_KPI) entries: settled on the close day (Phase 6). */
+  /** Credits of Khoán (MONEY_IF_KPI) entries: their points equivalent, internal (PD-066), used at the close (khoanTopUp). */
   pointsKhoan: number;
-  /** Provisional Khoán money (paid at settlement always, or only if the KPI is met — settings.khoanPayPolicy, PD-033). */
+  /** Khoán money earned so far; the close pays it in full or in part (khoanTopUp, PD-066). */
   moneyKhoanProvisional: number;
   /** Images of the person's own lines done in Khoán shifts (Checking lines included, PD-037). */
   qtyKhoan: number;
@@ -266,6 +268,18 @@ export const percentKpi = (points: number, target: number | null) => (target ===
 export const prorateTarget = (target: number, workingDays: number, leaveDays: number) =>
   workingDays <= 0 ? target : round2((target * Math.max(workingDays - leaveDays, 0)) / workingDays);
 
+/**
+ * The MONTH target a period applies (SPEC §6.3): the effective target, prorated by the approved leave on working days
+ * when settings.kpiProrateLeave is on and the leave is known (`leaveDays` null = unknown → not prorated); null without a
+ * target. The one rule of the forecast, the close (settleUser) and the board's KPI column (PD-069).
+ */
+export const periodTarget = (input: { targetBase: number | null; prorateLeave: boolean; workingDays: number; leaveDays: number | null }) =>
+  input.targetBase === null
+    ? null
+    : input.prorateLeave && input.leaveDays !== null
+      ? prorateTarget(input.targetBase, input.workingDays, input.leaveDays)
+      : input.targetBase;
+
 export type ForecastTone = "MET" | "ON_TRACK" | "AT_RISK" | "BEHIND" | "NO_TARGET";
 
 export type Forecast = {
@@ -309,12 +323,12 @@ export const forecast = (input: {
   const daysLeft = input.today > to ? 0 : input.today < from ? totalDays : daysInclusive(input.today, to);
   const workingDaysLeft = input.today > to ? 0 : countWorkingDays(input.today < from ? from : input.today, to);
   const elapsed = totalDays - daysLeft;
-  const target =
-    input.target === null
-      ? null
-      : input.prorateLeave && input.leaveDays !== null
-        ? prorateTarget(input.target, countWorkingDays(from, to), input.leaveDays)
-        : input.target;
+  const target = periodTarget({
+    targetBase: input.target,
+    prorateLeave: input.prorateLeave,
+    workingDays: countWorkingDays(from, to),
+    leaveDays: input.leaveDays
+  });
   const remaining = target === null ? null : Math.max(round2(target - input.pointsOfficial), 0);
   const avgPerDayNeeded = remaining === null || daysLeft === 0 ? null : ceil2(remaining / daysLeft);
 
@@ -407,7 +421,55 @@ export const rankByPoints = <T extends { pointsOfficial: number }>(items: readon
   });
 };
 
-// KPI settlement (SPEC §8, PLAN §6) -------------------------------------------------------------------------
+// KPI settlement (SPEC §8, PLAN §6, PD-066) -------------------------------------------------------------------
+
+/** The Khoán rule of every settlement run since PD-066 (recorded as KpiSettlementRun.khoanPolicy). */
+export const settlementKhoanPolicy: KhoanPayPolicy = "TOP_UP";
+
+/**
+ * round(money × part / whole) to the nearest đồng, exact — money × cents may exceed 2^53, so it is done in BigInt; a half
+ * rounds away from zero. 0 when nothing is left (part ≤ 0) or the whole is not positive.
+ */
+export const proportionalMoney = (money: number, partCents: number, wholeCents: number) => {
+  if (partCents <= 0 || wholeCents <= 0 || money === 0) {
+    return 0;
+  }
+  if (partCents >= wholeCents) {
+    return money + 0;
+  }
+  const numerator = BigInt(Math.abs(money)) * BigInt(partCents);
+  const denominator = BigInt(wholeCents);
+  const rounded = Number((numerator * 2n + denominator) / (denominator * 2n));
+  return (money < 0 ? -rounded : rounded) + 0;
+};
+
+/**
+ * PD-066 TOP_UP — "thiếu bao nhiêu bù bấy nhiêu" — for one person and period. shortfall = max(0, target − official
+ * points) (no target → 0); K = the Khoán credits (points equivalent per "Bảng đơn giá"; a negative sum counts as 0);
+ * M = the Khoán money earned.
+ * - shortfall 0 → nothing converted, M paid, KPI met;
+ * - 0 < shortfall ≤ K → the shortfall is converted, round(M × (K − shortfall) / K) paid, KPI met (official + converted = target);
+ * - shortfall > K → all of K converted, nothing paid, KPI not met.
+ * Exact to the cent (credits) and to the đồng (money). Used by the close (settleUser) and "Nếu chốt hôm nay" (forecast).
+ */
+export const khoanTopUp = (input: { target: number | null; pointsOfficial: number; khoanCredits: number; khoanMoney: number }): KhoanTopUp => {
+  const shortfallCents = input.target === null ? 0 : Math.max(0, toCents(input.target) - toCents(input.pointsOfficial));
+  const khoanCents = Math.max(0, toCents(input.khoanCredits));
+  const earned = input.khoanMoney + 0;
+  if (shortfallCents === 0) {
+    return { shortfall: 0, khoanPointsConverted: 0, khoanMoneyEarned: earned, khoanMoneyPaid: earned, met: true };
+  }
+  if (shortfallCents <= khoanCents) {
+    return {
+      shortfall: fromCents(shortfallCents),
+      khoanPointsConverted: fromCents(shortfallCents),
+      khoanMoneyEarned: earned,
+      khoanMoneyPaid: proportionalMoney(earned, khoanCents - shortfallCents, khoanCents),
+      met: true
+    };
+  }
+  return { shortfall: fromCents(shortfallCents), khoanPointsConverted: fromCents(khoanCents), khoanMoneyEarned: earned, khoanMoneyPaid: 0, met: false };
+};
 
 export type SettlementInput = {
   /** MONTH target effective for the period (null = no KPI). */
@@ -419,17 +481,18 @@ export type SettlementInput = {
   leaveDays: number;
   /** Credits of POINTS entries, worker + QC (PLAN §6.2). */
   pointsOfficial: number;
-  /** Credits and provisional money of Khoán (MONEY_IF_KPI) entries. */
+  /** Credits (points equivalent) and money earned of Khoán (MONEY_IF_KPI) entries. */
   khoanCredits: number;
   khoanMoneyRaw: number;
-  /** settings.khoanPayPolicy (PD-033). */
-  khoanPolicy: KhoanPayPolicy;
 };
 
 export type SettlementResult = SettlementInput & {
   /** Target applied (prorated by leave when the setting is on). */
   target: number | null;
+  /** max(0, target − official points); 0 without a target. */
+  shortfall: number;
   met: boolean;
+  /** Khoán money paid (khoanTopUp). */
   khoanMoney: number;
   khoanPointsConverted: number;
   /** KPI points of the period: official + converted Khoán credits. */
@@ -440,23 +503,21 @@ export type SettlementResult = SettlementInput & {
 };
 
 /**
- * PLAN §6 / SPEC §8.2 for one person: met = official points (Chính thức + OT + QC) ≥ target (no target → met);
- * Khoán credits never decide "met". The Khoán work follows the policy (PD-033):
- * - ALWAYS: the Khoán money is always paid and its credits never count toward the KPI (nothing converted).
- * - IF_KPI: met → the money is paid and its credits do not count; not met → no money, the credits convert into KPI points.
+ * PLAN §6 / SPEC §8.2 for one person, with the Khoán rule TOP_UP (PD-066, khoanTopUp): the target (prorated by approved
+ * leave when the setting is on) is compared with the official points (Chính thức + OT + QC); a shortfall is topped up
+ * from the Khoán credits, the Khoán money is paid for what is left. met = official + converted ≥ target (no target → met).
  */
 export const settleUser = (input: SettlementInput): SettlementResult => {
-  const target =
-    input.targetBase === null ? null : input.prorateLeave ? prorateTarget(input.targetBase, input.workingDays, input.leaveDays) : input.targetBase;
-  const met = target === null || toCents(input.pointsOfficial) >= toCents(target);
-  const paid = met || input.khoanPolicy === "ALWAYS";
-  const khoanPointsConverted = paid ? 0 : input.khoanCredits;
+  const target = periodTarget(input);
+  const topUp = khoanTopUp({ target, pointsOfficial: input.pointsOfficial, khoanCredits: input.khoanCredits, khoanMoney: input.khoanMoneyRaw });
+  const khoanPointsConverted = topUp.khoanPointsConverted;
   const totalPoints = fromCents(toCents(input.pointsOfficial) + toCents(khoanPointsConverted));
   return {
     ...input,
     target,
-    met,
-    khoanMoney: paid ? input.khoanMoneyRaw : 0,
+    shortfall: topUp.shortfall,
+    met: topUp.met,
+    khoanMoney: topUp.khoanMoneyPaid,
     khoanPointsConverted,
     totalPoints,
     percent: percentKpi(totalPoints, target),
@@ -473,14 +534,8 @@ export type SettlementUserInput = {
   leaveDays: number;
 };
 
-/** Settles every given person for a period. Deterministic: the same inputs always give the same rows. */
-export const settlePeriod = (input: {
-  period: string;
-  closeDay: KpiCloseDays;
-  prorateLeave: boolean;
-  khoanPolicy: KhoanPayPolicy;
-  users: readonly SettlementUserInput[];
-}) => {
+/** Settles every given person for a period (TOP_UP, PD-066). Deterministic: the same inputs always give the same rows. */
+export const settlePeriod = (input: { period: string; closeDay: KpiCloseDays; prorateLeave: boolean; users: readonly SettlementUserInput[] }) => {
   const { from, to } = periodRange(input.period, input.closeDay);
   const workingDays = countWorkingDays(from, to);
   return {
@@ -497,8 +552,7 @@ export const settlePeriod = (input: {
         leaveDays: user.leaveDays,
         pointsOfficial: user.pointsOfficial,
         khoanCredits: user.khoanCredits,
-        khoanMoneyRaw: user.khoanMoneyRaw,
-        khoanPolicy: input.khoanPolicy
+        khoanMoneyRaw: user.khoanMoneyRaw
       })
     }))
   };
@@ -532,9 +586,11 @@ export type KpiReportMonth = {
   period: string;
   target: number | null;
   pointsOfficial: number;
+  shortfall: number;
   khoanPointsConverted: number;
   totalPoints: number;
-  khoanMoney: number;
+  khoanMoneyEarned: number;
+  khoanMoneyPaid: number;
 };
 
 /** Rollup key of a monthly period: "2026-Q4" or "2026". */
@@ -582,35 +638,45 @@ export const rollupKpiPeriod = (input: {
 export type KpiFiguresLike = {
   target: number | null;
   pointsOfficial: number;
+  shortfall: number;
   khoanPointsConverted: number;
   totalPoints: number;
-  khoanMoney: number | null;
+  khoanMoneyEarned: number | null;
+  khoanMoneyPaid: number | null;
   /** Month rows: met the KPI; rollups: computed from percent (no target → met). */
   met?: boolean;
   percent: number | null;
 };
 
+/** Sum of the visible amounts (null when none is visible). */
+const sumMoney = (values: readonly (number | null)[]) => {
+  const visible = values.filter((value): value is number => value !== null);
+  return visible.length > 0 ? visible.reduce((total, value) => total + value, 0) + 0 : null;
+};
+
 /**
  * Team / organization total of KPI figures (PLAN §6 "theo NV, team"): sums of targets (null when nobody has one),
- * points, converted Khoán points, totals and money (null when no money is visible); percent = total / target.
+ * points, shortfalls, converted Khoán points, totals and money earned / paid (null when no money is visible); percent =
+ * total / target.
  */
 export const sumKpiFigures = (items: readonly KpiFiguresLike[]) => {
   const cents = (pick: (item: KpiFiguresLike) => number) => items.reduce((total, item) => total + toCents(pick(item)), 0);
   const targets = items.filter((item) => item.target !== null);
   const target = targets.length > 0 ? fromCents(targets.reduce((total, item) => total + toCents(item.target!), 0)) : null;
   const totalPoints = fromCents(cents((item) => item.totalPoints));
-  const money = items.filter((item) => item.khoanMoney !== null);
   return {
     memberCount: items.length,
     withTargetCount: targets.length,
     metCount: items.filter((item) => item.met ?? (item.target === null || (item.percent ?? 0) >= 100)).length,
     target,
     pointsOfficial: fromCents(cents((item) => item.pointsOfficial)),
+    shortfall: fromCents(cents((item) => item.shortfall)),
     khoanPointsConverted: fromCents(cents((item) => item.khoanPointsConverted)),
     totalPoints,
     percent: percentKpi(totalPoints, target),
     difference: target === null ? null : fromCents(toCents(totalPoints) - toCents(target)),
-    khoanMoney: money.length > 0 ? money.reduce((total, item) => total + (item.khoanMoney ?? 0), 0) + 0 : null
+    khoanMoneyEarned: sumMoney(items.map((item) => item.khoanMoneyEarned)),
+    khoanMoneyPaid: sumMoney(items.map((item) => item.khoanMoneyPaid))
   };
 };
 
@@ -622,9 +688,11 @@ export const rollupKpi = (months: readonly KpiReportMonth[], explicitTarget: num
   const totalPoints = sum((month) => month.totalPoints);
   return {
     pointsOfficial: sum((month) => month.pointsOfficial),
+    shortfall: sum((month) => month.shortfall),
     khoanPointsConverted: sum((month) => month.khoanPointsConverted),
     totalPoints,
-    khoanMoney: months.reduce((total, month) => total + month.khoanMoney, 0) + 0,
+    khoanMoneyEarned: months.reduce((total, month) => total + month.khoanMoneyEarned, 0) + 0,
+    khoanMoneyPaid: months.reduce((total, month) => total + month.khoanMoneyPaid, 0) + 0,
     target,
     percent: percentKpi(totalPoints, target),
     difference: target === null ? null : fromCents(toCents(totalPoints) - toCents(target))

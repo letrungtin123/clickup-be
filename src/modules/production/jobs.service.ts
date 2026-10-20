@@ -6,7 +6,9 @@ import type {
   CreateJobRequest,
   DeleteJobResult,
   JobDetail,
+  JobFacets,
   JobPage,
+  JobPoints,
   JobPersonTotals,
   JobOptions,
   JobOptionsQuery,
@@ -19,11 +21,12 @@ import type { JobScopes } from "../../contracts/production-catalog.js";
 import { noLeaderFilter } from "../../contracts/production-jobs.js";
 import { getSql } from "../../db/client.js";
 import { AppError } from "../../lib/app-error.js";
-import { escapeLike, toIso, type QuerySql } from "../../lib/db-types.js";
+import { decodeCursor, encodeCursor, escapeLike, invalidCursor, toIso, type QuerySql } from "../../lib/db-types.js";
 import type { AccessContext } from "../access/access-context.js";
 import { visibleUserIdSql } from "../access/test-accounts.js";
 import { actsAsJobLeader, assertProductionMember, assertProductionRole, isProductionAdmin } from "./access.js";
-import { cursorInstantSql, decodeTimeCursor, encodeTimeCursor } from "./cursor.js";
+import { loadSettings } from "./catalog.service.js";
+import { cursorInstantSql, decodeTimeCursor, encodeTimeCursor, isUuid, isValidCursorInstant } from "./cursor.js";
 import { anyTagSql, customFieldFilterSql, resolveCustomFieldFilters, resolveCustomValues, setEntityTags } from "./custom-fields.js";
 import { syncJobChat } from "./job-chat.service.js";
 import {
@@ -59,6 +62,7 @@ import {
 } from "./jobs.repo.js";
 import { enqueueProductionEvents, feedbackEvent, jobLeaderAssignedEvent, jobStatusChangedEvent } from "./notifications.js";
 import { publishProductionChange } from "./realtime.js";
+import { loadJobPoints, pointsViewer, sumPoints } from "./task-points.js";
 import { insertTasks, loadJobForTasks, moveTasks, releaseParkedTasks, settleJob, softDeleteTasks, syncJobTotalImages } from "./tasks.service.js";
 import {
   allowedTransitions,
@@ -232,7 +236,7 @@ const jobListFilterSql = (
   scopes: JobScopes,
   query: JobQuery,
   plans: Awaited<ReturnType<typeof resolveCustomFieldFilters>>,
-  { person }: { person: boolean }
+  { person, project = true }: { person: boolean; /** false: ignore `projectId` (the facets' project counts, PD-067). */ project?: boolean }
 ) => {
   const like = query.q ? `%${escapeLike(query.q.toLowerCase())}%` : null;
   return sql`
@@ -240,7 +244,7 @@ const jobListFilterSql = (
     AND ${visibleUserIdSql(sql, context, sql`j.created_by`)}
     ${scopes.view === "all" ? sql`` : sql`AND ${jobViewSql(sql, context, scopes)}`}
     ${query.includeArchived ? sql`` : sql`AND j.archived_at IS NULL`}
-    ${query.projectId ? sql`AND j.project_id = ${query.projectId}` : sql``}
+    ${project && query.projectId ? sql`AND j.project_id = ${query.projectId}` : sql``}
     ${query.jobStatusId?.length ? sql`AND j.job_status_id = ANY(${query.jobStatusId}::uuid[])` : sql``}
     ${query.leaderId === noLeaderFilter ? sql`AND j.leader_id IS NULL` : query.leaderId ? sql`AND j.leader_id = ${query.leaderId}` : sql``}
     ${
@@ -304,6 +308,10 @@ const personTotals = async (sql: QuerySql, organizationId: string, personId: str
  * Per-person view (`personId`, PD-034): jobs where the person is an assignee; each row carries the person's
  * share (processes, assigned / done / checked of their own tasks) and the first page their totals over every
  * matching job.
+ *
+ * `sort=received` (PD-067, the List view grouped by month of "Ngày nhận"): newest Ngày nhận first, then newest created,
+ * keyset on (received_at, created_at, id) at full precision — a three-part cursor the "created" order refuses (and
+ * vice versa).
  */
 export const listJobs = async (context: AccessContext, query: JobQuery): Promise<JobPage> => {
   assertProductionMember(context);
@@ -313,34 +321,121 @@ export const listJobs = async (context: AccessContext, query: JobQuery): Promise
   if (scopes.view === "none") {
     throw forbidden("Bạn không có quyền xem danh sách job.");
   }
-  const cursor = decodeTimeCursor(query.cursor);
+  const byReceived = query.sort === "received";
+  const createdCursor = byReceived ? null : decodeTimeCursor(query.cursor);
+  const receivedCursor = byReceived ? decodeReceivedCursor(query.cursor) : null;
+  const firstPage = !createdCursor && !receivedCursor;
   const [plans, workflow] = await Promise.all([
     resolveCustomFieldFilters(sql, organizationId, "JOB", query.cf),
     loadWorkflowModel(sql, organizationId)
   ]);
+  // A fresh fragment per use (the page and the outer select).
+  const order = () => (byReceived ? sql`j.received_at DESC, j.created_at DESC, j.id DESC` : sql`j.created_at DESC, j.id DESC`);
+  const after = receivedCursor
+    ? sql`AND (j.received_at, j.created_at, j.id) < (${cursorInstantSql(sql, receivedCursor.received)}, ${cursorInstantSql(sql, receivedCursor.created)}, ${receivedCursor.id}::uuid)`
+    : createdCursor
+      ? sql`AND (j.created_at, j.id) < (${cursorInstantSql(sql, createdCursor.at)}, ${createdCursor.id}::uuid)`
+      : sql``;
   const [rows, totals] = await Promise.all([
     sql<JobRow[]>`
       WITH page AS MATERIALIZED (
         SELECT j.id FROM production.jobs j
         WHERE ${jobListFilterSql(sql, context, scopes, query, plans, { person: true })}
-          ${cursor ? sql`AND (j.created_at, j.id) < (${cursorInstantSql(sql, cursor.at)}, ${cursor.id}::uuid)` : sql``}
-        ORDER BY j.created_at DESC, j.id DESC
+          ${after}
+        ORDER BY ${order()}
         LIMIT ${query.limit + 1}
       )
       ${jobSelectSql(sql, lineFinishStatusIds(workflow), query.personId)}
       WHERE j.organization_id = ${organizationId} AND j.id IN (SELECT id FROM page)
-      ORDER BY j.created_at DESC, j.id DESC
+      ORDER BY ${order()}
     `,
-    query.personId && !cursor
+    query.personId && firstPage
       ? personTotals(sql, organizationId, query.personId, jobListFilterSql(sql, context, scopes, query, plans, { person: false }))
       : Promise.resolve(null)
   ]);
   const page = rows.slice(0, query.limit);
   const last = page[page.length - 1];
+  const nextCursor =
+    rows.length > query.limit && last
+      ? byReceived
+        ? encodeCursor([last.received_cursor, last.created_cursor, last.id])
+        : encodeTimeCursor(last.created_cursor, last.id)
+      : null;
+  // PD-070 "Điểm" of each job of the page (the person's rows in the per-person view), batched for the page.
+  const points =
+    page.length === 0
+      ? new Map<string, JobPoints>()
+      : await loadJobPoints(sql, organizationId, await pointsViewer(context, sql), page.map((row) => row.id), query.personId);
   return {
-    items: page.map(toJobSummary),
-    pageInfo: { hasMore: rows.length > query.limit, nextCursor: rows.length > query.limit && last ? encodeTimeCursor(last.created_cursor, last.id) : null },
+    items: page.map((row) => ({ ...toJobSummary(row), pointsOfficial: points.get(row.id) ?? null })),
+    pageInfo: { hasMore: rows.length > query.limit, nextCursor },
     personTotals: totals
+  };
+};
+
+/** The (received_at, created_at, id) cursor of `sort=received`; null without one, 400 INVALID_CURSOR when malformed. */
+const decodeReceivedCursor = (cursor: string | undefined) => {
+  if (!cursor) {
+    return null;
+  }
+  const [received, created, id] = decodeCursor(cursor, 3) ?? [];
+  if (
+    typeof received !== "string" ||
+    typeof created !== "string" ||
+    typeof id !== "string" ||
+    !isValidCursorInstant(received) ||
+    !isValidCursorInstant(created) ||
+    !isUuid(id)
+  ) {
+    throw invalidCursor();
+  }
+  return { received, created, id };
+};
+
+/**
+ * GET /production/jobs/facets (PD-067): the counts of the job List view — jobs per month of "Ngày nhận" (organization
+ * timezone, every filter applied) and per project (every filter but the project one; the filtered project is kept with
+ * 0). Same filters and visibility as listJobs (view scope, PD-063 test accounts, per-person view); one grouped query
+ * each over the organization's job rows.
+ */
+export const getJobFacets = async (context: AccessContext, query: JobQuery): Promise<JobFacets> => {
+  assertProductionMember(context);
+  const sql = getSql();
+  const organizationId = context.organization.id;
+  const scopes = await loadJobScopes(sql, context);
+  if (scopes.view === "none") {
+    throw forbidden("Bạn không có quyền xem danh sách job.");
+  }
+  const [plans, settings] = await Promise.all([
+    resolveCustomFieldFilters(sql, organizationId, "JOB", query.cf),
+    loadSettings(sql, organizationId)
+  ]);
+  const [months, projects] = await Promise.all([
+    sql<{ month: string; count: number }[]>`
+      SELECT to_char(j.received_at AT TIME ZONE ${settings.timezone}::text, 'YYYY-MM') AS month, count(*)::int AS count
+      FROM production.jobs j
+      WHERE ${jobListFilterSql(sql, context, scopes, query, plans, { person: true })}
+      GROUP BY 1
+      ORDER BY 1 DESC
+    `,
+    sql<{ project_id: string; code: string; name: string; active: boolean; count: number }[]>`
+      WITH counts AS (
+        SELECT j.project_id, count(*)::int AS count
+        FROM production.jobs j
+        WHERE ${jobListFilterSql(sql, context, scopes, query, plans, { person: true, project: false })}
+        GROUP BY j.project_id
+      )
+      SELECT p.id AS project_id, p.code, p.name, p.active, coalesce(c.count, 0)::int AS count
+      FROM production.projects p
+      LEFT JOIN counts c ON c.project_id = p.id
+      WHERE p.organization_id = ${organizationId}
+        AND (c.project_id IS NOT NULL ${query.projectId ? sql`OR p.id = ${query.projectId}` : sql``})
+      ORDER BY lower(p.code), p.code, p.id
+    `
+  ]);
+  return {
+    months: months.map((row) => ({ month: row.month, count: row.count })),
+    projects: projects.map((row) => ({ projectId: row.project_id, code: row.code, name: row.name, active: row.active, count: row.count }))
   };
 };
 
@@ -379,9 +474,12 @@ export const getJobDetail = async (context: AccessContext, jobId: string, sql: Q
   const archived = row.archived_at !== null;
   const assignees = taskRows.map((task) => task.assignee_id);
   const canEdit = !archived && wholeJobAllowed(scopes.update, assignees, me);
+  const tasks = await toProductionTasks(sql, context, workflow, taskRows, scopes);
   return {
     ...toJobSummary(row),
-    tasks: await toProductionTasks(sql, context, workflow, taskRows, scopes),
+    // PD-070: the job's "Điểm" = its rows' points (lines and subtasks, each row once).
+    pointsOfficial: sumPoints(tasks.map((task) => task.points)),
+    tasks,
     feedbacks: feedbackRows.map(toFeedback),
     capabilities: {
       canEdit,

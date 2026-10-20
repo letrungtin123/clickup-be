@@ -73,6 +73,33 @@ export const TaskQtyRequestSchema = z.object({
 export type TaskQtyRequest = z.infer<typeof TaskQtyRequestSchema>;
 
 /**
+ * PD-070 "Điểm" of one task row (a line or a subtask — a subtask scores its own process × quantity, PD-048): the
+ * assignee's points on an official shift (pay mode POINTS, OT included). Never money.
+ * - Recorded (the row has its entry in the score ledger: the line's role — WORKER, QC for a Checking line, PD-037 —
+ *   original + adjustments, POINTS entries): that value, `expected` false.
+ * - Not recorded yet: the expected points = quantity (qtyDone, else qtyAssigned) × the price of today's rule of
+ *   "Bảng đơn giá" for (project, process), resolved and computed exactly as at Done (scoring.ts), `expected` true. No
+ *   quantity → credits null, `missing` "QTY"; no rule → credits null, `missing` "RULE".
+ */
+export const TaskPointsSchema = z.object({
+  /** null: nothing computable yet (see `missing`). */
+  credits: z.number().nullable(),
+  /** true: not recorded yet — an estimate from "Bảng đơn giá" (the ledger records the line at its first Done). */
+  expected: z.boolean(),
+  /** Why `credits` is null: "QTY" no quantity yet, "RULE" no price for the process in the project today; else null. */
+  missing: z.enum(["QTY", "RULE"]).nullable()
+});
+export type TaskPoints = z.infer<typeof TaskPointsSchema>;
+
+/**
+ * PD-070 "Điểm" of a job in the List view: the sum of its rows' points (TaskPointsSchema) over official-shift rows the
+ * caller may see — recorded plus expected; `expected` true when any of those rows is not recorded yet (an estimate,
+ * shown muted). Khoán rows never count. With `personId` (per-person view) only that person's rows.
+ */
+export const JobPointsSchema = z.object({ credits: z.number(), expected: z.boolean() });
+export type JobPoints = z.infer<typeof JobPointsSchema>;
+
+/**
  * PD-044: a subtask as its parent line lists it. A subtask is part of the line's images done in another process
  * ("Công đoạn"), split off by the worker with a reason: same person, QC, shift and dates as the line; its quantity is
  * taken from the line (the total the Leader gave stays the same) and its status always follows the line's.
@@ -88,7 +115,12 @@ export const ProductionSubtaskSchema = z.object({
   qtyDone: z.number().int().nullable(),
   reason: z.string().nullable(),
   createdBy: UserRefSchema.nullable(),
-  createdAt: IsoDate
+  createdAt: IsoDate,
+  /**
+   * PD-070: its own points (as ProductionTask `points`). The API always sends it; optional only so subtask objects built
+   * by the apps (tests, optimistic copies) need not carry it — the job List reads the subtask's own task row instead.
+   */
+  points: TaskPointsSchema.nullable().optional()
 });
 export type ProductionSubtask = z.infer<typeof ProductionSubtaskSchema>;
 
@@ -158,6 +190,11 @@ export const ProductionTaskSchema = z.object({
    * or someone else's task).
    */
   myCredits: z.array(z.object({ role: z.enum(["WORKER", "QC"]), credits: z.number(), qty: z.number().int(), payMode: PayModeSchema })),
+  /**
+   * PD-070 "Điểm" of this row in the job List view (TaskPointsSchema). null: a Khoán shift (MONEY_IF_KPI — never money
+   * nor points here), or someone else's row while the caller lacks `view_others_scores` (PD-065; superadmin always).
+   */
+  points: TaskPointsSchema.nullable(),
   /** The latest QC fail of the task ("xem note QC"): its note, when and by whom; null if QC never failed it. */
   lastQcFail: z.object({ note: z.string().nullable(), at: IsoDate, by: UserRefSchema.nullable() }).nullable(),
   createdAt: IsoDate,
@@ -342,18 +379,52 @@ export const UpdateProductionTaskRequestSchema = z
   })
   .strict();
 
-export const MyProductionTasksQuerySchema = z.object({
-  /** assignee: tasks I do; qc: tasks I check; all: both. */
-  role: z.enum(["assignee", "qc", "all"]).default("all"),
-  /** Include tasks already past the QC/complete stage (terminal or delivered). */
-  includeFinished: BoolQuery,
-  /** TASK tags: any of them (`tagId=a&tagId=b`). */
-  tagId: IdListQuerySchema,
-  /** TASK custom-field filters, query `cf.<key>=…` (CustomFieldFilterSchema in production-catalog). */
-  cf: CustomFieldFiltersSchema,
-  cursor: SafeText().max(500).optional(),
-  limit: z.coerce.number().int().min(1).max(200).default(100)
-});
+/** A calendar day "YYYY-MM-DD" in a query (impossible days such as 2026-02-31 are refused). */
+const isCalendarDay = (value: string) => {
+  const date = new Date(`${value}T00:00:00Z`);
+  return !Number.isNaN(date.getTime()) && date.toISOString().slice(0, 10) === value;
+};
+const DayQuery = z
+  .string()
+  .regex(/^\d{4}-\d{2}-\d{2}$/, "Ngày phải có dạng YYYY-MM-DD.")
+  .refine(isCalendarDay, "Ngày không hợp lệ.");
+/** PD-068 "Việc của tôi" date filter basis: the line's "Ngày nhận" (assigned / received day) or its "Ngày giao". */
+export const myTaskDateBases = ["received", "deadline"] as const;
+export type MyTaskDateBasis = (typeof myTaskDateBases)[number];
+
+export const MyProductionTasksQuerySchema = z
+  .object({
+    /** assignee: tasks I do; qc: tasks I check; all: both. */
+    role: z.enum(["assignee", "qc", "all"]).default("all"),
+    /**
+     * Include finished lines ("Đã check" or later; a Checking line once Done). PD-068: then the open lines come first
+     * (soonest Ngày giao first), the finished ones after them, latest Ngày giao first.
+     */
+    includeFinished: BoolQuery,
+    /** TASK tags: any of them (`tagId=a&tagId=b`). */
+    tagId: IdListQuerySchema,
+    /** TASK custom-field filters, query `cf.<key>=…` (CustomFieldFilterSchema in production-catalog). */
+    cf: CustomFieldFiltersSchema,
+    /**
+     * PD-068 search, accents and case ignored: the line's code ("1286", "#1286"; a subtask's "1286a" finds its line), the
+     * Gói công việc / job name, the project code or name, the process name, the note. Blank = no search.
+     */
+    q: z.preprocess(
+      (value) => (typeof value === "string" && value.trim() === "" ? undefined : value),
+      SafeText().trim().max(120).optional()
+    ),
+    /** PD-068 date filter basis of `from` / `to`: "received" (Ngày nhận, default) or "deadline" (Ngày giao). */
+    dateBy: z.enum(myTaskDateBases).default("received"),
+    /** PD-068 first / last calendar day (organization timezone, inclusive); `from` after `to` → 400. */
+    from: DayQuery.optional(),
+    to: DayQuery.optional(),
+    cursor: SafeText().max(500).optional(),
+    limit: z.coerce.number().int().min(1).max(200).default(100)
+  })
+  .refine((query) => !query.from || !query.to || query.from <= query.to, {
+    message: "“Từ ngày” phải trước hoặc bằng “Đến ngày”.",
+    path: ["to"]
+  });
 export type MyProductionTasksQuery = z.infer<typeof MyProductionTasksQuerySchema>;
 
 /** GET /production/tasks/qc-queue — optional TASK tag / custom-field filters (same as "Task của tôi"). */
@@ -467,6 +538,11 @@ export const JobSummarySchema = z.object({
   people: JobPeopleSchema,
   /** The `personId` person's part of this job (job list filtered by a person); null everywhere else. */
   personShare: JobPersonShareSchema.nullable(),
+  /**
+   * PD-070 "Điểm" of the job (JobPointsSchema): its official-shift rows' points the caller may see; with `personId` that
+   * person's rows only. null: no such row with points (no task, Khoán only, nothing visible, no quantity / price yet).
+   */
+  pointsOfficial: JobPointsSchema.nullable(),
   customValues: CustomValuesSchema,
   tagIds: z.array(Id),
   createdBy: UserRefSchema.nullable(),
@@ -531,6 +607,10 @@ export type JobDetail = z.infer<typeof JobDetailSchema>;
 /** `leaderId=none`: jobs without a leader ("Chưa có leader", PD-035). */
 export const noLeaderFilter = "none";
 
+/** Orders of GET /production/jobs (`sort`). */
+export const jobListSorts = ["created", "received"] as const;
+export type JobListSort = (typeof jobListSorts)[number];
+
 export const JobQuerySchema = z.object({
   projectId: Id.optional(),
   /** Manual job statuses (PD-038): any of them (`jobStatusId=a&jobStatusId=b`). */
@@ -551,10 +631,32 @@ export const JobQuerySchema = z.object({
   /** Only jobs with at least one late task. */
   late: BoolQuery,
   includeArchived: BoolQuery,
+  /**
+   * Row order. "created" (default): newest created first. "received" (PD-067, the List view grouped by month of "Ngày
+   * nhận"): newest Ngày nhận first, then newest created — so a month group fills page after page. Cursors of one order
+   * are refused by the other (400 INVALID_CURSOR).
+   */
+  sort: z.enum(jobListSorts).default("created"),
   cursor: SafeText().max(500).optional(),
   limit: z.coerce.number().int().min(1).max(100).default(50)
 });
 export type JobQuery = z.infer<typeof JobQuerySchema>;
+
+/**
+ * GET /production/jobs/facets (PD-067) — counts for the job List view, with the GET /production/jobs query and the same
+ * visibility rules (view scope, PD-063 test accounts; `sort` / `cursor` / `limit` ignored):
+ * - `months`: jobs per month of "Ngày nhận" in the organization's timezone ("YYYY-MM", newest first), every filter applied;
+ * - `projects`: jobs per project with every filter BUT the project one (the sidebar lists each project that has matching
+ *   jobs, by code), plus the filtered project itself when it has none (count 0) so the selection stays visible.
+ * Per-person view (`personId`): the person's jobs, like the list.
+ */
+export const JobFacetsSchema = z.object({
+  months: z.array(z.object({ month: z.string().regex(/^\d{4}-\d{2}$/), count: z.number().int() })),
+  projects: z.array(
+    z.object({ projectId: Id, code: z.string(), name: z.string(), active: z.boolean(), count: z.number().int() })
+  )
+});
+export type JobFacets = z.infer<typeof JobFacetsSchema>;
 
 /** "Gói công việc": typed by the user, usually a folder path or batch name. */
 export const jobCodeMaxLength = 300;

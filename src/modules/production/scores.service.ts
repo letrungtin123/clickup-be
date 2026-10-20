@@ -19,16 +19,20 @@ import { featureForbidden } from "./features.js";
 import { matchesCustomFieldFilters, resolveCustomFieldFilters } from "./custom-fields.js";
 import { cursorInstantSql, cursorTextSql, decodeTimeCursor, encodeTimeCursor } from "./cursor.js";
 import { assertTaskVisible, loadTask } from "./jobs.repo.js";
-import { approvedLeaveDays } from "./leave.service.js";
+import { loadKpiRequiredUserIds, loadKpiRequirement, loadTargetVersionsByUser } from "./kpi-targets.service.js";
+import { approvedLeaveDays, approvedLeaveDaysByUser } from "./leave.service.js";
 import type { CustomFieldFilter, CustomValues, ProductionSettings } from "../../contracts/production-catalog.js";
 import { closeDayOfPeriod } from "../../contracts/production-scores.js";
 import {
+  countWorkingDays,
   daysInclusive,
   effectiveTarget,
   forecast,
+  khoanTopUp,
   kpiProgress,
   periodOfDay,
   periodRange,
+  periodTarget,
   rankByPoints,
   summarize,
   totals,
@@ -219,14 +223,14 @@ export const loadScoreSubject = async (sql: QuerySql, organizationId: string, us
 };
 
 /**
- * Everyone's Khoán money for the caller (board, task scores, "Điểm cá nhân", PD-065): settings.moneyPublic or the
- * `view_others_money` feature (by default Admin and Director; the superadmin always).
+ * Everyone's Khoán money for the caller (board, task scores, "Điểm cá nhân", PD-065): the `view_others_money` feature (by
+ * default Admin and Director; the superadmin always). PD-066: nothing else opens it (`moneyPublic` is retired).
  */
-export const seesOthersMoney = (context: AccessContext, settings: Pick<ProductionSettings, "moneyPublic" | "featurePermissions">) =>
-  settings.moneyPublic || featuresOf(context, settings.featurePermissions).has("view_others_money");
+export const seesOthersMoney = (context: AccessContext, settings: Pick<ProductionSettings, "featurePermissions">) =>
+  featuresOf(context, settings.featurePermissions).has("view_others_money");
 
 /** Khoán money of `userId` for the caller: their own, or `seesOthersMoney`. */
-export const seesMoneyOf = (context: AccessContext, settings: Pick<ProductionSettings, "moneyPublic" | "featurePermissions">, userId: string) =>
+export const seesMoneyOf = (context: AccessContext, settings: Pick<ProductionSettings, "featurePermissions">, userId: string) =>
   userId === context.user.id || seesOthersMoney(context, settings);
 
 /**
@@ -350,7 +354,10 @@ export const loadTargetVersions = async (sql: QuerySql, organizationId: string, 
     `
   ).map((row) => ({ periodType: row.period_type, targetPoints: Number(row.target_points), effectiveFrom: row.effective_from }));
 
-/** KPI forecast of one person (`userId`) for a period plus % KPI by month / quarter / year (money always filled in). */
+/**
+ * KPI forecast of one person (`userId`) for a period plus % KPI by month / quarter / year (money always filled in), whether
+ * they must have a KPI and what closing the period today would give (TOP_UP on the figures so far, PD-066).
+ */
 const computeForecast = async (
   sql: QuerySql,
   organizationId: string,
@@ -366,14 +373,15 @@ const computeForecast = async (
   const yearFrom = periodRange(`${year}-01`, closeDay).from;
   const yearTo = periodRange(`${year}-12`, closeDay).to;
 
-  const [days, targets] = await Promise.all([
+  const [days, targets, requirement] = await Promise.all([
     sql<{ business_day: string; pay_mode: PayMode; credits: string; money: string }[]>`
       SELECT to_char(business_day, 'YYYY-MM-DD') AS business_day, pay_mode, sum(credits)::text AS credits, sum(money)::text AS money
       FROM production.score_entries
       WHERE organization_id = ${organizationId} AND user_id = ${userId} AND business_day BETWEEN ${yearFrom}::date AND ${yearTo}::date
       GROUP BY business_day, pay_mode
     `,
-    loadTargetVersions(sql, organizationId, userId)
+    loadTargetVersions(sql, organizationId, userId),
+    loadKpiRequirement(sql, organizationId, userId, period)
   ]);
 
   const monthlyCents: Record<string, number> = {};
@@ -406,14 +414,17 @@ const computeForecast = async (
     leaveDays
   });
   const progress = (periodType: KpiPeriodType) => kpiProgress({ periodType, period, monthlyPoints, targets });
+  const pointsKhoan = khoanCents / 100 + 0;
 
   return {
     ...result,
     closeDay: closeDayOfPeriod(closeDay, period),
     today,
-    pointsKhoan: khoanCents / 100 + 0,
+    pointsKhoan,
     moneyKhoanProvisional: khoanMoney,
-    kpi: { month: progress("MONTH"), quarter: progress("QUARTER"), year: progress("YEAR") }
+    kpi: { month: progress("MONTH"), quarter: progress("QUARTER"), year: progress("YEAR") },
+    kpiRequired: requirement.required,
+    ifSettledToday: khoanTopUp({ target: result.target, pointsOfficial, khoanCredits: pointsKhoan, khoanMoney })
   };
 };
 
@@ -426,8 +437,8 @@ export const getScoreForecast = async (context: AccessContext, query: { period?:
 };
 
 /**
- * GET /production/scores/user/:userId/forecast — the KPI forecast of any production member (PD-052), money per
- * `seesMoneyOf`; someone else's needs `view_others_scores` (PD-065, 403 SCORES_PRIVATE).
+ * GET /production/scores/user/:userId/forecast — the KPI forecast of any production member (PD-052), money and "Nếu chốt
+ * hôm nay" (PD-066) per `seesMoneyOf`; someone else's needs `view_others_scores` (PD-065, 403 SCORES_PRIVATE).
  */
 export const getUserScoreForecast = async (
   context: AccessContext,
@@ -441,7 +452,8 @@ export const getUserScoreForecast = async (
   assertSeesScoresOf(context, settings, userId);
   const subject = await loadScoreSubject(sql, organizationId, userId);
   const result = await computeForecast(sql, organizationId, subject.id, settings, query);
-  return hideTotalsMoney(result, seesMoneyOf(context, settings, subject.id));
+  const moneyVisible = seesMoneyOf(context, settings, subject.id);
+  return { ...hideTotalsMoney(result, moneyVisible), ifSettledToday: moneyVisible ? result.ifSettledToday : null };
 };
 
 // Board -------------------------------------------------------------------------------------------------
@@ -462,11 +474,13 @@ type BoardRow = {
 };
 
 /**
- * GET /production/scores/board — every production worker (STAFF/LEADER/QC) and anyone who scored in
- * the period, ranked by official points. PD-065: the roles of `view_others_scores` (by default every role; the
- * superadmin always), others 403 SCORES_PRIVATE (settings.scoresPublic stays retired, PD-052); money only for the row's
- * owner, `view_others_money`, or when settings.moneyPublic. Temporary QA test accounts are left out for a viewer who is
- * not one (PD-063).
+ * GET /production/scores/board — "Bảng điểm → Toàn đội" (PD-069): every production worker (STAFF/LEADER/QC), everyone who
+ * must have a KPI (PD-066) and anyone who scored in the period, by official points, each with their KPI of the period
+ * (effective MONTH target prorated by approved leave like the forecast / close — scoring.ts periodTarget) and whether
+ * they must have one. PD-065: the roles of `view_others_scores` (by default every role; the superadmin always), others
+ * 403 SCORES_PRIVATE (settings.scoresPublic stays retired, PD-052); money only for the row's owner or
+ * `view_others_money` (PD-066). Temporary QA test accounts are left out for a viewer who is not one (PD-063). A fixed
+ * number of queries whatever the number of people (required members, the board, targets, leave).
  */
 export const getScoreBoard = async (
   context: AccessContext,
@@ -489,6 +503,8 @@ export const getScoreBoard = async (
   const period = query.period ?? periodOfDay(businessDay(new Date()), closeDaysOf(settings));
   const { from, to } = periodRange(period, closeDaysOf(settings));
   const teamId = query.teamId ?? null;
+  // PD-066: who must have a KPI this period — on the board even before they score (PD-069 "Chưa có KPI").
+  const required = await loadKpiRequiredUserIds(sql, organizationId, period);
 
   const rows = await sql<BoardRow[]>`
     WITH sums AS (
@@ -507,6 +523,8 @@ export const getScoreBoard = async (
       JOIN public.organization_memberships om
         ON om.organization_id = ur.organization_id AND om.user_id = ur.user_id AND om.deleted_at IS NULL AND om.status = 'active'
       WHERE ur.organization_id = ${organizationId} AND ur.role_code IN ('STAFF', 'LEADER', 'QC')
+      UNION
+      SELECT unnest(${[...required]}::uuid[])
     )
     SELECT au.id AS user_id, au.display_name, au.email, au.avatar_url, mp.team_id, tm.name AS team_name,
       coalesce(s.points_official, '0') AS points_official, coalesce(s.points_khoan, '0') AS points_khoan,
@@ -534,6 +552,20 @@ export const getScoreBoard = async (
       .map((row) => ({ ...row, pointsOfficial: Number(row.points_official) })),
     (row) => row.display_name
   );
+  // PD-069: each person's KPI of the period, as the forecast / close compute it (one query each for all the people).
+  const userIds = ranked.map((row) => row.user_id);
+  const [targets, leave] = await Promise.all([
+    loadTargetVersionsByUser(sql, organizationId, userIds, ["MONTH"]),
+    settings.kpiProrateLeave ? approvedLeaveDaysByUser(sql, organizationId, userIds, from, to, { workdaysOnly: true }) : null
+  ]);
+  const workingDays = countWorkingDays(from, to);
+  const kpiTargetOf = (userId: string) =>
+    periodTarget({
+      targetBase: effectiveTarget(targets.get(userId) ?? [], "MONTH", period),
+      prorateLeave: settings.kpiProrateLeave,
+      workingDays,
+      leaveDays: leave?.get(userId) ?? null
+    });
   return {
     period,
     from,
@@ -550,7 +582,9 @@ export const getScoreBoard = async (
         pointsOfficial: row.pointsOfficial,
         pointsKhoan: Number(row.points_khoan),
         qtyKhoan: row.qty_khoan,
-        money: moneyVisible || own ? Number(row.money) : null
+        money: moneyVisible || own ? Number(row.money) : null,
+        kpiTarget: kpiTargetOf(row.user_id),
+        kpiRequired: required.has(row.user_id)
       };
     })
   };
@@ -562,7 +596,7 @@ export const getScoreBoard = async (
  * GET /production/scores/task/:taskId — the ledger rows of one task (task detail), everyone's, for anyone who may
  * see the task (PD-052 retired the settings.scoresPublic filter of PR-11). PD-065: someone without
  * `view_others_scores` gets only their own rows (totals and per-process figures of those rows); money only for the row's
- * owner, `view_others_money`, or when settings.moneyPublic.
+ * owner or `view_others_money` (PD-066).
  */
 export const getTaskScores = async (context: AccessContext, taskId: string): Promise<TaskScores> => {
   assertProductionMember(context);

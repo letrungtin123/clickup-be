@@ -1,13 +1,16 @@
 import type { z } from "zod";
 
-import type {
-  ApplyDefaultKpiResult,
-  KpiTarget,
-  KpiTargetCell,
-  KpiTargetImportRequestSchema,
-  KpiTargetImportResult,
-  KpiTargetMatrix,
-  PutKpiTargetsRequestSchema
+import { sortProductionRoles } from "../../contracts/production-catalog.js";
+import {
+  kpiRequiredRoles,
+  type ApplyDefaultKpiResult,
+  type KpiTarget,
+  type KpiTargetCell,
+  type KpiTargetImportRequestSchema,
+  type KpiTargetImportResult,
+  type KpiTargetMatrix,
+  type KpiTargetsMissing,
+  type PutKpiTargetsRequestSchema
 } from "../../contracts/production-scores.js";
 import { getSql } from "../../db/client.js";
 import { AppError } from "../../lib/app-error.js";
@@ -18,7 +21,7 @@ import { toUserRef, type UserRefJson } from "../work/mappers.js";
 import { assertConfigEditor, assertProductionAdmin } from "./access.js";
 import { closeDaysOf, loadSettings } from "./catalog.service.js";
 import { isAlignedPeriod, parseKpiTargetCsv } from "./kpi-targets.js";
-import { effectiveVersion, periodOfDay, type KpiPeriodType } from "./scoring.js";
+import { effectiveVersion, periodOfDay, type KpiPeriodType, type TargetVersion } from "./scoring.js";
 import { businessDay } from "./time.js";
 
 /**
@@ -68,6 +71,29 @@ const selectTargets = (sql: QuerySql, organizationId: string, filter: { ids?: st
   ORDER BY k.user_id, k.period_type, k.effective_from DESC
   LIMIT 20000
 `;
+
+/**
+ * Every target version of `userIds` (of the given period types), per user — one query for many people (KPI settlement,
+ * KPI report, the board's KPI column). Pick a period's target with scoring.ts effectiveTarget.
+ */
+export const loadTargetVersionsByUser = async (sql: QuerySql, organizationId: string, userIds: string[], types: KpiPeriodType[]) => {
+  const byUser = new Map<string, TargetVersion[]>();
+  if (userIds.length === 0) {
+    return byUser;
+  }
+  const rows = await sql<{ user_id: string; period_type: KpiPeriodType; target_points: string; effective_from: string }[]>`
+    SELECT user_id, period_type, target_points::text AS target_points, to_char(effective_from, 'YYYY-MM') AS effective_from
+    FROM production.kpi_targets
+    WHERE organization_id = ${organizationId} AND user_id = ANY(${userIds}::uuid[]) AND period_type = ANY(${types}::text[])
+  `;
+  for (const row of rows) {
+    byUser.set(row.user_id, [
+      ...(byUser.get(row.user_id) ?? []),
+      { periodType: row.period_type, targetPoints: Number(row.target_points), effectiveFrom: row.effective_from }
+    ]);
+  }
+  return byUser;
+};
 
 const assertAligned = (periodType: KpiPeriodType, period: string) => {
   if (!isAlignedPeriod(periodType, period)) {
@@ -160,6 +186,84 @@ export const getKpiTargetMatrix = async (context: AccessContext, query: { year?:
       };
     }),
     history
+  };
+};
+
+// PD-066: KPI is mandatory -------------------------------------------------------------------------------------
+
+type RequiredMemberRow = UserRefJson & { team_id: string | null; team_name: string | null; roles: string[] | null; has_target: boolean };
+
+/**
+ * PD-066: the people who must have a MONTH KPI for `period` — active members of the organization holding one of
+ * `kpiRequiredRoles` (ADMIN, ACCOUNT, LEADER, QC, STAFF), except the organization superadmin, members who are only
+ * DIRECTOR and temporary QA test accounts (whoever looks) — each with whether a MONTH target is effective for the period
+ * (a version starting at or before it). `onlyUserId`: just that person (empty when they need none).
+ */
+const selectKpiRequiredMembers = (sql: QuerySql, organizationId: string, period: string, onlyUserId: string | null = null) => sql<RequiredMemberRow[]>`
+  SELECT au.id, au.display_name, au.email, au.avatar_url, mp.team_id, tm.name AS team_name,
+    (SELECT array_agg(ur.role_code) FROM production.user_roles ur WHERE ur.organization_id = om.organization_id AND ur.user_id = om.user_id) AS roles,
+    EXISTS (
+      SELECT 1 FROM production.kpi_targets k
+      WHERE k.organization_id = om.organization_id AND k.user_id = om.user_id AND k.period_type = 'MONTH'
+        AND k.effective_from <= ${`${period}-01`}::date
+    ) AS has_target
+  FROM public.organization_memberships om
+  JOIN public.app_users au ON au.id = om.user_id AND au.deleted_at IS NULL AND NOT au.is_test_account
+  LEFT JOIN production.member_profiles mp ON mp.organization_id = om.organization_id AND mp.user_id = om.user_id
+  LEFT JOIN production.teams tm ON tm.organization_id = om.organization_id AND tm.id = mp.team_id
+  WHERE om.organization_id = ${organizationId} AND om.deleted_at IS NULL AND om.status = 'active'
+    AND EXISTS (
+      SELECT 1 FROM production.user_roles ur
+      WHERE ur.organization_id = om.organization_id AND ur.user_id = om.user_id AND ur.role_code = ANY(${[...kpiRequiredRoles]}::text[])
+    )
+    AND NOT EXISTS (SELECT 1 FROM public.roles r WHERE r.id = om.role_id AND r.key = 'superadmin')
+    AND (${onlyUserId}::uuid IS NULL OR om.user_id = ${onlyUserId}::uuid)
+  ORDER BY au.display_name, au.id
+  LIMIT 5000
+`;
+
+/** PD-066: who must have a MONTH KPI for `period` (`requiredCount`) and who of them has none (`missing`, by name). */
+export const findMissingKpiTargets = async (sql: QuerySql, organizationId: string, period: string) => {
+  const rows = await selectKpiRequiredMembers(sql, organizationId, period);
+  return { requiredCount: rows.length, missing: rows.filter((row) => !row.has_target) };
+};
+
+/** PD-066: the ids of everyone who must have a MONTH KPI for `period` (see selectKpiRequiredMembers) — one query. */
+export const loadKpiRequiredUserIds = async (sql: QuerySql, organizationId: string, period: string) =>
+  new Set((await selectKpiRequiredMembers(sql, organizationId, period)).map((row) => row.id));
+
+/** PD-066: `userId` must have a MONTH KPI (see selectKpiRequiredMembers); the period only decides `hasTarget`. */
+export const loadKpiRequirement = async (sql: QuerySql, organizationId: string, userId: string, period: string) => {
+  const [row] = await selectKpiRequiredMembers(sql, organizationId, period, userId);
+  return { required: row !== undefined, hasTarget: row?.has_target ?? false };
+};
+
+/** 409 KPI_TARGETS_MISSING of a settlement run (details: KpiTargetsMissingDetailsSchema). Nothing may be written. */
+export const kpiTargetsMissingError = (missing: readonly Pick<RequiredMemberRow, "id" | "display_name">[]) =>
+  new AppError("KPI_TARGETS_MISSING", `Còn ${missing.length} người chưa có KPI kỳ này — set KPI trước khi chốt.`, 409, {
+    users: missing.map((row) => ({ id: row.id, displayName: row.display_name }))
+  });
+
+/**
+ * GET /production/kpi-targets/missing?period — PD-066: who must have a MONTH KPI for the period (default: the current
+ * one) and has none, for the people who manage KPI (ADMIN, like the KPI matrix). Settling that period is refused (409
+ * KPI_TARGETS_MISSING) until the list is empty.
+ */
+export const getMissingKpiTargets = async (context: AccessContext, query: { period?: string | undefined }): Promise<KpiTargetsMissing> => {
+  assertProductionAdmin(context);
+  const sql = getSql();
+  const organizationId = org(context);
+  const period = query.period ?? periodOfDay(businessDay(new Date()), closeDaysOf(await loadSettings(sql, organizationId)));
+  const { requiredCount, missing } = await findMissingKpiTargets(sql, organizationId, period);
+  return {
+    period,
+    requiredCount,
+    items: missing.map((row) => ({
+      user: toUserRef(row)!,
+      teamId: row.team_id,
+      teamName: row.team_name,
+      roles: sortProductionRoles(row.roles ?? [])
+    }))
   };
 };
 

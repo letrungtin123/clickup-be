@@ -151,6 +151,7 @@ const jobRow = (overrides: Partial<JobRow> = {}): JobRow => ({
   created_by: null,
   created_at: new Date("2026-10-01T01:00:00Z"),
   created_cursor: "2026-10-01T01:00:00.000000Z",
+  received_cursor: "2026-10-01T01:00:00.000000Z",
   archived_at: null,
   ...overrides
 });

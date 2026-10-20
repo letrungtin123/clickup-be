@@ -9,6 +9,7 @@ import type {
   ProductionSubtask,
   ProductionTask,
   TaskKind,
+  TaskPoints,
   TaskQtyRequest
 } from "../../contracts/production-jobs.js";
 import { AppError } from "../../lib/app-error.js";
@@ -31,6 +32,7 @@ import {
   subtaskManageAllowed
 } from "./job-permissions.js";
 import { parentNumberSql, taskCode } from "./task-codes.js";
+import { loadLinePoints, pointsViewer, type PointsLine } from "./task-points.js";
 import {
   allowedTransitions,
   isSubtask,
@@ -441,14 +443,49 @@ export const loadTaskExtras = async (sql: QuerySql, organizationId: string, user
   return result;
 };
 
-/** Task rows → API tasks for the caller, with the card extras (loadTaskExtras) and their capabilities. */
+/** PD-070: a task row and the subtasks it embeds as rows to price (a subtask shares its line's person, project and shift). */
+export const pointsLinesOf = (rows: readonly TaskRow[]): PointsLine[] =>
+  rows.flatMap((row) => [
+    {
+      id: row.id,
+      assigneeId: row.assignee_id,
+      projectId: row.project_id,
+      processId: row.process_id,
+      processIsQc: row.process_is_qc,
+      payMode: row.pay_mode,
+      kind: row.kind,
+      qtyAssigned: row.qty_assigned,
+      qtyDone: row.qty_done
+    },
+    // PD-044: a subtask is a NORMAL row never on the QC process.
+    ...(row.subtasks ?? []).map((subtask) => ({
+      id: subtask.id,
+      assigneeId: row.assignee_id,
+      projectId: row.project_id,
+      processId: subtask.process_id,
+      processIsQc: false,
+      payMode: row.pay_mode,
+      kind: "NORMAL" as const,
+      qtyAssigned: subtask.qty_assigned,
+      qtyDone: subtask.qty_done
+    }))
+  ]);
+
+/** PD-070 "Điểm" of task rows and their embedded subtasks for the caller (task-points.ts), keyed by task id. */
+export const loadTaskPoints = async (sql: QuerySql, context: AccessContext, rows: readonly TaskRow[]) =>
+  rows.length === 0
+    ? new Map<string, TaskPoints | null>()
+    : loadLinePoints(sql, context.organization.id, await pointsViewer(context, sql), pointsLinesOf(rows));
+
+/** Task rows → API tasks for the caller, with the card extras (loadTaskExtras), points (PD-070) and capabilities. */
 export const toProductionTasks = async (sql: QuerySql, context: AccessContext, workflow: Workflow, rows: readonly TaskRow[], scopes?: JobScopes) => {
-  const [extras, mine] = await Promise.all([
+  const [extras, mine, points] = await Promise.all([
     loadTaskExtras(sql, context.organization.id, context.user.id, rows),
-    scopes ? Promise.resolve(scopes) : loadJobScopes(sql, context)
+    scopes ? Promise.resolve(scopes) : loadJobScopes(sql, context),
+    loadTaskPoints(sql, context, rows)
   ]);
   const access: TaskAccess = { scopes: mine, userId: context.user.id };
-  return rows.map((row) => toProductionTask(row, workflow, relationOf(context, row), access, extras.get(row.id)));
+  return rows.map((row) => toProductionTask(row, workflow, relationOf(context, row), access, extras.get(row.id), points));
 };
 
 type CapabilityRow = Pick<
@@ -504,7 +541,7 @@ export const taskCapabilities = (row: CapabilityRow, access: TaskAccess, leads =
 export const subtaskJsonCode = (row: Pick<SubtaskJson, "number" | "sub_seq">, lineNumber: number | string) =>
   taskCode({ number: row.number, subSeq: row.sub_seq, parentNumber: lineNumber });
 
-const toSubtask = (row: SubtaskJson, lineNumber: number | string): ProductionSubtask => ({
+const toSubtask = (row: SubtaskJson, lineNumber: number | string, points: TaskPoints | null = null): ProductionSubtask => ({
   id: row.id,
   number: Number(row.number),
   code: subtaskJsonCode(row, lineNumber),
@@ -513,7 +550,8 @@ const toSubtask = (row: SubtaskJson, lineNumber: number | string): ProductionSub
   qtyDone: row.qty_done,
   reason: row.reason,
   createdBy: toUserRef(row.created_by),
-  createdAt: toIso(row.created_at)
+  createdAt: toIso(row.created_at),
+  points
 });
 
 export const toTaskQtyRequest = (row: QtyRequestJson): TaskQtyRequest => ({
@@ -555,7 +593,15 @@ export const withSubtasksAfterLines = <T extends Pick<TaskRow, "id" | "kind" | "
   return [...ordered, ...rows.filter((row) => isSubtaskRow(row) && !placed.has(row.id))];
 };
 
-export const toProductionTask = (row: TaskRow, workflow: Workflow, relation: TaskRelation, access: TaskAccess, extras: TaskExtras = noExtras): ProductionTask => {
+/** `points`: PD-070 points by task id (loadTaskPoints) for the row and its subtasks; none known → null. */
+export const toProductionTask = (
+  row: TaskRow,
+  workflow: Workflow,
+  relation: TaskRelation,
+  access: TaskAccess,
+  extras: TaskExtras = noExtras,
+  points?: ReadonlyMap<string, TaskPoints | null>
+): ProductionTask => {
   const doneStatusIds = new Set(workflow.statuses.filter((status) => status.countsDone).map((status) => status.id));
   const subtask = isSubtaskRow(row);
   return {
@@ -582,7 +628,7 @@ export const toProductionTask = (row: TaskRow, workflow: Workflow, relation: Tas
     parentTaskId: row.parent_task_id,
     isSubtask: subtask,
     splitReason: row.split_reason,
-    subtasks: subtask ? [] : (row.subtasks ?? []).map((item) => toSubtask(item, row.number)),
+    subtasks: subtask ? [] : (row.subtasks ?? []).map((item) => toSubtask(item, row.number, points?.get(item.id) ?? null)),
     allocatedQty: subtask ? (row.qty_assigned ?? 0) : allocatedQtyOf(row),
     pendingQtyRequest: row.pending_qty_request ? toTaskQtyRequest(row.pending_qty_request) : null,
     feedbackId: row.feedback_id,
@@ -594,6 +640,7 @@ export const toProductionTask = (row: TaskRow, workflow: Workflow, relation: Tas
     customValues: row.custom_values as ProductionTask["customValues"],
     tagIds: row.tag_ids ?? [],
     myCredits: extras.myCredits,
+    points: points?.get(row.id) ?? null,
     lastQcFail: extras.lastQcFail,
     createdAt: toIso(row.created_at),
     updatedAt: toIso(row.updated_at),
@@ -675,6 +722,8 @@ export type JobRow = {
   created_at: Date;
   /** created_at at full (microsecond) precision, UTC — the list's keyset cursor (BUG-PR-05 / PR-16). */
   created_cursor: string;
+  /** received_at likewise — the cursor of the list in "Ngày nhận" order (PD-067). */
+  received_cursor: string;
   archived_at: Date | null;
 };
 
@@ -685,7 +734,7 @@ export type JobRow = {
  */
 export const jobSelectSql = (sql: QuerySql, finish: LineFinishStatusIds, personId?: string) => sql`
   SELECT j.id, j.number, j.code, j.name, p.id AS project_id, p.code AS project_code, p.name AS project_name, c.name AS client_name,
-    ${cursorTextSql(sql, "j.created_at")} AS created_cursor,
+    ${cursorTextSql(sql, "j.created_at")} AS created_cursor, ${cursorTextSql(sql, "j.received_at")} AS received_cursor,
     j.leader_id, (SELECT ${userJsonSql(sql)} FROM public.app_users au WHERE au.id = j.leader_id) AS leader,
     j.received_at, j.deadline, j.total_images, j.total_images_manual, j.drive_link, j.channel_id,
     js.id AS job_status_id, js.name AS job_status_name, js.color AS job_status_color, js.is_closed AS job_status_closed,
@@ -838,6 +887,8 @@ export const toJobSummary = (row: JobRow): JobSummary => ({
   openFeedbackCount: row.open_feedback_count,
   people: toJobPeople(row),
   personShare: toJobPersonShare(row.person_share ?? null),
+  // PD-070: set by the job list (loadJobPoints) and the job detail (its tasks' points).
+  pointsOfficial: null,
   customValues: row.custom_values as JobSummary["customValues"],
   tagIds: row.tag_ids ?? [],
   createdBy: toUserRef(row.created_by),

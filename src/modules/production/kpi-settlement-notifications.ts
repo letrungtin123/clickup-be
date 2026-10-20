@@ -20,6 +20,7 @@ export const kpiSettledEvent = (organizationId: string, runId: string, period: s
 
 const periodLabel = (period: string) => `${period.slice(5, 7)}/${period.slice(0, 4)}`;
 const points = (value: number) => value.toLocaleString("vi-VN", { maximumFractionDigits: 2 });
+const money = (value: number) => `${value.toLocaleString("vi-VN", { maximumFractionDigits: 0 })}đ`;
 
 type RunInfo = { period: string; user_count: number; met_count: number; not_met_count: number };
 type SettledRow = {
@@ -28,8 +29,20 @@ type SettledRow = {
   target_points: string | null;
   points_official: string;
   khoan_points_converted: string;
+  khoan_money_raw: string;
   khoan_money: string;
   total_points: string;
+};
+
+/**
+ * The person's own result (PD-066): "Đạt KPI: 2.600 / 2.600 điểm (bù 50 điểm từ Khoán) · Tiền Khoán nhận 750.000đ".
+ * The money is the recipient's own.
+ */
+export const kpiResultBody = (row: { met: boolean; total: number; target: number | null; converted: number; earned: number; paid: number }) => {
+  const head = `${row.met ? "Đạt KPI" : "Chưa đạt KPI"}: ${points(row.total)}${row.target === null ? "" : ` / ${points(row.target)}`} điểm`;
+  const topUp = row.converted > 0 ? ` (bù ${points(row.converted)} điểm từ Khoán)` : "";
+  const khoan = row.earned !== 0 || row.paid !== 0 ? ` · Tiền Khoán nhận ${money(row.paid)}` : "";
+  return `${head}${topUp}${khoan}`;
 };
 
 export const kpiSettlementNotificationHandlers: Record<string, (event: DomainEventEnvelope) => Promise<void>> = {
@@ -50,7 +63,8 @@ export const kpiSettlementNotificationHandlers: Record<string, (event: DomainEve
     }
     const rows = await sql<SettledRow[]>`
       SELECT user_id, met, target_points::text AS target_points, points_official::text AS points_official,
-        khoan_points_converted::text AS khoan_points_converted, khoan_money::text AS khoan_money, total_points::text AS total_points
+        khoan_points_converted::text AS khoan_points_converted, khoan_money_raw::text AS khoan_money_raw, khoan_money::text AS khoan_money,
+        total_points::text AS total_points
       FROM production.kpi_settlements WHERE organization_id = ${envelope.organizationId} AND run_id = ${runId}
     `;
     if (rows.length === 0 && run.user_count > 0) {
@@ -66,7 +80,14 @@ export const kpiSettlementNotificationHandlers: Record<string, (event: DomainEve
         type: "production.kpi_settled",
         actorUserId: null,
         title: `Chốt KPI kỳ ${label}`,
-        body: `${row.met ? "Đạt KPI" : "Chưa đạt KPI"}: ${points(total)}${target === null ? "" : ` / ${points(target)}`} điểm`,
+        body: kpiResultBody({
+          met: row.met,
+          total,
+          target,
+          converted: Number(row.khoan_points_converted),
+          earned: Number(row.khoan_money_raw),
+          paid: Number(row.khoan_money)
+        }),
         payload: {
           runId,
           period: run.period,
@@ -76,6 +97,7 @@ export const kpiSettlementNotificationHandlers: Record<string, (event: DomainEve
           met: row.met,
           pointsOfficial: Number(row.points_official),
           khoanPointsConverted: Number(row.khoan_points_converted),
+          khoanMoneyEarned: Number(row.khoan_money_raw),
           khoanMoney: Number(row.khoan_money)
         },
         dedupeKey: `kpi:${runId}:result`

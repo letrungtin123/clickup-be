@@ -29,6 +29,9 @@ export const toCreditRule = (row: CreditRuleRow): CreditRule => ({
   effectiveTo: row.effective_to
 });
 
+/** SPEC Phase 1 §3: a rule is in force on `day` (business calendar day) when [effective_from, effective_to) contains it. */
+const inForceSql = (sql: QuerySql, day: string) => sql`effective_from <= ${day}::date AND (effective_to IS NULL OR ${day}::date < effective_to)`;
+
 /** SPEC Phase 1 §3: the rule whose [effective_from, effective_to) contains `day` (business calendar day). */
 export const getCreditRule = async (
   sql: QuerySql,
@@ -42,11 +45,44 @@ export const getCreditRule = async (
       SELECT ${dateColumns(sql)}
       FROM production.credit_rules
       WHERE organization_id = ${organizationId} AND project_id = ${projectId} AND process_id = ${processId}
-        AND effective_from <= ${day}::date AND (effective_to IS NULL OR ${day}::date < effective_to)
+        AND ${inForceSql(sql, day)}
       LIMIT 1
     `
   )[0];
   return row ? toCreditRule(row) : null;
+};
+
+/** Key of a (project, process) pair in getCreditRules' result. */
+export const creditRuleKey = (projectId: string, processId: string) => `${projectId}:${processId}`;
+
+/**
+ * getCreditRule for many (project, process) pairs at once (PD-070: the expected points of a page of tasks) — the same
+ * rule each pair resolves on `day`, keyed by creditRuleKey; pairs without a rule are absent. One query.
+ */
+export const getCreditRules = async (
+  sql: QuerySql,
+  organizationId: string,
+  pairs: readonly { projectId: string; processId: string }[],
+  day: string
+): Promise<Map<string, CreditRule>> => {
+  const unique = [...new Map(pairs.map((pair) => [creditRuleKey(pair.projectId, pair.processId), pair])).values()];
+  const result = new Map<string, CreditRule>();
+  if (unique.length === 0) {
+    return result;
+  }
+  const rows = await sql<CreditRuleRow[]>`
+    SELECT ${dateColumns(sql)}
+    FROM production.credit_rules
+    WHERE organization_id = ${organizationId}
+      AND (project_id, process_id) IN (
+        SELECT * FROM unnest(${unique.map((pair) => pair.projectId)}::uuid[], ${unique.map((pair) => pair.processId)}::uuid[])
+      )
+      AND ${inForceSql(sql, day)}
+  `;
+  for (const row of rows) {
+    result.set(creditRuleKey(row.project_id, row.process_id), toCreditRule(row));
+  }
+  return result;
 };
 
 export const listRulesAt = async (sql: QuerySql, organizationId: string, day: string) =>

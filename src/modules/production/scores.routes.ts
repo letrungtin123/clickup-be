@@ -16,6 +16,8 @@ import {
   KpiTargetImportResultSchema,
   KpiTargetMatrixQuerySchema,
   KpiTargetMatrixSchema,
+  KpiTargetsMissingQuerySchema,
+  KpiTargetsMissingSchema,
   MyScoresQuerySchema,
   MyScoresSchema,
   PutKpiTargetsRequestSchema,
@@ -31,7 +33,14 @@ import { withCustomFieldFilters } from "../../contracts/production-catalog.js";
 import { requireSupabaseUser } from "../../middleware/auth.js";
 import { handle, param } from "./http.js";
 import { getKpiReport, listKpiSettlementRuns, listKpiSettlements, runKpiSettlement } from "./kpi-settlement.service.js";
-import { applyDefaultKpiTargets, deleteKpiTarget, getKpiTargetMatrix, importKpiTargets, putKpiTargets } from "./kpi-targets.service.js";
+import {
+  applyDefaultKpiTargets,
+  deleteKpiTarget,
+  getKpiTargetMatrix,
+  getMissingKpiTargets,
+  importKpiTargets,
+  putKpiTargets
+} from "./kpi-targets.service.js";
 import { getMyScores, getScoreBoard, getScoreForecast, getTaskScores, getUserScoreForecast, getUserScores } from "./scores.service.js";
 
 /**
@@ -65,6 +74,11 @@ export const createProductionScoreRoutes = (): ExpressRouter => {
   routes.get(
     "/production/kpi-targets",
     handle(async (context, req) => KpiTargetMatrixSchema.parse(await getKpiTargetMatrix(context, KpiTargetMatrixQuerySchema.parse(req.query))))
+  );
+  // PD-066: who must have a KPI for a period and has none (the settlement of that period is refused until it is empty)
+  routes.get(
+    "/production/kpi-targets/missing",
+    handle(async (context, req) => KpiTargetsMissingSchema.parse(await getMissingKpiTargets(context, KpiTargetsMissingQuerySchema.parse(req.query))))
   );
   routes.put(
     "/production/kpi-targets",

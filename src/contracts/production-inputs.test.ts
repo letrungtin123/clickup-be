@@ -6,6 +6,7 @@ import {
   defaultJobPermissions,
   IsoDateInputSchema,
   isKpiCloseDay,
+  KhoanPayPolicySchema,
   KpiCloseDayVersionSchema,
   kpiCloseDayEndOfMonth,
   ProductionSettingsSchema,
@@ -126,8 +127,8 @@ describe("production request inputs", () => {
   });
 });
 
-// PD-032 / PD-033: what PATCH /production/settings accepts for the close day and the Khoán pay policy.
-describe("production settings: close day and Khoán pay policy", () => {
+// PD-032 / PD-066: what PATCH /production/settings accepts for the close day; the Khoán pay policy and moneyPublic are gone.
+describe("production settings: close day; no Khoán pay policy, no moneyPublic (PD-066)", () => {
   it("close day is 1–28 or 31 = “Cuối tháng”", () => {
     for (const day of [1, 20, 28, 31]) {
       expect(UpdateProductionSettingsRequestSchema.safeParse({ kpiCloseDay: day }).success, String(day)).toBe(true);
@@ -143,23 +144,19 @@ describe("production settings: close day and Khoán pay policy", () => {
     expect([1, 28, 31, 29, 0, 12.5].map(isKpiCloseDay)).toEqual([true, true, true, false, false, false]);
   });
 
-  it("Khoán pay policy is ALWAYS or IF_KPI, and is saved with the other settings", () => {
-    expect(UpdateProductionSettingsRequestSchema.safeParse({ khoanPayPolicy: "ALWAYS" }).success).toBe(true);
-    expect(UpdateProductionSettingsRequestSchema.safeParse({ khoanPayPolicy: "IF_KPI" }).success).toBe(true);
-    for (const value of ["always", "NEVER", "", null, true, 1]) {
-      expect(UpdateProductionSettingsRequestSchema.safeParse({ khoanPayPolicy: value }).success, String(value)).toBe(false);
+  it("PD-066: the Khoán pay policy and moneyPublic are no longer settings — a PATCH naming them is refused", () => {
+    for (const value of ["ALWAYS", "IF_KPI", "TOP_UP"]) {
+      expect(UpdateProductionSettingsRequestSchema.safeParse({ khoanPayPolicy: value }).success, value).toBe(false);
     }
-    expect(
-      UpdateProductionSettingsRequestSchema.parse({ kpiCloseDay: 31, khoanPayPolicy: "IF_KPI", kpiProrateLeave: true })
-    ).toEqual({ kpiCloseDay: 31, khoanPayPolicy: "IF_KPI", kpiProrateLeave: true });
-    // The full settings (GET) must carry a policy.
+    expect(UpdateProductionSettingsRequestSchema.safeParse({ moneyPublic: true }).success).toBe(false);
+    expect(UpdateProductionSettingsRequestSchema.parse({ kpiCloseDay: 31, kpiProrateLeave: true })).toEqual({ kpiCloseDay: 31, kpiProrateLeave: true });
+    // Runs keep their recorded rule readable: the two retired ones and TOP_UP.
+    expect(["ALWAYS", "IF_KPI", "TOP_UP"].map((value) => KhoanPayPolicySchema.safeParse(value).success)).toEqual([true, true, true]);
     const settings = {
       kpiCloseDay: 31,
       kpiCloseDays: [{ fromPeriod: null, closeDay: 25 }, { fromPeriod: "2026-11", closeDay: 31 }],
       scoresPublic: true,
-      moneyPublic: false,
       kpiProrateLeave: false,
-      khoanPayPolicy: "ALWAYS",
       anomalyFailRate: 0.15,
       dueSoonHours: 2,
       kpiDefaultMember: 100,
@@ -169,10 +166,8 @@ describe("production settings: close day and Khoán pay policy", () => {
       featurePermissions: defaultFeaturePermissions,
       timezone: "Asia/Ho_Chi_Minh"
     };
-    expect(ProductionSettingsSchema.safeParse(settings).success).toBe(true);
-    const withoutPolicy: Record<string, unknown> = { ...settings };
-    delete withoutPolicy.khoanPayPolicy;
-    expect(ProductionSettingsSchema.safeParse(withoutPolicy).success).toBe(false);
+    const parsed = ProductionSettingsSchema.parse({ ...settings, moneyPublic: true, khoanPayPolicy: "ALWAYS" });
+    expect("moneyPublic" in parsed || "khoanPayPolicy" in parsed).toBe(false);
   });
 
   it("closingDayOfPeriod clamps 31 to the month's length", () => {
