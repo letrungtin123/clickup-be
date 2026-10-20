@@ -493,7 +493,10 @@ export const JobSummarySchema = z.object({
   /** Optional free name (kept for older jobs; the forms no longer ask for it). */
   name: z.string().nullable(),
   project: z.object({ id: Id, code: z.string(), name: z.string(), clientName: z.string().nullable() }),
-  /** Optional (PD-035): without a leader, any Leader / Admin acts as the job leader. */
+  /**
+   * PD-073: every job is created with a Leader; null only for jobs created before (PD-035 had it optional) — any Leader /
+   * Admin then acts as the job leader. A Leader who loses the role stays named until the job is reassigned (SEC2-04).
+   */
   leader: UserRefSchema.nullable(),
   /** "Ngày nhận" of the job (default of its lines'). */
   receivedAt: IsoDate,
@@ -648,13 +651,19 @@ export type JobQuery = z.infer<typeof JobQuerySchema>;
  * - `months`: jobs per month of "Ngày nhận" in the organization's timezone ("YYYY-MM", newest first), every filter applied;
  * - `projects`: jobs per project with every filter BUT the project one (the sidebar lists each project that has matching
  *   jobs, by code), plus the filtered project itself when it has none (count 0) so the selection stays visible.
+ * - `leaderTabs` (PD-073, the "Tất cả" / "Tôi quản lý" tabs): jobs with every filter BUT the leader one (`all`), and
+ *   among them those whose Leader is the caller (`mine`; jobs without a leader are not); null when the caller does not
+ *   hold the production role LEADER (no tabs).
  * Per-person view (`personId`): the person's jobs, like the list.
  */
+export const JobLeaderTabsSchema = z.object({ all: z.number().int(), mine: z.number().int() });
+export type JobLeaderTabs = z.infer<typeof JobLeaderTabsSchema>;
 export const JobFacetsSchema = z.object({
   months: z.array(z.object({ month: z.string().regex(/^\d{4}-\d{2}$/), count: z.number().int() })),
   projects: z.array(
     z.object({ projectId: Id, code: z.string(), name: z.string(), active: z.boolean(), count: z.number().int() })
-  )
+  ),
+  leaderTabs: JobLeaderTabsSchema.nullable()
 });
 export type JobFacets = z.infer<typeof JobFacetsSchema>;
 
@@ -666,7 +675,14 @@ const JobFields = {
   projectId: Id,
   code: JobCodeSchema,
   name: SafeText().trim().max(300).nullable().optional(),
-  /** null / omitted: no leader (PD-035). */
+  /**
+   * The job's Leader: a member holding LEADER (else 400 LEADER_INVALID). PD-073 — every job must have one:
+   * - POST: required; missing / null → 400 JOB_LEADER_REQUIRED "Chọn Leader cho job.";
+   * - PATCH: null → 400 JOB_LEADER_REQUIRED (it cannot be cleared). An older job without a leader keeps working, but a
+   *   PATCH that edits its own fields (code, name, projectId, receivedAt, deadline, totalImages, driveLink) must also
+   *   name one — see UpdateJobRequestSchema.
+   * Kept nullable / optional in the schema so the refusal carries that code and message.
+   */
   leaderId: Id.nullable().optional(),
   /** "Ngày nhận" of the job. */
   receivedAt: IsoDateInput,
@@ -687,6 +703,14 @@ export const CreateJobRequestSchema = z
   })
   .strict();
 export type CreateJobRequest = z.infer<typeof CreateJobRequestSchema>;
+/**
+ * PATCH /production/jobs/:jobId (the job form, archive / restore). PD-073: when the job would be left without a Leader,
+ * 400 JOB_LEADER_REQUIRED for a request that sends `leaderId: null` or edits any of the job's own fields
+ * (`jobLeaderBoundFields`) — only for callers who may set the Leader ("update: all"; with "own" the Leader is not
+ * theirs to choose, so their edits go through). Archive / restore, tags and custom-field values alone, and the job status
+ * (PATCH …/status) still work on an older job without a leader.
+ */
+export const jobLeaderBoundFields = ["code", "name", "projectId", "receivedAt", "deadline", "totalImages", "driveLink", "leaderId"] as const;
 export const UpdateJobRequestSchema = z
   .object({
     ...JobFields,

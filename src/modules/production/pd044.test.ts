@@ -526,8 +526,12 @@ describe("PD-045 job status that needs every line checked", () => {
   });
 
   it("a new job cannot start in such a status (no line yet)", async () => {
-    db.state.handler = (call) => (call.text.startsWith("SELECT 1 FROM production.projects") ? [{ "?column?": 1 }] : statusQueries([])(call));
-    const input = { projectId: jobId, code: "Batch 1", receivedAt: "2026-10-14T00:00:00Z", deadline: "2026-10-15T00:00:00Z", jobStatusId: statusFinished };
+    db.state.handler = (call) =>
+      call.text.startsWith("SELECT 1 FROM production.projects") ? [{ "?column?": 1 }]
+      : call.text.includes("array_agg(ur.role_code)") ? [{ user_id: leader, roles: ["LEADER"], superadmin: false }]
+      : statusQueries([])(call);
+    // PD-073: the Leader is required.
+    const input = { projectId: jobId, code: "Batch 1", leaderId: leader, receivedAt: "2026-10-14T00:00:00Z", deadline: "2026-10-15T00:00:00Z", jobStatusId: statusFinished };
     expect(await failure(createJob(leaderContext, input))).toEqual({ code: "JOB_NOT_READY", status: 409, message: "Job chưa có task nào." });
     expect(callsLike(/^INSERT INTO production\.jobs/)).toHaveLength(0);
   });

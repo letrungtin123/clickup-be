@@ -698,7 +698,8 @@ describe("work-log fields (PD-035)", () => {
       code: "B1",
       name: null,
       project_id: projectId,
-      leader_id: null,
+      // PD-073: a job without a leader would refuse the edit (JOB_LEADER_REQUIRED, pd073.test.ts).
+      leader_id: me,
       received_at: jobReceived,
       deadline: jobDeadline,
       total_images: 40,

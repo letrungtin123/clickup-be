@@ -18,13 +18,13 @@ import type {
   UpdateJobStatusRequest
 } from "../../contracts/production-jobs.js";
 import type { JobScopes } from "../../contracts/production-catalog.js";
-import { noLeaderFilter } from "../../contracts/production-jobs.js";
+import { jobLeaderBoundFields, noLeaderFilter } from "../../contracts/production-jobs.js";
 import { getSql } from "../../db/client.js";
 import { AppError } from "../../lib/app-error.js";
 import { decodeCursor, encodeCursor, escapeLike, invalidCursor, toIso, type QuerySql } from "../../lib/db-types.js";
 import type { AccessContext } from "../access/access-context.js";
 import { visibleUserIdSql } from "../access/test-accounts.js";
-import { actsAsJobLeader, assertProductionMember, assertProductionRole, isProductionAdmin } from "./access.js";
+import { actsAsJobLeader, assertProductionMember, assertProductionRole, isProductionAdmin, productionRolesOf } from "./access.js";
 import { loadSettings } from "./catalog.service.js";
 import { cursorInstantSql, decodeTimeCursor, encodeTimeCursor, isUuid, isValidCursorInstant } from "./cursor.js";
 import { anyTagSql, customFieldFilterSql, resolveCustomFieldFilters, resolveCustomValues, setEntityTags } from "./custom-fields.js";
@@ -127,7 +127,13 @@ const assertJobStatusAllowed = async (
   }
 };
 
-/** A named leader must hold LEADER; null = no leader (PD-035). */
+/**
+ * PD-073: every job must have a Leader — 400 JOB_LEADER_REQUIRED for a new job without one, and for an edit that would
+ * leave a job without one (jobLeaderNeeded says when).
+ */
+const jobLeaderRequired = (message = "Chọn Leader cho job.") => new AppError("JOB_LEADER_REQUIRED", message, 400);
+
+/** A named leader must hold LEADER (null passes: the callers decide whether one is required, PD-073). */
 const assertLeader = async (sql: QuerySql, organizationId: string, leaderId: string | null) => {
   if (!leaderId) {
     return;
@@ -236,7 +242,17 @@ const jobListFilterSql = (
   scopes: JobScopes,
   query: JobQuery,
   plans: Awaited<ReturnType<typeof resolveCustomFieldFilters>>,
-  { person, project = true }: { person: boolean; /** false: ignore `projectId` (the facets' project counts, PD-067). */ project?: boolean }
+  {
+    person,
+    project = true,
+    leader = true
+  }: {
+    person: boolean;
+    /** false: ignore `projectId` (the facets' project counts, PD-067). */
+    project?: boolean;
+    /** false: ignore `leaderId` (the facets' "Tất cả" / "Tôi quản lý" counts, PD-073). */
+    leader?: boolean;
+  }
 ) => {
   const like = query.q ? `%${escapeLike(query.q.toLowerCase())}%` : null;
   return sql`
@@ -246,7 +262,7 @@ const jobListFilterSql = (
     ${query.includeArchived ? sql`` : sql`AND j.archived_at IS NULL`}
     ${project && query.projectId ? sql`AND j.project_id = ${query.projectId}` : sql``}
     ${query.jobStatusId?.length ? sql`AND j.job_status_id = ANY(${query.jobStatusId}::uuid[])` : sql``}
-    ${query.leaderId === noLeaderFilter ? sql`AND j.leader_id IS NULL` : query.leaderId ? sql`AND j.leader_id = ${query.leaderId}` : sql``}
+    ${!leader ? sql`` : query.leaderId === noLeaderFilter ? sql`AND j.leader_id IS NULL` : query.leaderId ? sql`AND j.leader_id = ${query.leaderId}` : sql``}
     ${
       // "Mọi nhân viên": works on at least one task (assignee only; QC-only jobs do not count).
       person && query.personId
@@ -395,8 +411,9 @@ const decodeReceivedCursor = (cursor: string | undefined) => {
 /**
  * GET /production/jobs/facets (PD-067): the counts of the job List view — jobs per month of "Ngày nhận" (organization
  * timezone, every filter applied) and per project (every filter but the project one; the filtered project is kept with
- * 0). Same filters and visibility as listJobs (view scope, PD-063 test accounts, per-person view); one grouped query
- * each over the organization's job rows.
+ * 0). PD-073, for a caller holding LEADER only: the "Tất cả" / "Tôi quản lý" tab counts — every filter but the leader
+ * one, `mine` = led by the caller (one count with a FILTER clause). Same filters and visibility as listJobs (view scope,
+ * PD-063 test accounts, per-person view); one grouped query each over the organization's job rows.
  */
 export const getJobFacets = async (context: AccessContext, query: JobQuery): Promise<JobFacets> => {
   assertProductionMember(context);
@@ -410,7 +427,9 @@ export const getJobFacets = async (context: AccessContext, query: JobQuery): Pro
     resolveCustomFieldFilters(sql, organizationId, "JOB", query.cf),
     loadSettings(sql, organizationId)
   ]);
-  const [months, projects] = await Promise.all([
+  // The tabs are a Leader's view: holding LEADER itself (the organization superadmin holds every role), not ADMIN.
+  const leaderTabs = productionRolesOf(context).has("LEADER");
+  const [months, projects, tabs] = await Promise.all([
     sql<{ month: string; count: number }[]>`
       SELECT to_char(j.received_at AT TIME ZONE ${settings.timezone}::text, 'YYYY-MM') AS month, count(*)::int AS count
       FROM production.jobs j
@@ -431,11 +450,20 @@ export const getJobFacets = async (context: AccessContext, query: JobQuery): Pro
       WHERE p.organization_id = ${organizationId}
         AND (c.project_id IS NOT NULL ${query.projectId ? sql`OR p.id = ${query.projectId}` : sql``})
       ORDER BY lower(p.code), p.code, p.id
-    `
+    `,
+    leaderTabs
+      ? sql<{ all_count: number; mine_count: number }[]>`
+          SELECT count(*)::int AS all_count, count(*) FILTER (WHERE j.leader_id = ${context.user.id})::int AS mine_count
+          FROM production.jobs j
+          WHERE ${jobListFilterSql(sql, context, scopes, query, plans, { person: true, leader: false })}
+        `
+      : Promise.resolve(null)
   ]);
+  const tabCounts = tabs?.[0];
   return {
     months: months.map((row) => ({ month: row.month, count: row.count })),
-    projects: projects.map((row) => ({ projectId: row.project_id, code: row.code, name: row.name, active: row.active, count: row.count }))
+    projects: projects.map((row) => ({ projectId: row.project_id, code: row.code, name: row.name, active: row.active, count: row.count })),
+    leaderTabs: tabs ? { all: tabCounts?.all_count ?? 0, mine: tabCounts?.mine_count ?? 0 } : null
   };
 };
 
@@ -501,9 +529,10 @@ export const getJobDetail = async (context: AccessContext, jobId: string, sql: Q
 // Writes --------------------------------------------------------------------------------------------------
 
 /**
- * POST /production/jobs — a job without lines ("create: all", PD-036; with "own" a job is created only together with
- * one's own line through "Nhập công việc"). PD-045: a new job has no line yet, so a status with requiresAllChecked
- * ("Đã xong") is refused (409 JOB_NOT_READY "Job chưa có task nào.").
+ * POST /production/jobs — a job without lines ("create: all", PD-036; "Nhập công việc" adds lines to existing jobs only,
+ * PD-038). PD-045: a new job has no line yet, so a status with requiresAllChecked ("Đã xong") is refused (409
+ * JOB_NOT_READY "Job chưa có task nào."). PD-073: the Leader is required (400 JOB_LEADER_REQUIRED "Chọn Leader cho
+ * job."); they must hold LEADER (400 LEADER_INVALID).
  */
 export const createJob = async (context: AccessContext, input: CreateJobRequest) => {
   assertProductionMember(context);
@@ -512,8 +541,11 @@ export const createJob = async (context: AccessContext, input: CreateJobRequest)
   if ((await loadJobScopes(sql, context)).create !== "all") {
     throw forbidden("Bạn không có quyền tạo job — hãy dùng \"Nhập Task\" để nhập task của mình.");
   }
-  // PD-035: the leader is optional; Tổng tấm left empty follows the lines (0 until the job is split).
+  // PD-073: every job has a Leader (PD-035 had it optional). Tổng tấm left empty follows the lines (0 until the job is split).
   const leaderId = input.leaderId ?? null;
+  if (!leaderId) {
+    throw jobLeaderRequired();
+  }
   const receivedAt = new Date(input.receivedAt);
   const deadline = new Date(input.deadline);
   assertJobDates(receivedAt, deadline);
@@ -550,6 +582,18 @@ export const createJob = async (context: AccessContext, input: CreateJobRequest)
   return await getJobDetail(context, jobId);
 };
 
+/**
+ * PD-073: whether a PATCH would leave the job without a Leader while it edits what the job form edits: `leaderId: null`
+ * (clearing it), or any of the job's own fields (jobLeaderBoundFields) on a job that has none (created before PD-073; a
+ * Leader who lost the role stays named, SEC2-04). Archive / restore, tags and custom-field values alone do not count, so
+ * those — and the job status (its own endpoint) — keep working on such a job. updateJob applies it to callers with
+ * "update: all" only: with "own" the Leader is not theirs to choose, so their edits go through. Pure (unit tested).
+ */
+export const jobLeaderNeeded = (input: UpdateJobRequest, currentLeaderId: string | null) => {
+  const leaderAfter = input.leaderId === undefined ? currentLeaderId : input.leaderId;
+  return !leaderAfter && jobLeaderBoundFields.some((field) => input[field] !== undefined);
+};
+
 export const updateJob = async (context: AccessContext, jobId: string, input: UpdateJobRequest) => {
   assertProductionMember(context);
   const organizationId = context.organization.id;
@@ -574,6 +618,12 @@ export const updateJob = async (context: AccessContext, jobId: string, input: Up
     }
     if (job.archived_at && input.archived !== false) {
       throw new AppError("JOB_ARCHIVED", "Job đã lưu trữ — khôi phục trước khi sửa.", 409);
+    }
+    // PD-073: an edit of the job's own fields never leaves it without a Leader (callers who may set the Leader).
+    if (scopes.update === "all" && jobLeaderNeeded(input, job.leader_id)) {
+      throw jobLeaderRequired(
+        input.leaderId === null ? "Job phải có Leader — chỉ đổi sang Leader khác." : "Job chưa có Leader — chọn Leader để lưu thay đổi."
+      );
     }
     if (input.projectId) {
       await assertProject(tx, organizationId, input.projectId);

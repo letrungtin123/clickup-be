@@ -345,9 +345,11 @@ describe("job list, create job and the work-entry picker (PD-038)", () => {
   });
 
   it("Tạo job: the chosen Trạng thái is checked and stored; without one the trigger takes the first status", async () => {
-    const base = { projectId, code: "Batch 9", receivedAt: "2026-10-12T00:00:00+07:00", deadline: "2026-10-13T23:59:00+07:00" };
+    // PD-073: the Leader is required (here the creator, holding LEADER).
+    const base = { projectId, code: "Batch 9", leaderId: me, receivedAt: "2026-10-12T00:00:00+07:00", deadline: "2026-10-13T23:59:00+07:00" };
     db.state.handler = (call) =>
       call.text.startsWith("SELECT 1 FROM production.projects") ? [{ "?column?": 1 }]
+      : call.text.includes("array_agg(ur.role_code)") ? [{ user_id: me, roles: ["LEADER"], superadmin: false }]
       : call.text.startsWith("INSERT INTO production.jobs") ? [{ id: jobId }]
       : jobQueries()(call);
     await createJob(contextWith(["LEADER"]), CreateJobRequestSchema.parse({ ...base, jobStatusId: statusDoing }));

@@ -84,7 +84,9 @@ describe("work-log fields", () => {
     expect(ProductionTaskSchema.shape.workLink.safeParse("Y:\\Client").success).toBe(true);
   });
 
-  it("a job's Gói công việc is up to 300 characters; leader optional; Tổng tấm optional", () => {
+  // PD-073: the Leader is required by the service (400 JOB_LEADER_REQUIRED, pd073.test.ts); the schema lets null through
+  // so that refusal carries its own code and message.
+  it("a job's Gói công việc is up to 300 characters; leader nullable in the schema; Tổng tấm optional", () => {
     const job = { projectId: "11111111-1111-4111-8111-111111111111", receivedAt: "2026-10-12T00:00:00+07:00", deadline: "2026-10-15T23:59:00+07:00" };
     expect(CreateJobRequestSchema.safeParse({ ...job, code: "x".repeat(300) }).success).toBe(true);
     expect(CreateJobRequestSchema.safeParse({ ...job, code: "x".repeat(301) }).success).toBe(false);

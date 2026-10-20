@@ -6,7 +6,9 @@
  * (task), Checking rows included: the checker's QC points come from their own Checking line (PD-037), so no line gets
  * a QC assignment. Every line is replayed through the real workflow engine with the dates of its row (Ngày nhận
  * 00:00, Done 17:00 on Ngày giao) and ends Delivered; Hình lỗi is stored for review only; Giờ OT and Ghi chú are
- * optional; the job has no leader (the file has none).
+ * optional; the job has no leader (the file has none). PD-073 (every job must have a Leader) binds the app's job
+ * create / edit: jobs replayed here are historical, like the jobs created before it — they keep working without a
+ * leader, and the job form asks for one at their next edit.
  *
  *   npx tsx scripts/import-worklog-v2.ts --config <private config.json> [--dry-run]
  *
