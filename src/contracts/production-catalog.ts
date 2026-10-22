@@ -260,6 +260,18 @@ export const effectiveJobScopes = (roles: Iterable<ProductionRole>, matrix: JobP
   return result;
 };
 
+/**
+ * PD-079 — "create" of ACCOUNT covers Projects and Job Codes (jobs) only: an Account creates no task at all ("Chia task",
+ * "Nhập Task", subtasks). The scopes that create tasks — and split subtasks through "update: all" — are the ones of the
+ * caller's OTHER roles (ADMIN is "all"); a member who also holds LEADER / ADMIN / QC / STAFF keeps what those give (most
+ * permissive role wins).
+ */
+export const taskJobScopes = (roles: Iterable<ProductionRole>, matrix: JobPermissionMatrix): JobScopes =>
+  effectiveJobScopes(
+    [...roles].filter((role) => role !== "ACCOUNT"),
+    matrix
+  );
+
 // Feature permission matrix (PD-065) ---------------------------------------------------------------
 
 /**
@@ -388,6 +400,11 @@ export const ProductionMeSchema = z.object({
   /** My scopes in the job permission matrix (PD-036): the job menu, "Tạo job", "Nhập công việc", the assignee picker. */
   jobPermissions: JobScopesSchema,
   /**
+   * PD-079: my scope for creating TASKS ("Chia task", "Nhập Task", "Tạo nhanh task"): `jobPermissions.create` without
+   * what ACCOUNT gives (taskJobScopes) — an Account creates Projects and Job Codes only.
+   */
+  taskCreate: JobPermissionScopeSchema,
+  /**
    * PD-065: my features in the feature permission matrix (`featurePermissionKeys` order): the menus "Hàng chờ QC",
    * "Bảng điều khiển", "Quản trị số liệu", "Bất thường", "Khách hàng", "Xếp hạng", leave approval / export. The
    * superadmin has all of them. Others' Khoán money needs `view_others_money` (PD-066: nothing else opens it).
@@ -448,6 +465,95 @@ export const UpsertClientRequestSchema = z
   })
   .strict();
 
+/**
+ * PD-078 / PD-079 — a Photo Retouch Project (hierarchy Project > Job Code > Task > Subtask) and what the caller may do with
+ * it. Pure rules shared by the API (which enforces them) and the app (which follows them):
+ * - owners ("Người phụ trách"): one or more members holding LEADER or ADMIN (the superadmin holds ADMIN), in order (the
+ *   first is shown first and pre-filled as a job's Leader); several only when the organization superadmin sets them;
+ *   older projects may have none until an Admin picks one;
+ * - create: LEADER, ADMIN or ACCOUNT — the superadmin picks one or more owners, an Admin or an Account exactly one, a
+ *   Leader (without ADMIN / ACCOUNT) owns what they create;
+ * - edit (name, code, description, active): its owners (while still holding LEADER / ADMIN), every Admin, and the
+ *   Account who created it (`createdBy` = me, while holding ACCOUNT);
+ * - owners: the superadmin sets any number (≥ 1); an Admin sets / changes the single owner of a project that has at most
+ *   one (a project with several owners is read-only for them); Leaders and Accounts never change them after creation;
+ * - delete: whoever may edit it, and only while the project never had a job (any job row — live, archived or in the
+ *   trash — blocks it: 409 PROJECT_HAS_JOBS);
+ * - the Project page: LEADER, ADMIN, DIRECTOR, ACCOUNT (Director read-only; Account: the projects they created).
+ */
+export const projectOwnerRoles = ["LEADER", "ADMIN"] as const satisfies readonly ProductionRole[];
+export const projectCreatorRoles = ["LEADER", "ADMIN", "ACCOUNT"] as const satisfies readonly ProductionRole[];
+export const projectPageRoles = ["LEADER", "ADMIN", "DIRECTOR", "ACCOUNT"] as const satisfies readonly ProductionRole[];
+/** Most owners one project may have (the superadmin's multi-select). */
+export const projectOwnersMax = 20;
+
+const holdsAny = (roles: Iterable<ProductionRole>, wanted: readonly ProductionRole[]) => [...roles].some((role) => wanted.includes(role));
+
+/** May own a project / be picked as one of its owners (LEADER or ADMIN). */
+export const mayOwnProject = (roles: Iterable<ProductionRole>) => holdsAny(roles, projectOwnerRoles);
+/** May create projects (LEADER, ADMIN or ACCOUNT — PD-079 added ACCOUNT). */
+export const mayCreateProject = (roles: Iterable<ProductionRole>) => holdsAny(roles, projectCreatorRoles);
+/** Sees the Project page (LEADER, ADMIN, DIRECTOR, ACCOUNT); STAFF / QC do not. */
+export const seesProjectPage = (roles: Iterable<ProductionRole>) => holdsAny(roles, projectPageRoles);
+
+/** Who the owners of a NEW project are: "many" (the superadmin picks ≥ 1), "one" (Admin, Account: exactly one), "self". */
+export const projectOwnerPicks = ["self", "one", "many"] as const;
+export type ProjectOwnerPick = (typeof projectOwnerPicks)[number];
+/** What a caller may do with the owners of an EXISTING project: nothing, set the single owner, or set the whole list. */
+export const projectOwnerEdits = ["none", "one", "many"] as const;
+export type ProjectOwnerEdit = (typeof projectOwnerEdits)[number];
+
+export type ProjectViewer = { roles: Iterable<ProductionRole>; me: string; superadmin: boolean };
+
+/** The owner rule of a new project for the caller; null = they may not create projects. */
+export const newProjectOwnerPick = (viewer: Omit<ProjectViewer, "me">): ProjectOwnerPick | null => {
+  const roles = [...viewer.roles];
+  if (!mayCreateProject(roles)) {
+    return null;
+  }
+  if (viewer.superadmin) {
+    return "many";
+  }
+  return roles.includes("ADMIN") || roles.includes("ACCOUNT") ? "one" : "self";
+};
+
+export type ProjectCapabilities = { canEdit: boolean; canChangeOwner: boolean; ownerEdit: ProjectOwnerEdit; canDelete: boolean };
+
+/** What the viewer may do with a project owned by `ownerIds` (in order; empty: none yet), created by `createdById`. */
+export const projectCapabilitiesFor = (
+  viewer: ProjectViewer,
+  project: { ownerIds: readonly string[]; createdById: string | null; hasJobs: boolean }
+): ProjectCapabilities => {
+  const roles = [...viewer.roles];
+  const admin = roles.includes("ADMIN") || viewer.superadmin;
+  // Like a job's leader (SEC2-04): ownership counts only while the owner still holds LEADER / ADMIN.
+  const owns = project.ownerIds.includes(viewer.me) && mayOwnProject(roles);
+  // PD-079: an Account manages the projects they created (not their owners).
+  const createdAsAccount = project.createdById !== null && project.createdById === viewer.me && roles.includes("ACCOUNT");
+  const ownerEdit: ProjectOwnerEdit = viewer.superadmin ? "many" : admin && project.ownerIds.length <= 1 ? "one" : "none";
+  const canEdit = admin || owns || createdAsAccount;
+  return { canEdit, canChangeOwner: ownerEdit !== "none", ownerEdit, canDelete: canEdit && !project.hasJobs };
+};
+
+/**
+ * PD-078: a Leader holding neither ADMIN nor ACCOUNT creates jobs only in the projects they own (PD-079: are one of the
+ * owners of), always led by themselves, and moves a job only between their own projects. Several roles: the most
+ * permissive rule (Admin / Account: any project, the Leader pre-filled with the project's first owner holding LEADER).
+ */
+export const jobsBoundToOwnProjects = (roles: Iterable<ProductionRole>) => {
+  const list = [...roles];
+  return list.includes("LEADER") && !list.includes("ADMIN") && !list.includes("ACCOUNT");
+};
+
+export const ProjectCapabilitiesSchema = z.object({
+  canEdit: z.boolean(),
+  /** Any owner change (`ownerEdit` ≠ "none"); kept for PD-078 builds. */
+  canChangeOwner: z.boolean(),
+  /** PD-079: "many" the superadmin, "one" an Admin on a project with at most one owner, else "none" (read-only). */
+  ownerEdit: z.enum(projectOwnerEdits),
+  canDelete: z.boolean()
+});
+
 export const ProductionProjectSchema = z.object({
   id: Id,
   code: z.string(),
@@ -458,10 +564,44 @@ export const ProductionProjectSchema = z.object({
   clientId: Id.nullable(),
   clientName: z.string().nullable(),
   qcBufferHours: z.number().int(),
-  active: z.boolean()
+  active: z.boolean(),
+  /** PD-079: every owner ("Người phụ trách"), in order; empty = an older project without one. */
+  owners: z.array(UserRefSchema),
+  /** The first owner (`owners[0]`), as PD-078 sent it; null = none. */
+  owner: UserRefSchema.nullable(),
+  /** PD-078: who created it (null for projects created before PD-078) and when. */
+  createdBy: UserRefSchema.nullable(),
+  createdAt: IsoDate,
+  /** Its jobs that are not deleted (archived ones count); jobs created by a QA test account are hidden from real viewers (PD-063). */
+  jobCount: z.number().int(),
+  /** Any job row at all, the trash included (whoever created it): such a project is never deleted (409 PROJECT_HAS_JOBS). */
+  hasJobs: z.boolean(),
+  /** What the caller may do with it (projectCapabilitiesFor). */
+  capabilities: ProjectCapabilitiesSchema
 });
 export type ProductionProject = z.infer<typeof ProductionProjectSchema>;
-export const ProductionProjectCollectionSchema = z.object({ items: z.array(ProductionProjectSchema) });
+/**
+ * GET /production/projects (and the answer of every project write). `canCreate`: the caller may create projects;
+ * `ownerPick` (PD-079): how they pick the owners of a new one (newProjectOwnerPick; null when they may not create).
+ */
+export const ProductionProjectCollectionSchema = z.object({
+  items: z.array(ProductionProjectSchema),
+  canCreate: z.boolean(),
+  ownerPick: z.enum(projectOwnerPicks).nullable()
+});
+/**
+ * POST /production/projects and PATCH /production/projects/:projectId (partial). Owners: `ownerIds` (PD-079, in order) or
+ * the PD-078 single `ownerId` (= `[ownerId]`); each a member holding LEADER or ADMIN — else 400 PROJECT_OWNER_INVALID
+ * (on PATCH only the newly added ones are checked).
+ * - POST: the superadmin sends ≥ 1; an Admin or an Account exactly one (none → 400 PROJECT_OWNER_REQUIRED, several → 403
+ *   PROJECT_OWNERS_SUPERADMIN_ONLY); a Leader (without ADMIN / ACCOUNT) owns what they create (omit it or send their own
+ *   id; anyone else → 403 PROJECT_OWNER_LOCKED).
+ * - PATCH: the superadmin any list (≥ 1); an Admin one owner, only on a project with at most one (several → 403
+ *   PROJECT_OWNERS_SUPERADMIN_ONLY); anyone else 403 for any owner change. Never cleared (null / [] → 400
+ *   PROJECT_OWNER_REQUIRED); an Admin editing an older project without owner must send one, except to only switch it
+ *   active / inactive. Editing needs an owner, an Admin or the creating Account (403).
+ * - A code already used (case-insensitive) → 409 PROJECT_CODE_TAKEN.
+ */
 export const UpsertProductionProjectRequestSchema = z
   .object({
     code: SafeText().trim().min(1).max(40),
@@ -469,9 +609,24 @@ export const UpsertProductionProjectRequestSchema = z
     description: SafeText().trim().max(2000).nullable().optional(),
     clientId: Id.nullable().optional(),
     qcBufferHours: z.number().int().min(0).max(720).optional(),
-    active: z.boolean().optional()
+    active: z.boolean().optional(),
+    ownerId: Id.nullable().optional(),
+    ownerIds: z.array(Id).max(projectOwnersMax).optional()
   })
   .strict();
+export const UpdateProductionProjectRequestSchema = UpsertProductionProjectRequestSchema.partial().strict();
+export type UpsertProductionProjectRequest = z.infer<typeof UpsertProductionProjectRequestSchema>;
+export type UpdateProductionProjectRequest = z.infer<typeof UpdateProductionProjectRequestSchema>;
+
+/** The owners a request names (ownerIds, else the single ownerId), duplicates removed; undefined = not sent. */
+export const requestedProjectOwners = (input: { ownerId?: string | null | undefined; ownerIds?: readonly string[] | undefined }) =>
+  input.ownerIds !== undefined
+    ? [...new Set(input.ownerIds)]
+    : input.ownerId !== undefined
+      ? input.ownerId === null
+        ? []
+        : [input.ownerId]
+      : undefined;
 
 export const ProcessSchema = z.object({ id: Id, name: z.string(), isQc: z.boolean(), sortOrder: z.number().int(), active: z.boolean() });
 export type Process = z.infer<typeof ProcessSchema>;

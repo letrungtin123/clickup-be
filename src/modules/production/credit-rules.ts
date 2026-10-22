@@ -307,7 +307,7 @@ export const parseCreditCsv = (csv: string): { rows: ParsedCreditRow[]; errors: 
     }
     const key = `${projectCode.toUpperCase()}|${processName.toLowerCase()}`;
     if (seen.has(key)) {
-      lineErrors.push(`trùng cặp dự án × quy trình với dòng ${seen.get(key)}`);
+      lineErrors.push(`trùng cặp Project × quy trình với dòng ${seen.get(key)}`);
     } else {
       seen.set(key, record.line);
     }
@@ -350,7 +350,7 @@ export const importCreditRules = async (
 
   for (const row of rows) {
     if (!projects.has(row.projectCode.toUpperCase()) && !input.createMissing) {
-      errors.push({ line: row.line, message: `Dự án "${row.projectCode}" chưa có (bật "Tạo mới nếu chưa có" để tạo).` });
+      errors.push({ line: row.line, message: `Project "${row.projectCode}" chưa có (bật "Tạo mới nếu chưa có" để tạo).` });
     }
     if (!processes.has(row.processName.toLowerCase()) && !input.createMissing) {
       errors.push({ line: row.line, message: `Quy trình "${row.processName}" chưa có.` });
@@ -365,7 +365,8 @@ export const importCreditRules = async (
     if (!projects.has(code)) {
       const created = (
         await sql<{ id: string }[]>`
-          INSERT INTO production.projects (organization_id, code, name) VALUES (${input.organizationId}, ${row.projectCode}, ${row.projectCode})
+          INSERT INTO production.projects (organization_id, code, name, created_by)
+          VALUES (${input.organizationId}, ${row.projectCode}, ${row.projectCode}, ${input.userId})
           RETURNING id
         `
       )[0]!;

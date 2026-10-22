@@ -113,25 +113,28 @@ beforeEach(() => {
   clearProductionConfigCache();
 });
 
-describe("GET /production/jobs/facets leaderTabs — the Tất cả / Tôi quản lý tabs (PD-073)", () => {
-  it("a Leader gets both counts in one query: every filter but the leader one; mine = led by the caller", async () => {
+describe("GET /production/jobs/facets leaderTabs — the Tất cả / Tôi quản lý tabs (PD-073; PD-078: projects I own)", () => {
+  it("a Leader gets both counts in one query: every filter but the scope one; mine = jobs of the projects the caller owns", async () => {
     db.state.handler = (call) => (call.text.includes("AS all_count") ? [{ all_count: 30, mine_count: 12 }] : undefined);
     const facets = JobFacetsSchema.parse(
       await getJobFacets(
         contextWith(["LEADER"]),
-        JobQuerySchema.parse({ leaderId: me, projectId, q: "axp", late: "true", tagId, personId: person, jobStatusId: statusNew })
+        JobQuerySchema.parse({ scope: "mine", leaderId: other, projectId, q: "axp", late: "true", tagId, personId: person, jobStatusId: statusNew })
       )
     );
     expect(facets.leaderTabs).toEqual({ all: 30, mine: 12 });
     const tabs = callsLike(/AS all_count/);
     expect(tabs).toHaveLength(1);
     const text = tabs[0]!.text;
-    expect(text).toContain("SELECT count(*)::int AS all_count, count(*) FILTER (WHERE j.leader_id = $)::int AS mine_count FROM production.jobs j");
-    // `j.leader_id = me` never matches a job without a leader: those stay under "Tất cả" only.
+    expect(text).toContain(
+      "SELECT count(*)::int AS all_count, count(*) FILTER (WHERE EXISTS ( SELECT 1 FROM production.project_owners op WHERE op.organization_id = j.organization_id AND op.project_id = j.project_id AND op.user_id = $ ))::int AS mine_count FROM production.jobs j"
+    );
     expect(tabs[0]!.values[0]).toBe(me);
-    // The leader filter is left out; every other one applies (project, search, late, tags, person, statuses, archived).
-    expect(text).not.toContain("AND j.leader_id = $");
-    expect(text).not.toContain("AND j.leader_id IS NULL");
+    // Strictly the projects I own: leading a job is not enough.
+    expect(text).not.toContain("FILTER (WHERE j.leader_id");
+    // The scope filter is left out (only the FILTER clause names the owner); every other one applies — the Leader chip too.
+    expect(text.split("op.user_id = $").length - 1).toBe(1);
+    expect(text).toContain("AND j.leader_id = $");
     expect(text).toContain("AND j.project_id = $");
     expect(text).toContain("immutable_unaccent");
     expect(text).toContain("t.is_late");
@@ -139,15 +142,16 @@ describe("GET /production/jobs/facets leaderTabs — the Tất cả / Tôi quả
     expect(text).toContain("j.job_status_id = ANY($::uuid[])");
     expect(text).toContain("j.archived_at IS NULL");
     expect(text).toContain(createdByTest);
-    expect(tabs[0]!.values).toEqual(expect.arrayContaining([projectId, person]));
-    // The months (and the list) still follow the active tab: the leader filter applies there.
-    expect(monthsCall()!.text).toContain("AND j.leader_id = $");
+    expect(tabs[0]!.values).toEqual(expect.arrayContaining([projectId, person, other]));
+    // The months (and the list) follow the active tab: the scope filter applies there.
+    expect(monthsCall()!.text).toContain("AND EXISTS ( SELECT 1 FROM production.project_owners op");
 
-    // "Tất cả" (no leader filter) and someone else's / no leader: the same counts query, without a leader filter.
-    for (const leaderId of [undefined, other, "none"]) {
+    // "Tất cả" (no scope, or scope=all): the same counts query; the months are not narrowed to my projects.
+    for (const scope of [undefined, "all"]) {
       db.state.calls = [];
-      await getJobFacets(contextWith(["LEADER"]), JobQuerySchema.parse(leaderId ? { leaderId } : {}));
-      expect(tabsCall()!.text).not.toMatch(/AND j\.leader_id (= \$|IS NULL)/);
+      await getJobFacets(contextWith(["LEADER"]), JobQuerySchema.parse(scope ? { scope } : {}));
+      expect(tabsCall()!.text.split("op.user_id = $").length - 1).toBe(1);
+      expect(monthsCall()!.text).not.toContain("production.project_owners op");
     }
   });
 
@@ -158,24 +162,17 @@ describe("GET /production/jobs/facets leaderTabs — the Tất cả / Tôi quả
     expect(text).not.toContain("j.archived_at IS NULL");
   });
 
-  it("null (no tabs, no extra query) for anyone not holding LEADER — ADMIN, ACCOUNT, QC, STAFF, a superadmin without it", async () => {
-    for (const context of [
-      contextWith(["ADMIN"]),
-      contextWith(["ACCOUNT"]),
-      contextWith(["QC"]),
-      contextWith(["STAFF"]),
-      contextWith(["DIRECTOR"]),
-      contextWith([], { superadmin: true })
-    ]) {
+  it("null (no tabs, no extra query) for anyone holding neither LEADER nor ADMIN; ADMIN and the superadmin get them (PD-078)", async () => {
+    for (const context of [contextWith(["ACCOUNT"]), contextWith(["QC"]), contextWith(["STAFF"]), contextWith(["DIRECTOR"])]) {
       db.state.calls = [];
-      const facets = JobFacetsSchema.parse(await getJobFacets(context, JobQuerySchema.parse({ leaderId: me })));
+      const facets = JobFacetsSchema.parse(await getJobFacets(context, JobQuerySchema.parse({ scope: "mine" })));
       expect(facets.leaderTabs).toBeNull();
       expect(tabsCall()).toBeUndefined();
     }
-    // The superadmin holding every role (LEADER among them) gets them.
     db.state.handler = (call) => (call.text.includes("AS all_count") ? [{ all_count: 4, mine_count: 0 }] : undefined);
-    const facets = await getJobFacets(contextWith(["LEADER", "ACCOUNT", "QC", "STAFF"], { superadmin: true }), JobQuerySchema.parse({}));
-    expect(facets.leaderTabs).toEqual({ all: 4, mine: 0 });
+    for (const context of [contextWith(["ADMIN"]), contextWith([], { superadmin: true }), contextWith(["LEADER", "ACCOUNT", "QC", "STAFF"], { superadmin: true })]) {
+      expect((await getJobFacets(context, JobQuerySchema.parse({}))).leaderTabs).toEqual({ all: 4, mine: 0 });
+    }
   });
 
   it("the facets contract requires the field (null allowed)", () => {
@@ -188,7 +185,7 @@ describe("GET /production/jobs/facets leaderTabs — the Tất cả / Tôi quả
 describe("POST /production/jobs — the Leader is required (PD-073)", () => {
   const base = { projectId, code: "Batch 9", receivedAt: "2026-10-12T00:00:00+07:00", deadline: "2026-10-13T23:59:00+07:00" };
   const roles = (userRoles: Record<string, string[]>) => (call: Call) => {
-    if (call.text.startsWith("SELECT 1 FROM production.projects")) return [{ "?column?": 1 }];
+    if (call.text.includes("AS owned FROM production.projects p")) return [{ owned: true }];
     if (call.text.includes("array_agg(ur.role_code)")) {
       const ids = call.values.find(Array.isArray) as string[];
       return ids.filter((id) => userRoles[id]).map((id) => ({ user_id: id, roles: userRoles[id], superadmin: false }));
@@ -243,7 +240,7 @@ describe("PATCH /production/jobs/:id — the Leader cannot be cleared; older job
   /** The locked job row (and the re-read after the UPDATE), my lines (with "own"), the roles of a named leader. */
   const editQueries = (leaderId: string | null) => (call: Call) => {
     if (call.text.startsWith("SELECT code, name, project_id, leader_id")) return [jobEditRow(leaderId)];
-    if (call.text.startsWith("SELECT 1 FROM production.projects")) return [{ "?column?": 1 }];
+    if (call.text.includes("AS owned FROM production.projects p")) return [{ owned: true }];
     if (call.text.startsWith("SELECT assignee_id FROM production.tasks")) return [{ assignee_id: me }];
     if (call.text.includes("array_agg(ur.role_code)")) return [{ user_id: other, roles: ["LEADER"], superadmin: false }];
     return undefined;
@@ -265,8 +262,9 @@ describe("PATCH /production/jobs/:id — the Leader cannot be cleared; older job
     expect(updated()).toBe(0);
     expect(await patch(["ACCOUNT"], { code: "B2", leaderId: null })).toMatchObject({ code: "JOB_LEADER_REQUIRED", status: 400 });
     expect(updated()).toBe(0);
-    // Another Leader is fine; so are edits of a led job that leave the Leader alone.
-    expect(await patch(["LEADER"], { leaderId: other })).not.toMatchObject({ code: "JOB_LEADER_REQUIRED" });
+    // Another Leader is fine (for whoever may name another one — PD-078: not a Leader bound to their own projects, see
+    // pd078.test.ts); so are edits of a led job that leave the Leader alone.
+    expect(await patch(["ACCOUNT"], { leaderId: other })).not.toMatchObject({ code: "JOB_LEADER_REQUIRED" });
     expect(updated()).toBe(1);
     expect(await patch(["LEADER"], { code: "B2", deadline: "2026-10-06T00:00:00Z" })).not.toMatchObject({ code: "JOB_LEADER_REQUIRED" });
     expect(updated()).toBe(1);
@@ -292,7 +290,7 @@ describe("PATCH /production/jobs/:id — the Leader cannot be cleared; older job
     }
     expect((await patch(["ACCOUNT"], { deadline: "2026-10-06T00:00:00Z" }))?.message).toBe("Job chưa có Leader — chọn Leader để lưu thay đổi.");
     // Naming the Leader with the edit saves it.
-    expect(await patch(["LEADER"], { code: "B2", leaderId: other })).not.toMatchObject({ code: "JOB_LEADER_REQUIRED" });
+    expect(await patch(["ACCOUNT"], { code: "B2", leaderId: other })).not.toMatchObject({ code: "JOB_LEADER_REQUIRED" });
     expect(updated()).toBe(1);
     expect(callsLike(/^UPDATE production\.jobs SET/)[0]!.values).toContain(other);
   });

@@ -527,7 +527,7 @@ describe("PD-045 job status that needs every line checked", () => {
 
   it("a new job cannot start in such a status (no line yet)", async () => {
     db.state.handler = (call) =>
-      call.text.startsWith("SELECT 1 FROM production.projects") ? [{ "?column?": 1 }]
+      call.text.includes("AS owned FROM production.projects p") ? [{ owned: true }]
       : call.text.includes("array_agg(ur.role_code)") ? [{ user_id: leader, roles: ["LEADER"], superadmin: false }]
       : statusQueries([])(call);
     // PD-073: the Leader is required.

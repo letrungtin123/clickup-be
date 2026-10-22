@@ -20,6 +20,7 @@ import { loadReportCustomFields, runReport, type ReportCustomFields } from "./re
 import { getScoreBoard } from "./scores.service.js";
 import { percentKpi } from "./scoring.js";
 import { businessDay } from "./time.js";
+import { jobCodeHeaderHint, workLogHeaders } from "./worklog-headers.js";
 
 /**
  * Excel exports (SPEC Phase 5 §4 and §6): the report builder (data + config sheets), the filtered job
@@ -84,7 +85,7 @@ const filterLookups: Record<NamedFilter, { label: string; query: (sql: QuerySql,
       sql<{ name: string }[]>`SELECT name FROM production.teams WHERE organization_id = ${organizationId} AND id = ANY(${ids}::uuid[]) ORDER BY 1`
   },
   project: {
-    label: "Dự án",
+    label: "Project",
     query: (sql, organizationId, ids) =>
       sql<{ name: string }[]>`SELECT code AS name FROM production.projects WHERE organization_id = ${organizationId} AND id = ANY(${ids}::uuid[]) ORDER BY 1`
   },
@@ -300,10 +301,10 @@ export const personCells = (share: JobPersonShare | null): Record<string, CellVa
  * reads like the company's own work log. New columns go at the end; the 11 work-log columns keep their order.
  */
 export const workLogColumns: SheetColumn[] = [
-  { header: "Nhân viên thực hiện", key: "assignee", width: 24 },
-  { header: "Dự án", key: "project", width: 12 },
-  { header: "Gói công việc (Folder hình, hỏi leader nếu không rõ)", key: "jobCode", width: 48 },
-  { header: "Quy trình", key: "process", width: 18 },
+  { header: workLogHeaders.staff[0], key: "assignee", width: 24 },
+  { header: workLogHeaders.project[0], key: "project", width: 12 },
+  { header: `${workLogHeaders.pkg[0]} (${jobCodeHeaderHint})`, key: "jobCode", width: 48 },
+  { header: workLogHeaders.process[0], key: "process", width: 18 },
   { header: "Ngày nhận", key: "assignedAt", width: 12, numFmt: numberFormats.day },
   { header: "Ngày giao", key: "deadline", width: 12, numFmt: numberFormats.day },
   { header: "Ca làm việc", key: "shift", width: 14 },
@@ -416,13 +417,14 @@ export const exportJobs = async (context: AccessContext, res: Response, query: J
 
   const filters: [string, CellValue][] = [];
   if (query.q) filters.push(["Tìm kiếm", query.q]);
-  if (query.projectId) filters.push(["Lọc – Dự án", await nameOf("project", query.projectId)]);
+  if (query.projectId) filters.push(["Lọc – Project", await nameOf("project", query.projectId)]);
   if (query.jobStatusId?.length) {
     const names = await sql<{ name: string }[]>`
       SELECT name FROM production.job_statuses WHERE organization_id = ${org(context)} AND id = ANY(${query.jobStatusId}::uuid[]) ORDER BY position
     `;
     filters.push(["Lọc – Trạng thái", names.map((row) => row.name).join(", ")]);
   }
+  if (query.scope === "mine") filters.push(["Phạm vi", "Tôi quản lý (Project do tôi phụ trách)"]);
   if (query.leaderId) filters.push(["Lọc – Leader", query.leaderId === noLeaderFilter ? "Chưa có leader" : await nameOf("user", query.leaderId)]);
   if (personName) {
     filters.push(["Lọc – Nhân viên (người làm)", personName]);
@@ -467,9 +469,9 @@ export const exportJobs = async (context: AccessContext, res: Response, query: J
   }
 
   const columns: SheetColumn[] = [
-    { header: "Gói công việc", key: "code", width: 48 },
+    { header: "Job Code", key: "code", width: 48 },
     { header: "Tên job", key: "name", width: 32 },
-    { header: "Dự án", key: "project", width: 14 },
+    { header: "Project", key: "project", width: 14 },
     { header: "Client", key: "client", width: 20 },
     { header: "Leader", key: "leader", width: 22 },
     { header: "Người làm", key: "workers", width: 40 },

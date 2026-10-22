@@ -348,7 +348,7 @@ describe("job list, create job and the work-entry picker (PD-038)", () => {
     // PD-073: the Leader is required (here the creator, holding LEADER).
     const base = { projectId, code: "Batch 9", leaderId: me, receivedAt: "2026-10-12T00:00:00+07:00", deadline: "2026-10-13T23:59:00+07:00" };
     db.state.handler = (call) =>
-      call.text.startsWith("SELECT 1 FROM production.projects") ? [{ "?column?": 1 }]
+      call.text.includes("AS owned FROM production.projects p") ? [{ owned: true }]
       : call.text.includes("array_agg(ur.role_code)") ? [{ user_id: me, roles: ["LEADER"], superadmin: false }]
       : call.text.startsWith("INSERT INTO production.jobs") ? [{ id: jobId }]
       : jobQueries()(call);
@@ -411,7 +411,12 @@ describe("job list, create job and the work-entry picker (PD-038)", () => {
             }
           ]
         : undefined;
-    expect(await failure(listJobOptions(contextWith(["ACCOUNT"]), JobOptionsQuerySchema.parse({ projectId })))).toMatchObject({ code: "FORBIDDEN", status: 403 });
+    // PD-079: an Account never enters tasks, whatever its "create" (TASK_CREATE_FORBIDDEN); a role whose create is none: FORBIDDEN.
+    expect(await failure(listJobOptions(contextWith(["ACCOUNT"]), JobOptionsQuerySchema.parse({ projectId })))).toMatchObject({
+      code: "TASK_CREATE_FORBIDDEN",
+      status: 403
+    });
+    expect(await failure(listJobOptions(contextWith(["DIRECTOR"]), JobOptionsQuerySchema.parse({ projectId })))).toMatchObject({ code: "FORBIDDEN", status: 403 });
   });
 
   it("options: STAFF has create none by default (PD-047) — refused", async () => {

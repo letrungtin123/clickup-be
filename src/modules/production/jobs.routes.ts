@@ -40,9 +40,11 @@ import {
   WorkEntryResultSchema
 } from "../../contracts/production-jobs.js";
 import { withCustomFieldFilters } from "../../contracts/production-catalog.js";
+import { ProductionOverviewQuerySchema, ProductionOverviewSchema } from "../../contracts/production-overview.js";
 import { requireSupabaseUser } from "../../middleware/auth.js";
 import { handle, param } from "./http.js";
 import { openJobChat } from "./job-chat.service.js";
+import { getProductionOverview } from "./overview.service.js";
 import {
   changeJobStatus,
   closeFeedback,
@@ -78,6 +80,12 @@ import { createWorkEntry } from "./work-entries.service.js";
 export const createProductionJobRoutes = (): ExpressRouter => {
   const routes = Router();
   routes.use("/production", requireSupabaseUser);
+
+  // "Tổng quan" (PD-076): stats, charts, project progress and due lines of the visible jobs.
+  routes.get(
+    "/production/overview",
+    handle(async (context, req) => ProductionOverviewSchema.parse(await getProductionOverview(context, ProductionOverviewQuerySchema.parse(req.query))))
+  );
 
   // Jobs
   routes.get("/production/jobs", handle(async (context, req) => JobPageSchema.parse(await listJobs(context, JobQuerySchema.parse(withCustomFieldFilters(req.query))))));

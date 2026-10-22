@@ -229,7 +229,7 @@ export const ProductionTaskSchema = z.object({
     canRequestQty: z.boolean(),
     /** Approve / reject the open quantity request: the job's Leader, or "update: all" (PD-044). */
     canDecideQtyRequest: z.boolean(),
-    /** Split part of the line off as a subtask (PD-044): its assignee, Leader or "update: all"; a NORMAL work line before Done. */
+    /** Split part of the line off as a subtask (PD-044): its assignee, Leader or "update: all" (PD-079: not through ACCOUNT alone); a NORMAL work line before Done. */
     canCreateSubtask: z.boolean(),
     /** Delete the line (its points are reversed, PD-036). A subtask gives its quantity back to its line. */
     canDelete: z.boolean()
@@ -581,9 +581,9 @@ export const JobDetailSchema = JobSummarySchema.extend({
     canEdit: z.boolean(),
     /** Change the leader ("update: all"). */
     canChangeLeader: z.boolean(),
-    /** Add lines ("Chia task", "create" not none). */
+    /** Add lines ("Chia task", "create" not none; PD-079: never through ACCOUNT alone, see taskJobScopes). */
     canSplit: z.boolean(),
-    /** "create: own": the lines added are mine only (the assignee is fixed to me). */
+    /** "create: own" (from the task-creating roles): the lines added are mine only (the assignee is fixed to me). */
     splitOwnOnly: z.boolean(),
     /** Delete the job and all its lines ("delete: all", or "own" when every line is mine). */
     canDelete: z.boolean(),
@@ -610,6 +610,16 @@ export type JobDetail = z.infer<typeof JobDetailSchema>;
 /** `leaderId=none`: jobs without a leader ("Chưa có leader", PD-035). */
 export const noLeaderFilter = "none";
 
+/**
+ * PD-078 — the "Tất cả" / "Tôi quản lý" tabs of the Job list and Tổng quan (`scope`): "mine" = every job (so every task /
+ * subtask) of the projects the caller owns ("Người phụ trách"; PD-079: is ONE OF the owners of), strictly — a job they
+ * lead in someone else's project is not in it; "all" (or nothing) = no such filter. The tabs are shown to holders of LEADER or ADMIN; a LEADER lands on
+ * "mine", an Admin without LEADER on "all".
+ */
+export const jobListScopes = ["all", "mine"] as const;
+export const JobListScopeSchema = z.enum(jobListScopes);
+export type JobListScope = z.infer<typeof JobListScopeSchema>;
+
 /** Orders of GET /production/jobs (`sort`). */
 export const jobListSorts = ["created", "received"] as const;
 export type JobListSort = (typeof jobListSorts)[number];
@@ -618,7 +628,13 @@ export const JobQuerySchema = z.object({
   projectId: Id.optional(),
   /** Manual job statuses (PD-038): any of them (`jobStatusId=a&jobStatusId=b`). */
   jobStatusId: IdListQuerySchema,
+  /**
+   * The job's Leader — a link ("Job tôi phụ trách → Xem tất cả", member admin, `production.leader_removed`) shown as a
+   * removable "Leader: …" chip; `none` = jobs without a leader. Since PD-078 it is not the "Tôi quản lý" tab (`scope`).
+   */
   leaderId: z.union([Id, z.literal(noLeaderFilter)]).optional(),
+  /** PD-078 tab: "mine" = the jobs of the projects the caller owns (jobListScopes); "all" / absent = no filter. */
+  scope: JobListScopeSchema.optional(),
   /**
    * "Mọi nhân viên" (per-person view): only jobs where this person is the ASSIGNEE of at least one task (QC-only
    * involvement does not count); rows then carry `personShare` and the first page `personTotals`.
@@ -649,11 +665,12 @@ export type JobQuery = z.infer<typeof JobQuerySchema>;
  * GET /production/jobs/facets (PD-067) — counts for the job List view, with the GET /production/jobs query and the same
  * visibility rules (view scope, PD-063 test accounts; `sort` / `cursor` / `limit` ignored):
  * - `months`: jobs per month of "Ngày nhận" in the organization's timezone ("YYYY-MM", newest first), every filter applied;
- * - `projects`: jobs per project with every filter BUT the project one (the sidebar lists each project that has matching
- *   jobs, by code), plus the filtered project itself when it has none (count 0) so the selection stays visible.
- * - `leaderTabs` (PD-073, the "Tất cả" / "Tôi quản lý" tabs): jobs with every filter BUT the leader one (`all`), and
- *   among them those whose Leader is the caller (`mine`; jobs without a leader are not); null when the caller does not
- *   hold the production role LEADER (no tabs).
+ * - `projects`: PD-078 — EVERY project of the organization (active and inactive, with or without jobs, in both tabs),
+ *   sorted by code (Vietnamese collation, numbers in numeric order), each with its jobs for every filter BUT the project
+ *   one (0 allowed), whether it is active (the app folds the inactive ones) and its owner.
+ * - `leaderTabs` (the "Tất cả" / "Tôi quản lý" tabs, PD-073; meaning changed by PD-078): jobs with every filter BUT the
+ *   `scope` one (`all`), and among them those of the projects the caller owns (`mine`); null when the caller holds
+ *   neither LEADER nor ADMIN (no tabs).
  * Per-person view (`personId`): the person's jobs, like the list.
  */
 export const JobLeaderTabsSchema = z.object({ all: z.number().int(), mine: z.number().int() });
@@ -661,17 +678,32 @@ export type JobLeaderTabs = z.infer<typeof JobLeaderTabsSchema>;
 export const JobFacetsSchema = z.object({
   months: z.array(z.object({ month: z.string().regex(/^\d{4}-\d{2}$/), count: z.number().int() })),
   projects: z.array(
-    z.object({ projectId: Id, code: z.string(), name: z.string(), active: z.boolean(), count: z.number().int() })
+    z.object({
+      projectId: Id,
+      code: z.string(),
+      name: z.string(),
+      active: z.boolean(),
+      count: z.number().int(),
+      /** The first owner ("Người phụ trách", PD-078); null = none yet. */
+      ownerId: Id.nullable(),
+      /** PD-079: every owner, in order (empty = none yet). */
+      ownerIds: z.array(Id)
+    })
   ),
   leaderTabs: JobLeaderTabsSchema.nullable()
 });
 export type JobFacets = z.infer<typeof JobFacetsSchema>;
 
-/** "Gói công việc": typed by the user, usually a folder path or batch name. */
+/** "Job Code" (PD-078; "Gói công việc" before): typed by the user, usually a folder path or batch name. */
 export const jobCodeMaxLength = 300;
 export const JobCodeSchema = SafeText().trim().min(1).max(jobCodeMaxLength);
 
 const JobFields = {
+  /**
+   * The job's Project: an active one (else 400 PROJECT_NOT_FOUND). PD-078: a Leader holding neither ADMIN nor ACCOUNT
+   * (`jobsBoundToOwnProjects`) only in a project they own (PD-079: one of whose owners they are; else 403
+   * PROJECT_NOT_OWNED) — on PATCH they move a job only from one of their projects to another.
+   */
   projectId: Id,
   code: JobCodeSchema,
   name: SafeText().trim().max(300).nullable().optional(),
@@ -681,6 +713,8 @@ const JobFields = {
    * - PATCH: null → 400 JOB_LEADER_REQUIRED (it cannot be cleared). An older job without a leader keeps working, but a
    *   PATCH that edits its own fields (code, name, projectId, receivedAt, deadline, totalImages, driveLink) must also
    *   name one — see UpdateJobRequestSchema.
+   * PD-078: a Leader bound to their own projects (`jobsBoundToOwnProjects`) names only themselves (another id → 403
+   * JOB_LEADER_LOCKED, on POST and when a PATCH changes it).
    * Kept nullable / optional in the schema so the refusal carries that code and message.
    */
   leaderId: Id.nullable().optional(),

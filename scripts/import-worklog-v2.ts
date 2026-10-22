@@ -1,8 +1,9 @@
 /**
  * LOCAL DEVELOPMENT ONLY — imports work logs in the company's "v2" layout (PD-035): one sheet, one row per task,
- *   Nhân viên thực hiện · Dự án · Gói công việc · Quy trình · Ngày nhận · Ngày giao · Ca làm việc · Số lượng ·
+ *   Nhân viên thực hiện · Project · Job Code · Quy trình · Ngày nhận · Ngày giao · Ca làm việc · Số lượng ·
  *   Hình lỗi · Giờ OT · Ghi chú
- * Rows with the same Dự án + Gói công việc form one job whose code is the package text (PD-035). Every row is a line
+ * ("Project" / "Job Code" were "Dự án" / "Gói công việc" before PD-078: both spellings are read, see worklog-headers.ts.)
+ * Rows with the same Project + Job Code form one job whose code is the package text (PD-035). Every row is a line
  * (task), Checking rows included: the checker's QC points come from their own Checking line (PD-037), so no line gets
  * a QC assignment. Every line is replayed through the real workflow engine with the dates of its row (Ngày nhận
  * 00:00, Done 17:00 on Ngày giao) and ends Delivered; Hình lỗi is stored for review only; Giờ OT and Ghi chú are
@@ -30,6 +31,7 @@ import { type AccessContext, resolveAccessContext } from "../src/modules/access/
 import { loadTask, loadWorkflowModel, type TaskRow } from "../src/modules/production/jobs.repo.js";
 import { insertTasks, moveTask, moveTasks, settleJob } from "../src/modules/production/tasks.service.js";
 import { statusByCode, type Workflow } from "../src/modules/production/workflow.js";
+import { workLogColumnOf, workLogHeaders, type WorkLogColumn } from "../src/modules/production/worklog-headers.js";
 import { assertDevDatabase, isLoopbackUrl } from "./lib/dev-guard.js";
 
 const args = new Map<string, string>();
@@ -84,19 +86,6 @@ const text = (value: unknown) => (value === null || value === undefined ? "" : v
 const day = (value: unknown) => (value instanceof Date && !Number.isNaN(value.getTime()) ? value.toISOString().slice(0, 10) : null);
 const numberOrNull = (value: unknown) => (typeof value === "number" && Number.isFinite(value) ? value : null);
 
-const HEADERS = {
-  staff: "Nhân viên thực hiện",
-  project: "Dự án",
-  pkg: "Gói công việc",
-  process: "Quy trình",
-  received: "Ngày nhận",
-  delivered: "Ngày giao",
-  shift: "Ca làm việc",
-  qty: "Số lượng",
-  errors: "Hình lỗi",
-  ot: "Giờ OT",
-  note: "Ghi chú"
-} as const;
 
 export type Row = {
   source: string;
@@ -121,18 +110,16 @@ const readWorkbook = async (file: string): Promise<Row[]> => {
   await workbook.xlsx.readFile(file);
   const name = file.split(/[\\/]/).pop()!;
   for (const sheet of workbook.worksheets) {
-    const columns = new Map<keyof typeof HEADERS, number>();
+    const columns = new Map<WorkLogColumn, number>();
     sheet.getRow(1).eachCell((cell, column) => {
-      const header = text(cellValue(cell));
-      for (const [key, label] of Object.entries(HEADERS) as [keyof typeof HEADERS, string][]) {
-        if (header === label || header.startsWith(`${label} (`)) columns.set(key, column);
-      }
+      const key = workLogColumnOf(text(cellValue(cell)));
+      if (key) columns.set(key, column);
     });
-    if (columns.size < Object.keys(HEADERS).length) continue;
+    if (columns.size < Object.keys(workLogHeaders).length) continue;
     const rows: Row[] = [];
     sheet.eachRow({ includeEmpty: false }, (row, line) => {
       if (line === 1) return;
-      const get = (key: keyof typeof HEADERS) => cellValue(row.getCell(columns.get(key)!));
+      const get = (key: WorkLogColumn) => cellValue(row.getCell(columns.get(key)!));
       const staff = text(get("staff"));
       if (!staff) return;
       rows.push({
@@ -155,7 +142,7 @@ const readWorkbook = async (file: string): Promise<Row[]> => {
     });
     return rows;
   }
-  throw new Error(`${name}: no sheet with the v2 work-log header (${Object.values(HEADERS).join(", ")})`);
+  throw new Error(`${name}: no sheet with the v2 work-log header (${Object.values(workLogHeaders).map((labels) => labels.join(" / ")).join(", ")})`);
 };
 
 // Plan -----------------------------------------------------------------------------------------------------------------

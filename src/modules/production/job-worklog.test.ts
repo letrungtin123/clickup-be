@@ -828,8 +828,8 @@ describe("work-log fields (PD-035)", () => {
   it("the work-log export has exactly the Excel's 11 headers in order, then Trạng thái, QC, Trạng thái job and Link chia việc", () => {
     expect(workLogColumns.map((column) => column.header)).toEqual([
       "Nhân viên thực hiện",
-      "Dự án",
-      "Gói công việc (Folder hình, hỏi leader nếu không rõ)",
+      "Project",
+      "Job Code (Folder hình, hỏi leader nếu không rõ)",
       "Quy trình",
       "Ngày nhận",
       "Ngày giao",

@@ -1,6 +1,7 @@
 import {
   effectiveJobScopes,
   jobPermissionRoles,
+  taskJobScopes,
   type JobPermissionMatrix,
   type JobPermissionScope,
   type JobScopes,
@@ -22,6 +23,17 @@ import { loadSettings } from "./catalog.service.js";
 /** The caller's scopes (settings are cached per organization). */
 export const loadJobScopes = async (sql: QuerySql, context: AccessContext): Promise<JobScopes> =>
   effectiveJobScopes(productionRolesOf(context), (await loadSettings(sql, context.organization.id)).jobPermissions);
+
+/**
+ * PD-079: the caller's scopes for creating TASKS ("Chia task", "Nhập Task", subtasks): those of their roles other than
+ * ACCOUNT (taskJobScopes) — an Account creates Projects and Job Codes only.
+ */
+export const loadTaskScopes = async (sql: QuerySql, context: AccessContext): Promise<JobScopes> =>
+  taskJobScopes(productionRolesOf(context), (await loadSettings(sql, context.organization.id)).jobPermissions);
+
+/** PD-079: 403 for an Account trying to create a task. */
+export const taskCreateForbidden = () =>
+  new AppError("TASK_CREATE_FORBIDDEN", "Account không tạo task — chỉ tạo Project và Job Code.", 403);
 
 /** Roles whose `action` scope is "all" (ADMIN always), e.g. who sees every job. */
 export const rolesWithAll = (matrix: JobPermissionMatrix, action: keyof JobScopes): ProductionRole[] => [
@@ -108,6 +120,17 @@ export const assertLinesCreatable = (scopes: JobScopes, assigneeIds: readonly st
   if (errors.length > 0) {
     throw new AppError("FORBIDDEN", errors.join(" "), 403);
   }
+};
+
+/**
+ * New lines ("Chia task", "Nhập Task") with the task-creating scopes (loadTaskScopes, PD-079): an Account whose other roles
+ * create nothing gets 403 TASK_CREATE_FORBIDDEN; anyone else the rules of assertLinesCreatable.
+ */
+export const assertTaskLinesCreatable = (context: AccessContext, taskScopes: JobScopes, assigneeIds: readonly string[]) => {
+  if (taskScopes.create === "none" && productionRolesOf(context).has("ACCOUNT")) {
+    throw taskCreateForbidden();
+  }
+  assertLinesCreatable(taskScopes, assigneeIds, context.user.id);
 };
 
 export const forbidden = (message: string) => new AppError("FORBIDDEN", message, 403);

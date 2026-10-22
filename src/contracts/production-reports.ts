@@ -97,7 +97,7 @@ export type ReportValueFormat = "text" | "day" | "week" | "month" | "points" | "
 export const reportDimensionInfo: Record<ReportDimension, { label: string; kind: "entity" | "enum" | "time"; format: ReportValueFormat }> = {
   user: { label: "Nhân viên", kind: "entity", format: "text" },
   team: { label: "Team", kind: "entity", format: "text" },
-  project: { label: "Dự án", kind: "entity", format: "text" },
+  project: { label: "Project", kind: "entity", format: "text" },
   client: { label: "Client", kind: "entity", format: "text" },
   process: { label: "Quy trình", kind: "entity", format: "text" },
   shift: { label: "Ca", kind: "entity", format: "text" },

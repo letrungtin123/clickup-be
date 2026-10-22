@@ -193,32 +193,31 @@ describe("GET /production/jobs/facets (PD-067)", () => {
     expect(months.text).toContain("j.archived_at IS NULL");
   });
 
-  it("counts jobs per project without the project filter; the filtered project stays listed (count 0)", async () => {
+  it("lists EVERY project (PD-078) with its jobs for every filter but the project one, 0 allowed, sorted by code", async () => {
     db.state.handler = (call) =>
       call.text.startsWith("WITH counts AS")
         ? [
-            { project_id: projectA, code: "AXP", name: "Axon", active: true, count: 0 },
-            { project_id: projectB, code: "BRX", name: "Brix", active: false, count: 7 }
+            { project_id: projectB, code: "BRX", name: "Brix", active: false, owner_ids: null, count: 7 },
+            { project_id: projectA, code: "AXP", name: "Axon", active: true, owner_ids: [person], count: 0 }
           ]
         : undefined;
     const facets = JobFacetsSchema.parse(
       await getJobFacets(contextWith(["LEADER"]), JobQuerySchema.parse({ projectId: projectA, jobStatusId: "99999999-9999-4999-8999-999999999999" }))
     );
     expect(facets.projects).toEqual([
-      { projectId: projectA, code: "AXP", name: "Axon", active: true, count: 0 },
-      { projectId: projectB, code: "BRX", name: "Brix", active: false, count: 7 }
+      { projectId: projectA, code: "AXP", name: "Axon", active: true, count: 0, ownerId: person, ownerIds: [person] },
+      { projectId: projectB, code: "BRX", name: "Brix", active: false, count: 7, ownerId: null, ownerIds: [] }
     ]);
     const projects = projectsCall()!;
     expect(projects.text).not.toContain("AND j.project_id = $");
     expect(projects.text).toContain("j.job_status_id = ANY($::uuid[])");
     expect(projects.text).toContain("GROUP BY j.project_id");
     expect(projects.text).toContain("LEFT JOIN counts c ON c.project_id = p.id");
-    expect(projects.text).toContain("AND (c.project_id IS NOT NULL OR p.id = $)");
-    expect(projects.text).toContain("ORDER BY lower(p.code), p.code, p.id");
-
-    db.state.calls = [];
-    await getJobFacets(contextWith(["LEADER"]), JobQuerySchema.parse({}));
-    expect(projectsCall()!.text).toContain("AND (c.project_id IS NOT NULL )");
+    // No "has matching jobs" condition any more: projects without jobs are listed too (those of a QA test account hidden).
+    expect(projects.text).not.toContain("c.project_id IS NOT NULL");
+    expect(projects.text).toContain("AND (NOT EXISTS (SELECT 1 FROM public.app_users test_au WHERE test_au.id = p.created_by AND test_au.is_test_account) OR p.id = $)");
+    // PD-079: every owner, in order.
+    expect(projects.text).toContain("SELECT array_agg(po.user_id ORDER BY po.position, po.added_at) FROM production.project_owners po");
   });
 
   it("follows the list's visibility: view scope, test accounts (PD-063), the per-person view", async () => {

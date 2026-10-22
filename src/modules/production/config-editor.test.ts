@@ -82,7 +82,10 @@ const outcome = async (promise: Promise<unknown>) => {
   }
 };
 
-/** Every configuration write behind its route (PD-050), with a body good enough to reach the database. */
+/**
+ * Every configuration write behind its route (PD-050), with a body good enough to reach the database. Projects left the
+ * configuration with PD-078 (Leaders and Admins create them; pd078.test.ts).
+ */
 const writes: [string, (context: AccessContext) => Promise<unknown>][] = [
   ["PATCH /production/settings (job permission matrix included)", (c) => catalog.updateSettings(c, { scoresPublic: true })],
   ["PATCH /production/members/:userId", (c) => catalog.updateMember(c, other, { teamId: null })],
@@ -90,8 +93,6 @@ const writes: [string, (context: AccessContext) => Promise<unknown>][] = [
   ["PATCH /production/teams/:teamId", (c) => catalog.upsertTeam(c, someId, { name: "Team", active: false })],
   ["POST /production/clients", (c) => catalog.upsertClient(c, null, { name: "Client" })],
   ["PATCH /production/clients/:clientId", (c) => catalog.upsertClient(c, someId, { name: "Client" })],
-  ["POST /production/projects", (c) => catalog.upsertProject(c, null, { code: "P1", name: "Project" })],
-  ["PATCH /production/projects/:projectId", (c) => catalog.upsertProject(c, someId, { code: "P1", name: "Project" })],
   ["POST /production/processes", (c) => catalog.upsertProcess(c, null, { name: "Retouch" })],
   ["PATCH /production/processes/:processId", (c) => catalog.upsertProcess(c, someId, { name: "Retouch" })],
   ["DELETE /production/processes/:processId", (c) => catalog.deleteProcess(c, someId)],

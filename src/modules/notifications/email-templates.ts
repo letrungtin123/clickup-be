@@ -157,7 +157,7 @@ const contextOf = (notification: EmailNotification) => {
     hasTask: taskCode !== null,
     note: text(payload.note),
     productionFacts: [
-      ["Gói công việc", jobCode],
+      ["Job Code", jobCode],
       ["Task", taskCode !== null ? `#${taskCode}` : null],
       ["Công đoạn", text(payload.processName)],
       ["Số lượng", qty !== null ? `${qty} tấm` : null],
@@ -260,9 +260,9 @@ const templates = {
   "production.job_leader_assigned": (n, c) => ({
     headline: `${c.actor} đã giao bạn làm Leader job ${c.jobCode}`,
     facts: [
-      ["Gói công việc", c.jobCode],
+      ["Job Code", c.jobCode],
       ["Tên job", text(n.payload.jobName)],
-      ["Dự án", text(n.payload.projectCode)],
+      ["Project", text(n.payload.projectCode)],
       ["Deadline", formatDateTime(n.payload.deadline)]
     ]
   }),
@@ -330,7 +330,7 @@ const templates = {
     return {
       headline: `${c.actor} đã đổi trạng thái job ${c.jobCode}${from && to ? `: ${from} → ${to}` : to ? ` sang ${to}` : ""}`,
       facts: [
-        ["Gói công việc", c.jobCode],
+        ["Job Code", c.jobCode],
         ["Tên job", text(n.payload.jobName)],
         ["Trạng thái", from && to ? `${from} → ${to}` : to]
       ]
@@ -339,7 +339,7 @@ const templates = {
   "production.feedback": (n, c) => ({
     headline: `Có feedback từ khách hàng cho job ${c.jobCode}`,
     facts: [
-      ["Gói công việc", c.jobCode],
+      ["Job Code", c.jobCode],
       ["Loại feedback", text(n.payload.feedbackType)]
     ],
     excerpt: c.note ?? c.excerpt

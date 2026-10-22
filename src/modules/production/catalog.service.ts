@@ -15,7 +15,6 @@ import type {
   UpsertClientRequestSchema,
   UpsertCustomFieldRequestSchema,
   UpsertProcessRequestSchema,
-  UpsertProductionProjectRequestSchema,
   UpsertShiftRequestSchema,
   UpsertStatusRequestSchema,
   UpsertTagRequestSchema,
@@ -29,7 +28,8 @@ import {
   effectiveJobScopes,
   normalizeFeaturePermissions,
   normalizeJobPermissions,
-  productionRoleCodes
+  productionRoleCodes,
+  taskJobScopes
 } from "../../contracts/production-catalog.js";
 import { closeDayOfPeriod, kpiPeriodOfDay } from "../../contracts/production-scores.js";
 import { getSql } from "../../db/client.js";
@@ -53,6 +53,7 @@ import {
 import { cachedConfig, invalidateProductionConfig } from "./catalog-cache.js";
 import { deleteCreditRuleVersion, importCreditRules, listRuleHistory, listRulesAt, setCreditRule, startNewVersion } from "./credit-rules.js";
 import { matchesCustomFieldFilters, resolveCustomFieldFilters, resolveCustomValues, setEntityTags } from "./custom-fields.js";
+import { selectProductionProjects, toProductionProject } from "./projects.service.js";
 import { businessDay, isValidDay } from "./time.js";
 import { systemStatusCodes } from "./workflow.js";
 
@@ -225,6 +226,8 @@ export const getProductionMe = async (context: AccessContext): Promise<Productio
     isAdmin: isProductionAdmin(context),
     teamId: profile?.team_id ?? null,
     jobPermissions: effectiveJobScopes(roles, settings.jobPermissions),
+    // PD-079: "Nhập Task" / "Chia task" / "Tạo nhanh task" — ACCOUNT's "create" covers Projects and Job Codes only.
+    taskCreate: taskJobScopes(roles, settings.jobPermissions).create,
     features: [...featuresOf(context, settings.featurePermissions)],
     settings: {
       // The close day of the current period (a new day applies from the next period, G15); kpiCloseDays has them all.
@@ -513,71 +516,7 @@ export const upsertClient = async (context: AccessContext, id: string | null, in
 
 // Projects ----------------------------------------------------------------------------------------
 
-type ProjectRow = {
-  id: string;
-  code: string;
-  name: string;
-  description: string | null;
-  client_id: string | null;
-  client_name: string | null;
-  qc_buffer_hours: number;
-  active: boolean;
-};
-const toProject = (row: ProjectRow) => ({
-  id: row.id,
-  code: row.code,
-  name: row.name,
-  description: row.description,
-  clientId: row.client_id,
-  clientName: row.client_name,
-  qcBufferHours: row.qc_buffer_hours,
-  active: row.active
-});
-
-export const selectProductionProjects = (sql: QuerySql, organizationId: string) => sql<ProjectRow[]>`
-  SELECT p.id, p.code, p.name, p.description, p.client_id, c.name AS client_name, p.qc_buffer_hours, p.active
-  FROM production.projects p
-  LEFT JOIN production.clients c ON c.id = p.client_id AND c.organization_id = p.organization_id
-  WHERE p.organization_id = ${organizationId}
-  ORDER BY p.active DESC, upper(p.code)
-  LIMIT 2000
-`;
-
-export const listProjects = async (context: AccessContext) => {
-  assertProductionMember(context);
-  return { items: (await selectProductionProjects(getSql(), org(context))).map(toProject) };
-};
-
-export const upsertProject = async (context: AccessContext, id: string | null, input: In<typeof UpsertProductionProjectRequestSchema>) => {
-  assertConfigEditor(context);
-  const sql = getSql();
-  if (input.clientId) {
-    const client = await sql`SELECT 1 FROM production.clients WHERE organization_id = ${org(context)} AND id = ${input.clientId}`;
-    if (client.length === 0) {
-      throw new AppError("CLIENT_NOT_FOUND", "Không tìm thấy client.", 404);
-    }
-  }
-  if (id) {
-    const rows = await sql`
-      UPDATE production.projects
-      SET code = ${input.code}, name = ${input.name},
-          description = CASE WHEN ${input.description !== undefined} THEN ${input.description?.trim() || null} ELSE description END,
-          client_id = CASE WHEN ${input.clientId !== undefined} THEN ${input.clientId ?? null}::uuid ELSE client_id END,
-          qc_buffer_hours = coalesce(${input.qcBufferHours ?? null}, qc_buffer_hours),
-          active = coalesce(${input.active ?? null}, active)
-      WHERE organization_id = ${org(context)} AND id = ${id} RETURNING id
-    `;
-    if (rows.length === 0) {
-      throw new AppError("PROJECT_NOT_FOUND", "Không tìm thấy dự án.", 404);
-    }
-  } else {
-    await sql`
-      INSERT INTO production.projects (organization_id, code, name, description, client_id, qc_buffer_hours)
-      VALUES (${org(context)}, ${input.code}, ${input.name}, ${input.description?.trim() || null}, ${input.clientId ?? null}, ${input.qcBufferHours ?? 0})
-    `;
-  }
-  return await listProjects(context);
-};
+// PD-078: projects have an owner and their own rules (Leaders create them) — see projects.service.ts.
 
 // Processes & shifts ------------------------------------------------------------------------------
 
@@ -985,14 +924,14 @@ export const getCreditMatrix = async (context: AccessContext, at: string | undef
   }
   const sql = getSql();
   const [projects, processes, rules, money] = await Promise.all([
-    selectProductionProjects(sql, org(context)),
+    selectProductionProjects(sql, context),
     listProcesses(context),
     listRulesAt(sql, org(context), day),
     canSeeMoney(context)
   ]);
   return {
     at: day,
-    projects: projects.map(toProject),
+    projects: projects.map((row) => toProductionProject(context, row)),
     processes: processes.items,
     rules: rules.map((rule) => stripMoney(rule, money))
   };
@@ -1011,7 +950,7 @@ const assertCatalogPair = async (sql: QuerySql, organizationId: string, projectI
       AND pr.organization_id = ${organizationId} AND pr.id = ${processId}
   `;
   if (rows.length === 0) {
-    throw new AppError("CATALOG_NOT_FOUND", "Không tìm thấy dự án hoặc quy trình.", 404);
+    throw new AppError("CATALOG_NOT_FOUND", "Không tìm thấy Project hoặc quy trình.", 404);
   }
 };
 

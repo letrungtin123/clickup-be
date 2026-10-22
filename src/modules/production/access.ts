@@ -80,10 +80,11 @@ export const assertProductionRole = (context: AccessContext, ...roles: Productio
 export const assertProductionAdmin = (context: AccessContext) => assertProductionRole(context, "ADMIN");
 
 /**
- * Every write of "Cấu hình Photo Retouch" — settings (job permission matrix included), clients, projects, processes,
+ * Every write of "Cấu hình Photo Retouch" — settings (job permission matrix included), clients, processes,
  * shifts, credit rules, statuses / order / transitions, job statuses, custom fields, tags, teams, members' production
  * profile, whitelist, production users, KPI targets and the KPI close run — is the organization superadmin's alone
- * (PD-049, PD-050). Production members get 403 (reads keep their own rules); non-members still get 404.
+ * (PD-049, PD-050). Production members get 403 (reads keep their own rules); non-members still get 404. Projects left
+ * the configuration with PD-078 (Leaders and Admins create and edit them, projects.service.ts).
  */
 export const assertConfigEditor = (context: AccessContext) => {
   assertProductionMember(context);

@@ -228,7 +228,7 @@ describe("templates", () => {
       link: `${base}/production/jobs/${ids.job}`
     });
     expect(section.facts).toEqual([
-      { label: "Gói công việc", value: "JOB-2026-001" },
+      { label: "Job Code", value: "JOB-2026-001" },
       { label: "Tên job", value: "Lô ảnh tháng 10" },
       { label: "Trạng thái", value: "Đang làm → Đã xong" }
     ]);

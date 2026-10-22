@@ -4,8 +4,8 @@ import type { CreateSubtaskRequest, ProductionTask } from "../../contracts/produ
 import { getSql } from "../../db/client.js";
 import { AppError } from "../../lib/app-error.js";
 import type { AccessContext } from "../access/access-context.js";
-import { assertProductionMember } from "./access.js";
-import { forbidden, subtaskManageAllowed } from "./job-permissions.js";
+import { assertProductionMember, productionRolesOf } from "./access.js";
+import { forbidden, loadTaskScopes, subtaskManageAllowed, taskCreateForbidden } from "./job-permissions.js";
 import { isSubtaskRow } from "./jobs.repo.js";
 import { publishProductionChange } from "./realtime.js";
 import { maxSubtaskSeq, taskCode } from "./task-codes.js";
@@ -50,7 +50,12 @@ export const createProductionSubtask = async (context: AccessContext, taskId: st
     if (task.process_is_qc) {
       throw new AppError("SUBTASK_PARENT_INVALID", "Task Checking không tách subtask.", 400);
     }
-    if (!subtaskManageAllowed({ leads: relation.isJobLeader, updateScope: scopes.update, mine })) {
+    // PD-079: "update: all" splits subtasks only through the task-creating roles (an Account alone creates no task).
+    const taskScopes = await loadTaskScopes(tx, context);
+    if (!subtaskManageAllowed({ leads: relation.isJobLeader, updateScope: taskScopes.update, mine })) {
+      if (productionRolesOf(context).has("ACCOUNT") && subtaskManageAllowed({ leads: relation.isJobLeader, updateScope: scopes.update, mine })) {
+        throw taskCreateForbidden();
+      }
       throw forbidden("Chỉ người làm task, Leader của job hoặc người có quyền sửa mọi công việc mới tách được subtask.");
     }
     if (task.done_at !== null || task.closed_at !== null) {

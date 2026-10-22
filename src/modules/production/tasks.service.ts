@@ -57,12 +57,13 @@ import {
 import { enqueueProductionEvents, taskAssignedEvent, taskQtyEvent, taskQtyFilledEvent, taskStatusEvent } from "./notifications.js";
 import { publishProductionChange } from "./realtime.js";
 import {
-  assertLinesCreatable,
+  assertTaskLinesCreatable,
   doneQtyEditAllowed,
   forbidden,
   lineAllowed,
   qtyAssignedEditAllowed,
   qtyFillAllowed,
+  loadTaskScopes,
   subtaskDeleteAllowed,
   subtaskManageAllowed
 } from "./job-permissions.js";
@@ -912,9 +913,10 @@ export const createProductionTasks = async (context: AccessContext, jobId: strin
   const sql = getSql();
   const result = await sql.begin(async (tx) => {
     const job = await loadJobForTasks(tx, organizationId, jobId, true);
-    // PD-036 "create": lines for anyone ("all") or only for myself ("own"), on a job I may see.
-    const scopes = await assertJobVisible(tx, context, jobId);
-    assertLinesCreatable(scopes, lines.map((line) => line.assigneeId), context.user.id);
+    // PD-036 "create": lines for anyone ("all") or only for myself ("own"), on a job I may see. PD-079: with the
+    // task-creating scopes — an Account alone creates no task (403 TASK_CREATE_FORBIDDEN).
+    await assertJobVisible(tx, context, jobId);
+    assertTaskLinesCreatable(context, await loadTaskScopes(tx, context), lines.map((line) => line.assigneeId));
     const workflow = await loadWorkflowModel(tx, organizationId);
     const created = await insertTasks(tx, context, workflow, job, lines, { kind: "NORMAL", feedbackId: null, defaultParentId: null });
     await settleJob(tx, organizationId, workflow, jobId);

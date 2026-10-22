@@ -18,6 +18,7 @@ import type {
   UpdateJobStatusRequest
 } from "../../contracts/production-jobs.js";
 import type { JobScopes } from "../../contracts/production-catalog.js";
+import { jobsBoundToOwnProjects } from "../../contracts/production-catalog.js";
 import { jobLeaderBoundFields, noLeaderFilter } from "../../contracts/production-jobs.js";
 import { getSql } from "../../db/client.js";
 import { AppError } from "../../lib/app-error.js";
@@ -32,10 +33,12 @@ import { syncJobChat } from "./job-chat.service.js";
 import {
   forbidden,
   jobStatusChangeAllowed,
+  loadTaskScopes,
   jobViewAllowed,
   jobViewSql,
   leadsForView,
   loadJobScopes,
+  taskCreateForbidden,
   wholeJobAllowed,
   workEntryAllowed
 } from "./job-permissions.js";
@@ -151,11 +154,57 @@ const assertJobDates = (receivedAt: Date, deadline: Date) => {
   }
 };
 
-const assertProject = async (sql: QuerySql, organizationId: string, projectId: string) => {
-  const rows = await sql`SELECT 1 FROM production.projects WHERE organization_id = ${organizationId} AND id = ${projectId} AND active`;
-  if (rows.length === 0) {
-    throw new AppError("PROJECT_NOT_FOUND", "Dự án không tồn tại hoặc đã ngừng.", 400);
+/** An active project of the organization (else 400 PROJECT_NOT_FOUND) and its owner (PD-078). */
+/** Whether `userId` is one of the owners of the project `p` (PD-079: production.project_owners). */
+const ownerOfProjectSql = (sql: QuerySql, userId: string) => sql`EXISTS (
+  SELECT 1 FROM production.project_owners po
+  WHERE po.organization_id = p.organization_id AND po.project_id = p.id AND po.user_id = ${userId}
+)`;
+
+/** An active project of the organization (else 400 PROJECT_NOT_FOUND) and whether `me` is one of its owners (PD-078/079). */
+const assertProject = async (sql: QuerySql, organizationId: string, projectId: string, me: string) => {
+  const row = (
+    await sql<{ owned: boolean }[]>`
+      SELECT ${ownerOfProjectSql(sql, me)} AS owned
+      FROM production.projects p WHERE p.organization_id = ${organizationId} AND p.id = ${projectId} AND p.active
+    `
+  )[0];
+  if (!row) {
+    throw new AppError("PROJECT_NOT_FOUND", "Project không tồn tại hoặc đã ngừng hoạt động.", 400);
   }
+  return { owned: row.owned };
+};
+
+/** Whether `me` is one of the owners of a project (false: not, or no such project). */
+const ownsProject = async (sql: QuerySql, organizationId: string, projectId: string, me: string) =>
+  (
+    await sql<{ owned: boolean }[]>`
+      SELECT ${ownerOfProjectSql(sql, me)} AS owned
+      FROM production.projects p WHERE p.organization_id = ${organizationId} AND p.id = ${projectId}
+    `
+  )[0]?.owned ?? false;
+
+/**
+ * PD-078 — a Leader holding neither ADMIN nor ACCOUNT (`jobsBoundToOwnProjects`) works only in the projects they own: 403
+ * PROJECT_NOT_OWNED for any other project, 403 JOB_LEADER_LOCKED for any Leader but themselves. Pure (unit tested).
+ */
+export const projectNotOwned = (message = "Bạn chỉ tạo được job trong Project do mình phụ trách.") =>
+  new AppError("PROJECT_NOT_OWNED", message, 403);
+export const jobLeaderLocked = (message = "Leader chỉ tạo được job do chính mình phụ trách.") => new AppError("JOB_LEADER_LOCKED", message, 403);
+
+/**
+ * PD-078 "Tôi quản lý": the job `j` belongs to a project the caller owns — PD-079: is ONE OF the owners of (strictly an
+ * owner — leading a job in someone else's project does not count). Expects `j` = production.jobs.
+ */
+export const ownedProjectJobSql = (sql: QuerySql, context: AccessContext) => sql`EXISTS (
+  SELECT 1 FROM production.project_owners op
+  WHERE op.organization_id = j.organization_id AND op.project_id = j.project_id AND op.user_id = ${context.user.id}
+)`;
+
+/** PD-078: who gets the "Tất cả" / "Tôi quản lý" tabs — holders of LEADER or ADMIN (they can own projects). */
+export const hasScopeTabs = (context: AccessContext) => {
+  const roles = productionRolesOf(context);
+  return roles.has("LEADER") || roles.has("ADMIN");
 };
 
 // Job history ---------------------------------------------------------------------------------------------
@@ -234,9 +283,10 @@ export const jobEditChanges = (
 /**
  * Job-row filters of GET /production/jobs (everything but the keyset cursor), on `j`. The person filter is
  * optional so the per-person totals can reach the tasks through the assignee index instead. Jobs created by a
- * temporary QA test account are left out for a viewer who is not one (PD-063).
+ * temporary QA test account are left out for a viewer who is not one (PD-063). Also the job visibility of "Tổng quan"
+ * (PD-076, overview.service.ts).
  */
-const jobListFilterSql = (
+export const jobListFilterSql = (
   sql: QuerySql,
   context: AccessContext,
   scopes: JobScopes,
@@ -245,13 +295,13 @@ const jobListFilterSql = (
   {
     person,
     project = true,
-    leader = true
+    scope = true
   }: {
     person: boolean;
     /** false: ignore `projectId` (the facets' project counts, PD-067). */
     project?: boolean;
-    /** false: ignore `leaderId` (the facets' "Tất cả" / "Tôi quản lý" counts, PD-073). */
-    leader?: boolean;
+    /** false: ignore `scope` (the facets' "Tất cả" / "Tôi quản lý" counts, PD-078). */
+    scope?: boolean;
   }
 ) => {
   const like = query.q ? `%${escapeLike(query.q.toLowerCase())}%` : null;
@@ -262,7 +312,8 @@ const jobListFilterSql = (
     ${query.includeArchived ? sql`` : sql`AND j.archived_at IS NULL`}
     ${project && query.projectId ? sql`AND j.project_id = ${query.projectId}` : sql``}
     ${query.jobStatusId?.length ? sql`AND j.job_status_id = ANY(${query.jobStatusId}::uuid[])` : sql``}
-    ${!leader ? sql`` : query.leaderId === noLeaderFilter ? sql`AND j.leader_id IS NULL` : query.leaderId ? sql`AND j.leader_id = ${query.leaderId}` : sql``}
+    ${query.leaderId === noLeaderFilter ? sql`AND j.leader_id IS NULL` : query.leaderId ? sql`AND j.leader_id = ${query.leaderId}` : sql``}
+    ${scope && query.scope === "mine" ? sql`AND ${ownedProjectJobSql(sql, context)}` : sql``}
     ${
       // "Mọi nhân viên": works on at least one task (assignee only; QC-only jobs do not count).
       person && query.personId
@@ -408,12 +459,19 @@ const decodeReceivedCursor = (cursor: string | undefined) => {
   return { received, created, id };
 };
 
+/** Project codes in the sidebar's order (PD-078): Vietnamese collation, case / accents ignored, numbers in numeric order. */
+const projectCodeCollator = new Intl.Collator("vi", { numeric: true, sensitivity: "base" });
+export const compareProjectCodes = (a: { code: string; projectId: string }, b: { code: string; projectId: string }) =>
+  projectCodeCollator.compare(a.code, b.code) || (a.code < b.code ? -1 : a.code > b.code ? 1 : 0) || (a.projectId < b.projectId ? -1 : 1);
+
 /**
  * GET /production/jobs/facets (PD-067): the counts of the job List view — jobs per month of "Ngày nhận" (organization
- * timezone, every filter applied) and per project (every filter but the project one; the filtered project is kept with
- * 0). PD-073, for a caller holding LEADER only: the "Tất cả" / "Tôi quản lý" tab counts — every filter but the leader
- * one, `mine` = led by the caller (one count with a FILTER clause). Same filters and visibility as listJobs (view scope,
- * PD-063 test accounts, per-person view); one grouped query each over the organization's job rows.
+ * timezone, every filter applied) and per project. PD-078: EVERY project (active or not, with or without jobs; those
+ * created by a QA test account hidden from real viewers, PD-063), sorted by code (compareProjectCodes), each with its jobs
+ * for every filter but the project one (0 allowed) and its owner. The "Tất cả" / "Tôi quản lý" tab counts, for a caller
+ * holding LEADER or ADMIN: every filter but the `scope` one, `mine` = jobs of the projects the caller owns (one count
+ * with a FILTER clause). Same filters and visibility as listJobs (view scope, PD-063 test accounts, per-person view); one
+ * grouped query each over the organization's job rows.
  */
 export const getJobFacets = async (context: AccessContext, query: JobQuery): Promise<JobFacets> => {
   assertProductionMember(context);
@@ -427,8 +485,7 @@ export const getJobFacets = async (context: AccessContext, query: JobQuery): Pro
     resolveCustomFieldFilters(sql, organizationId, "JOB", query.cf),
     loadSettings(sql, organizationId)
   ]);
-  // The tabs are a Leader's view: holding LEADER itself (the organization superadmin holds every role), not ADMIN.
-  const leaderTabs = productionRolesOf(context).has("LEADER");
+  const scopeTabs = hasScopeTabs(context);
   const [months, projects, tabs] = await Promise.all([
     sql<{ month: string; count: number }[]>`
       SELECT to_char(j.received_at AT TIME ZONE ${settings.timezone}::text, 'YYYY-MM') AS month, count(*)::int AS count
@@ -437,32 +494,46 @@ export const getJobFacets = async (context: AccessContext, query: JobQuery): Pro
       GROUP BY 1
       ORDER BY 1 DESC
     `,
-    sql<{ project_id: string; code: string; name: string; active: boolean; count: number }[]>`
+    sql<{ project_id: string; code: string; name: string; active: boolean; owner_ids: string[] | null; count: number }[]>`
       WITH counts AS (
         SELECT j.project_id, count(*)::int AS count
         FROM production.jobs j
         WHERE ${jobListFilterSql(sql, context, scopes, query, plans, { person: true, project: false })}
         GROUP BY j.project_id
       )
-      SELECT p.id AS project_id, p.code, p.name, p.active, coalesce(c.count, 0)::int AS count
+      SELECT p.id AS project_id, p.code, p.name, p.active, coalesce(c.count, 0)::int AS count,
+        (
+          SELECT array_agg(po.user_id ORDER BY po.position, po.added_at)
+          FROM production.project_owners po WHERE po.organization_id = p.organization_id AND po.project_id = p.id
+        ) AS owner_ids
       FROM production.projects p
       LEFT JOIN counts c ON c.project_id = p.id
       WHERE p.organization_id = ${organizationId}
-        AND (c.project_id IS NOT NULL ${query.projectId ? sql`OR p.id = ${query.projectId}` : sql``})
+        AND (${visibleUserIdSql(sql, context, sql`p.created_by`)} ${query.projectId ? sql`OR p.id = ${query.projectId}` : sql``})
       ORDER BY lower(p.code), p.code, p.id
     `,
-    leaderTabs
+    scopeTabs
       ? sql<{ all_count: number; mine_count: number }[]>`
-          SELECT count(*)::int AS all_count, count(*) FILTER (WHERE j.leader_id = ${context.user.id})::int AS mine_count
+          SELECT count(*)::int AS all_count, count(*) FILTER (WHERE ${ownedProjectJobSql(sql, context)})::int AS mine_count
           FROM production.jobs j
-          WHERE ${jobListFilterSql(sql, context, scopes, query, plans, { person: true, leader: false })}
+          WHERE ${jobListFilterSql(sql, context, scopes, query, plans, { person: true, scope: false })}
         `
       : Promise.resolve(null)
   ]);
   const tabCounts = tabs?.[0];
   return {
     months: months.map((row) => ({ month: row.month, count: row.count })),
-    projects: projects.map((row) => ({ projectId: row.project_id, code: row.code, name: row.name, active: row.active, count: row.count })),
+    projects: projects
+      .map((row) => ({
+        projectId: row.project_id,
+        code: row.code,
+        name: row.name,
+        active: row.active,
+        count: row.count,
+        ownerId: row.owner_ids?.[0] ?? null,
+        ownerIds: row.owner_ids ?? []
+      }))
+      .sort(compareProjectCodes),
     leaderTabs: tabs ? { all: tabCounts?.all_count ?? 0, mine: tabCounts?.mine_count ?? 0 } : null
   };
 };
@@ -485,10 +556,11 @@ export const getJobDetail = async (context: AccessContext, jobId: string, sql: Q
   if (!row) {
     throw jobNotFound();
   }
-  const [rows, feedbackRows, scopes] = await Promise.all([
+  const [rows, feedbackRows, scopes, taskScopes] = await Promise.all([
     sql<TaskRow[]>`${taskSelectSql(sql)} WHERE t.organization_id = ${organizationId} AND t.job_id = ${jobId} ORDER BY t.created_at, t.number`,
     selectFeedbacks(sql, organizationId, jobId),
-    loadJobScopes(sql, context)
+    loadJobScopes(sql, context),
+    loadTaskScopes(sql, context)
   ]);
   // Every row, each line followed by its subtasks (PD-044; the FE nests them by parentTaskId).
   const taskRows = withSubtasksAfterLines(rows);
@@ -512,8 +584,9 @@ export const getJobDetail = async (context: AccessContext, jobId: string, sql: Q
     capabilities: {
       canEdit,
       canChangeLeader: canEdit && scopes.update === "all",
-      canSplit: !archived && scopes.create !== "none",
-      splitOwnOnly: scopes.create === "own",
+      // PD-079: adding lines follows the task-creating scopes (an Account alone adds none).
+      canSplit: !archived && taskScopes.create !== "none",
+      splitOwnOnly: taskScopes.create === "own",
       canDelete: !archived && wholeJobAllowed(scopes.delete, assignees, me),
       // Retired with the separate feedback feature (PD-045).
       canFeedback: false,
@@ -532,7 +605,9 @@ export const getJobDetail = async (context: AccessContext, jobId: string, sql: Q
  * POST /production/jobs — a job without lines ("create: all", PD-036; "Nhập công việc" adds lines to existing jobs only,
  * PD-038). PD-045: a new job has no line yet, so a status with requiresAllChecked ("Đã xong") is refused (409
  * JOB_NOT_READY "Job chưa có task nào."). PD-073: the Leader is required (400 JOB_LEADER_REQUIRED "Chọn Leader cho
- * job."); they must hold LEADER (400 LEADER_INVALID).
+ * job."); they must hold LEADER (400 LEADER_INVALID). PD-078: a Leader holding neither ADMIN nor ACCOUNT
+ * (`jobsBoundToOwnProjects`) creates jobs only in a project they own (403 PROJECT_NOT_OWNED) and led by themselves (403
+ * JOB_LEADER_LOCKED); Admin / Account: any active project, any Leader.
  */
 export const createJob = async (context: AccessContext, input: CreateJobRequest) => {
   assertProductionMember(context);
@@ -546,12 +621,19 @@ export const createJob = async (context: AccessContext, input: CreateJobRequest)
   if (!leaderId) {
     throw jobLeaderRequired();
   }
+  const bound = jobsBoundToOwnProjects(productionRolesOf(context));
+  if (bound && leaderId !== context.user.id) {
+    throw jobLeaderLocked();
+  }
   const receivedAt = new Date(input.receivedAt);
   const deadline = new Date(input.deadline);
   assertJobDates(receivedAt, deadline);
   const manualTotal = input.totalImages !== undefined && input.totalImages !== null;
   const jobId = await sql.begin(async (tx) => {
-    await assertProject(tx, organizationId, input.projectId);
+    const project = await assertProject(tx, organizationId, input.projectId, context.user.id);
+    if (bound && !project.owned) {
+      throw projectNotOwned();
+    }
     await assertLeader(tx, organizationId, leaderId);
     const customValues = await resolveCustomValues(tx, organizationId, "JOB", input.customValues, { enforceRequired: true });
     // PD-038: the chosen "Trạng thái", otherwise the first status by position (filled by the jobs_default_job_status trigger).
@@ -594,6 +676,11 @@ export const jobLeaderNeeded = (input: UpdateJobRequest, currentLeaderId: string
   return !leaderAfter && jobLeaderBoundFields.some((field) => input[field] !== undefined);
 };
 
+/**
+ * PATCH /production/jobs/:jobId. PD-078: a Leader bound to their own projects (`jobsBoundToOwnProjects`) moves a job only
+ * from a project they own to another one they own (403 PROJECT_NOT_OWNED) and names only themselves as its Leader (403
+ * JOB_LEADER_LOCKED); their other edits follow the job permission matrix as before.
+ */
 export const updateJob = async (context: AccessContext, jobId: string, input: UpdateJobRequest) => {
   assertProductionMember(context);
   const organizationId = context.organization.id;
@@ -625,8 +712,20 @@ export const updateJob = async (context: AccessContext, jobId: string, input: Up
         input.leaderId === null ? "Job phải có Leader — chỉ đổi sang Leader khác." : "Job chưa có Leader — chọn Leader để lưu thay đổi."
       );
     }
+    // PD-078: a Leader bound to their own projects moves a job only between projects they own, and names only themselves.
+    const bound = jobsBoundToOwnProjects(productionRolesOf(context));
+    const projectMove = input.projectId !== undefined && input.projectId !== job.project_id;
+    if (bound && projectMove && !(await ownsProject(tx, organizationId, job.project_id, context.user.id))) {
+      throw projectNotOwned("Job này thuộc Project không do bạn phụ trách — bạn không chuyển được sang Project khác.");
+    }
+    if (bound && input.leaderId && input.leaderId !== job.leader_id && input.leaderId !== context.user.id) {
+      throw jobLeaderLocked("Leader chỉ đặt được chính mình làm Leader của job.");
+    }
     if (input.projectId) {
-      await assertProject(tx, organizationId, input.projectId);
+      const project = await assertProject(tx, organizationId, input.projectId, context.user.id);
+      if (bound && projectMove && !project.owned) {
+        throw projectNotOwned("Bạn chỉ chuyển được job sang Project do mình phụ trách.");
+      }
     }
     if (input.leaderId && input.leaderId !== job.leader_id) {
       await assertLeader(tx, organizationId, input.leaderId);
@@ -778,7 +877,12 @@ export const listJobOptions = async (context: AccessContext, query: JobOptionsQu
   assertProductionMember(context);
   const sql = getSql();
   const organizationId = context.organization.id;
-  if (!workEntryAllowed((await loadJobScopes(sql, context)).create)) {
+  // PD-079: the picker of "Nhập Task" follows the task-creating scopes (an Account alone enters no task).
+  const taskCreate = (await loadTaskScopes(sql, context)).create;
+  if (!workEntryAllowed(taskCreate)) {
+    if (productionRolesOf(context).has("ACCOUNT")) {
+      throw taskCreateForbidden();
+    }
     throw forbidden("Bạn không có quyền nhập công việc.");
   }
   const like = query.q ? `%${escapeLike(query.q.toLowerCase())}%` : null;

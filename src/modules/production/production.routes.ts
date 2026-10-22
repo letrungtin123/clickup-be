@@ -43,6 +43,7 @@ import {
   UpsertClientRequestSchema,
   UpsertCustomFieldRequestSchema,
   UpsertProcessRequestSchema,
+  UpdateProductionProjectRequestSchema,
   UpsertProductionProjectRequestSchema,
   UpsertShiftRequestSchema,
   UpsertStatusRequestSchema,
@@ -69,7 +70,6 @@ import {
   listCustomFields,
   listMembers,
   listProcesses,
-  listProjects,
   listShifts,
   listTags,
   listTeams,
@@ -85,13 +85,13 @@ import {
   upsertClient,
   upsertCustomField,
   upsertProcess,
-  upsertProject,
   upsertShift,
   upsertStatus,
   upsertTag,
   upsertTeam
 } from "./catalog.service.js";
 import { createJobStatus, deleteJobStatus, listJobStatuses, reorderJobStatuses, updateJobStatus } from "./job-statuses.service.js";
+import { createProject, deleteProject, listProjects, updateProject } from "./projects.service.js";
 
 const DayQuery = z.object({ at: z.string().optional() });
 const HistoryQuery = z.object({ projectId: z.string().uuid(), processId: z.string().uuid() });
@@ -127,7 +127,7 @@ const EmailParam = z.string().trim().toLowerCase().email().max(254);
  * Production (Photo Retouch) catalog — SPEC Phase 0–1. Every handler checks production roles
  * itself (PD-011): non-members get 404, members without the role get 403. Every write here is
  * configuration, edited by the organization superadmin only (PD-050, `assertConfigEditor`) — except
- * the personal notification preferences.
+ * the personal notification preferences and the projects (PD-078, projects.service.ts).
  */
 export const createProductionRoutes = (): ExpressRouter => {
   const routes = Router();
@@ -185,13 +185,13 @@ export const createProductionRoutes = (): ExpressRouter => {
     )
   );
 
-  // Projects
+  // Projects (PD-078: owned by a Leader / Admin, created by Leaders and Admins — not configuration any more)
   routes.get("/production/projects", handle(async (context) => ProductionProjectCollectionSchema.parse(await listProjects(context))));
   routes.post(
     "/production/projects",
     handle(
       async (context, req) =>
-        ProductionProjectCollectionSchema.parse(await upsertProject(context, null, UpsertProductionProjectRequestSchema.parse(req.body))),
+        ProductionProjectCollectionSchema.parse(await createProject(context, UpsertProductionProjectRequestSchema.parse(req.body))),
       201
     )
   );
@@ -199,13 +199,13 @@ export const createProductionRoutes = (): ExpressRouter => {
     "/production/projects/:projectId",
     handle(async (context, req) =>
       ProductionProjectCollectionSchema.parse(
-        await upsertProject(
-          context,
-          param(req, "projectId"),
-          patchBody(UpsertProductionProjectRequestSchema, byId((await listProjects(context)).items, param(req, "projectId")), req.body)
-        )
+        await updateProject(context, param(req, "projectId"), UpdateProductionProjectRequestSchema.parse(req.body ?? {}))
       )
     )
+  );
+  routes.delete(
+    "/production/projects/:projectId",
+    handle(async (context, req) => ProductionProjectCollectionSchema.parse(await deleteProject(context, param(req, "projectId"))))
   );
 
   // Processes & shifts

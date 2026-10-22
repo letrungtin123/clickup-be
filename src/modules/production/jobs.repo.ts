@@ -25,6 +25,7 @@ import {
   leadsForView,
   lineAllowed,
   loadJobScopes,
+  loadTaskScopes,
   ownJobsSql,
   qtyAssignedEditAllowed,
   qtyFillAllowed,
@@ -391,7 +392,11 @@ export const assertTaskVisible = async (
 };
 
 /** The caller's access to tasks, for their capabilities (toProductionTask). */
-export type TaskAccess = { scopes: JobScopes; userId: string };
+/**
+ * `taskUpdateScope` (PD-079): the "update" scope of the task-creating roles (loadTaskScopes) — splitting a subtask through
+ * "update: all" needs it (an Account alone creates no task); absent = `scopes.update`.
+ */
+export type TaskAccess = { scopes: JobScopes; userId: string; taskUpdateScope?: JobScopes["update"] };
 
 export const jobArchivedError = () => new AppError("JOB_ARCHIVED", "Job đã lưu trữ — khôi phục trước khi thay đổi.", 409);
 
@@ -479,12 +484,13 @@ export const loadTaskPoints = async (sql: QuerySql, context: AccessContext, rows
 
 /** Task rows → API tasks for the caller, with the card extras (loadTaskExtras), points (PD-070) and capabilities. */
 export const toProductionTasks = async (sql: QuerySql, context: AccessContext, workflow: Workflow, rows: readonly TaskRow[], scopes?: JobScopes) => {
-  const [extras, mine, points] = await Promise.all([
+  const [extras, mine, points, taskScopes] = await Promise.all([
     loadTaskExtras(sql, context.organization.id, context.user.id, rows),
     scopes ? Promise.resolve(scopes) : loadJobScopes(sql, context),
-    loadTaskPoints(sql, context, rows)
+    loadTaskPoints(sql, context, rows),
+    loadTaskScopes(sql, context)
   ]);
-  const access: TaskAccess = { scopes: mine, userId: context.user.id };
+  const access: TaskAccess = { scopes: mine, userId: context.user.id, taskUpdateScope: taskScopes.update };
   return rows.map((row) => toProductionTask(row, workflow, relationOf(context, row), access, extras.get(row.id), points));
 };
 
@@ -530,7 +536,13 @@ export const taskCapabilities = (row: CapabilityRow, access: TaskAccess, leads =
     canRequestQty:
       live && mine && workLine && beforeDone && row.qty_assigned !== null && !canEditQtyAssigned && row.pending_qty_request === null,
     canDecideQtyRequest: live && row.pending_qty_request !== null && (leads || access.scopes.update === "all"),
-    canCreateSubtask: live && workLine && !row.process_is_qc && beforeDone && manages,
+    // PD-079: through "update: all" only when a task-creating role gives it (an Account alone creates no subtask).
+    canCreateSubtask:
+      live &&
+      workLine &&
+      !row.process_is_qc &&
+      beforeDone &&
+      subtaskManageAllowed({ leads, updateScope: access.taskUpdateScope ?? access.scopes.update, mine }),
     canDelete:
       live &&
       (subtask ? subtaskDeleteAllowed({ leads, deleteScope: access.scopes.delete, mine, done: !beforeDone }) : lineAllowed(access.scopes.delete, mine))

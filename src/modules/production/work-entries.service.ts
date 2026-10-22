@@ -5,7 +5,7 @@ import type { QuerySql } from "../../lib/db-types.js";
 import type { AccessContext } from "../access/access-context.js";
 import { assertProductionMember } from "./access.js";
 import { syncJobChat } from "./job-chat.service.js";
-import { assertLinesCreatable, loadJobScopes } from "./job-permissions.js";
+import { assertTaskLinesCreatable, loadTaskScopes } from "./job-permissions.js";
 import { loadWorkflowModel, selectTasks, toProductionTasks } from "./jobs.repo.js";
 import { publishProductionChange } from "./realtime.js";
 import { insertTasks, loadJobForTasks, settleJob } from "./tasks.service.js";
@@ -18,7 +18,8 @@ import { insertTasks, loadJobForTasks, settleJob } from "./tasks.service.js";
  * "Task 1: Chọn QC cho task.", insertTasks).
  *
  * Permissions (PD-036 "create"): "all" enters a row for anyone, "own" only for oneself — also into a job the caller could
- * not see before (the line is theirs); "none" (STAFF by default since PD-047) refuses (403). Archived jobs refuse new
+ * not see before (the line is theirs); "none" (STAFF by default since PD-047) refuses (403). PD-079: ACCOUNT's "create" does
+ * not count (an Account alone gets 403 TASK_CREATE_FORBIDDEN). Archived jobs refuse new
  * lines (409), deleted ones are not found.
  */
 
@@ -26,7 +27,7 @@ import { insertTasks, loadJobForTasks, settleJob } from "./tasks.service.js";
 const assertEntryJob = async (tx: QuerySql, organizationId: string, input: CreateWorkEntryRequest) => {
   const project = await tx`SELECT 1 FROM production.projects WHERE organization_id = ${organizationId} AND id = ${input.projectId} AND active`;
   if (project.length === 0) {
-    throw new AppError("PROJECT_NOT_FOUND", "Dự án không tồn tại hoặc đã ngừng.", 400);
+    throw new AppError("PROJECT_NOT_FOUND", "Project không tồn tại hoặc đã ngừng hoạt động.", 400);
   }
   const job = (
     await tx<{ project_id: string }[]>`
@@ -34,10 +35,10 @@ const assertEntryJob = async (tx: QuerySql, organizationId: string, input: Creat
     `
   )[0];
   if (!job) {
-    throw new AppError("JOB_NOT_FOUND", "Không tìm thấy gói công việc — chọn lại trong danh sách.", 404);
+    throw new AppError("JOB_NOT_FOUND", "Không tìm thấy Job Code — chọn lại trong danh sách.", 404);
   }
   if (job.project_id !== input.projectId) {
-    throw new AppError("JOB_PROJECT_MISMATCH", "Gói công việc không thuộc dự án đã chọn.", 400);
+    throw new AppError("JOB_PROJECT_MISMATCH", "Job Code không thuộc Project đã chọn.", 400);
   }
 };
 
@@ -47,7 +48,8 @@ export const createWorkEntry = async (context: AccessContext, input: CreateWorkE
   const organizationId = context.organization.id;
   const assigneeId = input.assigneeId ?? context.user.id;
   const sql = getSql();
-  assertLinesCreatable(await loadJobScopes(sql, context), [assigneeId], context.user.id);
+  // PD-079: the task-creating scopes — an Account alone creates no task (403 TASK_CREATE_FORBIDDEN).
+  assertTaskLinesCreatable(context, await loadTaskScopes(sql, context), [assigneeId]);
   if (Date.parse(input.deadline) < Date.parse(input.assignedAt)) {
     throw new AppError("TASK_LINES_INVALID", "Ngày giao phải từ Ngày nhận trở đi.", 400);
   }
