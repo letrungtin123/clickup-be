@@ -1,6 +1,7 @@
 import { startDeadlineScheduler } from "../modules/notifications/deadline-scheduler.js";
 import { emailBindings, handleEmailEvent, startEmailDigestSweeper } from "../modules/notifications/notification-email.js";
 import { handleNotificationEvent, notificationBindings } from "../modules/notifications/notification-handlers.js";
+import { startAtRiskScheduler } from "../modules/production/at-risk.js";
 import { startKpiSettlementScheduler } from "../modules/production/kpi-settlement-scheduler.js";
 import { startProductionLatenessScheduler } from "../modules/production/lateness-scheduler.js";
 import { workQueueNames } from "../lib/amqp.js";
@@ -40,6 +41,8 @@ export const startWorkerConsumers = async (): Promise<Stop> => {
   stops.push(startMaintenanceScheduler());
   stops.push(startProductionLatenessScheduler());
   stops.push(startKpiSettlementScheduler());
+  // PD-080: the Overview's At risk estimate, every ~15 minutes.
+  stops.push(startAtRiskScheduler());
   // Parked (dead-letter) messages → error log + one in-app alert per queue per hour.
   stops.push(startDeadLetterMonitor());
 

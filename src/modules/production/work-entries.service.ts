@@ -80,7 +80,8 @@ export const createWorkEntry = async (context: AccessContext, input: CreateWorkE
           ...(input.customValues ? { customValues: input.customValues } : {})
         }
       ],
-      { kind: "NORMAL", feedbackId: null, defaultParentId: null }
+      // PD-080b: the process must be priced for the project on the entry's Ngày nhận.
+      { kind: "NORMAL", feedbackId: null, defaultParentId: null, requirePricedProcess: true }
     );
     await settleJob(tx, organizationId, workflow, input.jobId);
     return { jobId: input.jobId, ...created };

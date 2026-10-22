@@ -40,11 +40,17 @@ import {
   WorkEntryResultSchema
 } from "../../contracts/production-jobs.js";
 import { withCustomFieldFilters } from "../../contracts/production-catalog.js";
-import { ProductionOverviewQuerySchema, ProductionOverviewSchema } from "../../contracts/production-overview.js";
+import {
+  ProductionOverviewQuerySchema,
+  ProductionOverviewSchema,
+  RiskHistoryQuerySchema,
+  RiskHistorySchema,
+  TeamLoadSchema
+} from "../../contracts/production-overview.js";
 import { requireSupabaseUser } from "../../middleware/auth.js";
 import { handle, param } from "./http.js";
 import { openJobChat } from "./job-chat.service.js";
-import { getProductionOverview } from "./overview.service.js";
+import { getProductionOverview, getRiskHistory, getTeamLoad } from "./overview.service.js";
 import {
   changeJobStatus,
   closeFeedback,
@@ -81,11 +87,18 @@ export const createProductionJobRoutes = (): ExpressRouter => {
   const routes = Router();
   routes.use("/production", requireSupabaseUser);
 
-  // "Tổng quan" (PD-076): stats, charts, project progress and due lines of the visible jobs.
+  // "Tổng quan" (PD-080 Overview V2): cards, "Cần bạn xử lý" and the jobs of the range for Leaders / Accounts / Quản trị / Director.
   routes.get(
     "/production/overview",
     handle(async (context, req) => ProductionOverviewSchema.parse(await getProductionOverview(context, ProductionOverviewQuerySchema.parse(req.query))))
   );
+  // PD-080: At risk history (superadmin, Director).
+  routes.get(
+    "/production/overview/risk-history",
+    handle(async (context, req) => RiskHistorySchema.parse(await getRiskHistory(context, RiskHistoryQuerySchema.parse(req.query))))
+  );
+  // PD-080: "ảnh đang ôm" of the team, for the Chia task suggestions and the assignee picker (Leader, Quản trị).
+  routes.get("/production/team-load", handle(async (context) => TeamLoadSchema.parse(await getTeamLoad(context))));
 
   // Jobs
   routes.get("/production/jobs", handle(async (context, req) => JobPageSchema.parse(await listJobs(context, JobQuerySchema.parse(withCustomFieldFilters(req.query))))));

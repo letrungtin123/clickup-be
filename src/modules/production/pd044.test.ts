@@ -796,3 +796,35 @@ describe("quantity requests (PD-044)", () => {
     expect(callsLike(/^UPDATE production\./)).toHaveLength(0);
   });
 });
+
+describe("PD-080b — a subtask's process must be priced (its line's Ngày nhận)", () => {
+  const unpriced = (call: Call) =>
+    call.text.includes("AS project_priced") ? [{ index: 1, process_name: "Cắt nền", project_code: "AXP", priced: false, project_priced: true }] : undefined;
+  const processRow = (call: Call) =>
+    call.text.startsWith("SELECT active, is_qc, name FROM production.processes") ? [{ active: true, is_qc: false, name: "Cắt nền" }] : undefined;
+
+  it("creating a subtask with an unpriced process → 400 PROCESS_NOT_PRICED on the line's day, nothing written", async () => {
+    const line = taskRow({ assigned_at: new Date("2026-10-25T17:00:00Z") });
+    db.state.handler = store([line], (call) => processRow(call) ?? unpriced(call));
+    const input = CreateSubtaskRequestSchema.parse({ processId: otherProcessId, qtyAssigned: 2, reason: "x" });
+    expect(await failure(createProductionSubtask(contextWith(["STAFF"]), lineId, input))).toMatchObject({ code: "PROCESS_NOT_PRICED", status: 400 });
+    const check = callsLike(/AS project_priced/)[0]!;
+    expect(check.values).toContainEqual([otherProcessId]);
+    expect(check.values).toContainEqual(["2026-10-26"]);
+    expect(callsLike(/^INSERT INTO production\.tasks/)).toHaveLength(0);
+  });
+
+  it("changing a subtask's process to an unpriced one → 400; its quantity alone asks nothing", async () => {
+    const line = taskRow({ subtasks: [subtaskJson()] });
+    db.state.handler = store([line, subtaskRow()], (call) =>
+      call.text.startsWith("SELECT id, number, process_id, qty_assigned, done_at FROM production.tasks")
+        ? [{ id: lineId, number: "7", process_id: processId, qty_assigned: 7, done_at: null }]
+        : (processRow(call) ?? unpriced(call))
+    );
+    const third = "79797979-7979-4797-8797-797979797979";
+    expect(await failure(updateProductionTask(contextWith(["STAFF"]), subId, { processId: third }))).toMatchObject({ code: "PROCESS_NOT_PRICED", status: 400 });
+    db.state.calls = [];
+    await updateProductionTask(contextWith(["STAFF"]), subId, { qtyAssigned: 5 }).catch(() => undefined);
+    expect(callsLike(/AS project_priced/)).toHaveLength(0);
+  });
+});

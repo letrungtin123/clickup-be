@@ -1,52 +1,58 @@
 import { JobQuerySchema } from "../../contracts/production-jobs.js";
+import { taskJobScopes, type JobStatusKind } from "../../contracts/production-catalog.js";
 import {
-  overviewChartMinDays,
-  overviewDaySpan,
-  overviewDueLimit,
+  defaultOverviewScope,
+  getsAccountNeeds,
+  getsLeaderNeeds,
+  hasOverviewScopeSwitch,
   overviewLeaderMine,
-  overviewProjectSlices,
-  type OverviewDay,
-  type OverviewDueList,
-  type OverviewProjectProgress,
+  overviewTaskStages,
+  seesOverview,
+  seesRiskHistory,
   type OverviewRange,
-  type OverviewStats,
-  type OverviewStatusSlice,
-  type OverviewVolumeSlice,
+  type OverviewTaskStage,
   type ProductionOverview,
-  type ProductionOverviewQuery
+  type ProductionOverviewQuery,
+  type RiskHistory,
+  type RiskHistoryQuery,
+  type TeamLoad
 } from "../../contracts/production-overview.js";
 import { getSql } from "../../db/client.js";
-import { toIso, type SqlFragment } from "../../lib/db-types.js";
+import { AppError } from "../../lib/app-error.js";
+import { toIso, type QuerySql } from "../../lib/db-types.js";
 import type { AccessContext } from "../access/access-context.js";
-import { visibleUserIdSql } from "../access/test-accounts.js";
+import { visibleUserIdSql, visibleUserSql } from "../access/test-accounts.js";
 import { toColor, toUserRef, type UserRefJson } from "../work/mappers.js";
 import { userJsonSql } from "../work/tasks.repo.js";
-import { assertProductionMember } from "./access.js";
+import { assertProductionMember, productionRolesOf } from "./access.js";
 import { loadSettings } from "./catalog.service.js";
+import { alertMinutesOf, coreWindowOf, zonedDay, zonedInstant } from "./core-clock.js";
 import { forbidden, loadJobScopes } from "./job-permissions.js";
-import { lineFinishedSql, lineFinishStatusIds, loadWorkflowModel, notSubtaskSql } from "./jobs.repo.js";
-import { hasScopeTabs, jobListFilterSql, ownedProjectJobSql } from "./jobs.service.js";
-import { addDays, businessDay } from "./time.js";
-import { isLineFinished, statusById, type Workflow } from "./workflow.js";
+import { loadWorkflowModel, notSubtaskSql } from "./jobs.repo.js";
+import { jobListFilterSql, ownedProjectJobSql } from "./jobs.service.js";
+import { accountNeedsOf, buildOverviewJobs, leaderNeedsOf, overviewCards, type OverviewJobRow, type OverviewLineRow, type OverviewRiskRow } from "./overview-model.js";
+import { taskCode } from "./task-codes.js";
+import { addDays } from "./time.js";
+import { isLineFinished, lineFinishStatusIds, type Workflow } from "./workflow.js";
 
 /**
- * PD-076 — "Tổng quan" of Photo Retouch (GET /production/overview): stats, charts, project progress and due lines in
- * one read. Definitions and visibility: contracts/production-overview.ts. A fixed number of grouped queries whatever
- * the data (settings, workflow and job scopes come from the per-organization config cache): the range's lines by status
- * (with the comparison days, and the "Tôi quản lý" split for a Leader / Admin), the chart days, the volume per project, the
- * open jobs' progress per project, and the two due lists.
+ * PD-080 — "Tổng quan" (Overview V2) of Photo Retouch for Leaders, Accounts, Quản trị and Director: GET /production/overview
+ * (cards, "Cần bạn xử lý", the jobs grouped by project in the app), GET /production/team-load (Chia task suggestions) and
+ * GET /production/overview/risk-history (superadmin / Director). Definitions: contracts/production-overview.ts; the rules
+ * themselves are pure functions in overview-model.ts (time rules, stages, cards, needs), core-clock.ts (core-window
+ * clocks) and at-risk.ts (the worker's estimate, read here from production.job_risk_episodes).
+ *
+ * The overview read is a fixed number of grouped queries whatever the data: the candidate jobs (client deadline in the
+ * range, client-late, or with a line due in the range / overdue — with their last activity, creator role and "owned"
+ * flag), their lines (subtask quantities summed, when each waiting line entered Chờ QC), who is on leave now, and the open
+ * At risk episodes. Settings and workflow come from the per-organization config cache.
  */
 
-// Pure helpers (unit tested) ------------------------------------------------------------------------------------------
+const overviewForbidden = () =>
+  new AppError("OVERVIEW_FORBIDDEN", "Tổng quan dành cho Leader, Account, Quản trị và Director — xem “Việc của tôi”.", 403);
 
-/** Calendar day (YYYY-MM-DD) of `at` in `timeZone`; the business timezone when the setting is not a known zone. */
-export const dayInTimeZone = (at: Date, timeZone: string) => {
-  try {
-    return new Intl.DateTimeFormat("en-CA", { timeZone, year: "numeric", month: "2-digit", day: "2-digit" }).format(at);
-  } catch {
-    return businessDay(at);
-  }
-};
+/** Calendar day (YYYY-MM-DD) of `at` in `timeZone`. */
+export const dayInTimeZone = (at: Date, timeZone: string) => zonedDay(at, timeZone);
 
 /** The range asked for; a missing end is the other one, both missing = today. */
 export const resolveOverviewRange = (query: Pick<ProductionOverviewQuery, "from" | "to">, today: string): OverviewRange => ({
@@ -54,367 +60,488 @@ export const resolveOverviewRange = (query: Pick<ProductionOverviewQuery, "from"
   to: query.to ?? query.from ?? today
 });
 
-/** The chart's days: the range, or — shorter than `overviewChartMinDays` (e.g. "Hôm nay") — that many days ending on its last day. */
-export const overviewChartRange = (range: OverviewRange): OverviewRange =>
-  overviewDaySpan(range.from, range.to) >= overviewChartMinDays
-    ? range
-    : { from: addDays(range.to, -(overviewChartMinDays - 1)), to: range.to };
+/** [start, end) instants of a range of organization days. */
+export const rangeInstants = (range: OverviewRange, timeZone: string) => ({
+  start: zonedInstant(range.from, "00:00", timeZone),
+  end: zonedInstant(addDays(range.to, 1), "00:00", timeZone)
+});
 
-/**
- * "So với …": the days just before the range, as many as the range has up to today (a range running into the future —
- * "Tháng này" — is compared with the same number of days, not a whole month). null when the range starts after today.
- */
-export const overviewComparisonRange = (range: OverviewRange, today: string): OverviewRange | null => {
-  const end = range.to < today ? range.to : today;
-  if (end < range.from) {
-    return null;
-  }
-  const days = overviewDaySpan(range.from, end);
-  return { from: addDays(range.from, -days), to: addDays(range.from, -1) };
-};
-
-/** Monday – Sunday of the week holding `day`. */
-export const weekOfDay = (day: string): OverviewRange => {
-  const weekday = new Date(`${day}T00:00:00Z`).getUTCDay();
-  const monday = addDays(day, -((weekday + 6) % 7));
-  return { from: monday, to: addDays(monday, 6) };
-};
-
-/** Every day of the range, oldest first, with its counts (0 when absent). */
-export const fillOverviewDays = (
-  range: OverviewRange,
-  received: ReadonlyMap<string, number>,
-  done: ReadonlyMap<string, number>
-): OverviewDay[] => {
-  const days: OverviewDay[] = [];
-  for (let day = range.from; day <= range.to && days.length <= 1000; day = addDays(day, 1)) {
-    days.push({ day, received: received.get(day) ?? 0, done: done.get(day) ?? 0 });
-  }
-  return days;
-};
-
-/** One group of the range's lines (status × Checking × Done once × in the range or the comparison days × in a project I own). */
-export type OverviewLineGroup = {
-  status_id: string;
-  status_code: string;
-  status_name: string;
-  status_color: string;
-  status_order: number;
-  is_checking: boolean;
-  was_done: boolean;
-  /** In the range (false: the comparison days before it). */
-  current: boolean;
-  /** The job is in a project the caller owns (PD-078 "Tôi quản lý"; only told apart for a Leader / Admin, else false). */
-  led: boolean;
-  lines: number;
-  /** Not Done yet and past Ngày giao (finished groups ignore it). */
-  past_deadline: number;
-};
-
-const doneMarker = new Date(0);
-
-/**
- * Stats, status slices, the comparison counts and the Leader tab counts from the grouped lines. `mineOnly`: the stats
- * cover the led groups only ("Tôi quản lý"); the tab counts always cover both.
- */
-export const summarizeOverviewLines = (workflow: Workflow, groups: readonly OverviewLineGroup[], mineOnly: boolean) => {
-  const ids = lineFinishStatusIds(workflow);
-  const stats: OverviewStats = { total: 0, notStarted: 0, inProgress: 0, done: 0, overdue: 0 };
-  const previous = { total: 0, done: 0 };
-  const tabs = { all: 0, mine: 0 };
-  const slices = new Map<string, OverviewStatusSlice & { order: number }>();
-  for (const group of groups) {
-    const finished = isLineFinished(
-      workflow,
-      { statusId: group.status_id, isChecking: group.is_checking, doneAt: group.was_done ? doneMarker : null },
-      ids
-    );
-    if (group.current) {
-      tabs.all += group.lines;
-      if (group.led) {
-        tabs.mine += group.lines;
-      }
-    }
-    if (mineOnly && !group.led) {
-      continue;
-    }
-    if (!group.current) {
-      previous.total += group.lines;
-      previous.done += finished ? group.lines : 0;
-      continue;
-    }
-    const overdue = finished ? 0 : group.past_deadline;
-    stats.total += group.lines;
-    stats.overdue += overdue;
-    if (finished) {
-      stats.done += group.lines;
-    } else if (statusById(workflow, group.status_id)?.isInitial) {
-      stats.notStarted += group.lines;
-    } else {
-      stats.inProgress += group.lines;
-    }
-    const slice = slices.get(group.status_id) ?? {
-      status: { id: group.status_id, code: group.status_code, name: group.status_name, color: toColor(group.status_color) },
-      count: 0,
-      overdue: 0,
-      order: group.status_order
-    };
-    slice.count += group.lines;
-    slice.overdue += overdue;
-    slices.set(group.status_id, slice);
-  }
-  const byStatus = [...slices.values()]
-    .sort((a, b) => a.order - b.order || a.status.name.localeCompare(b.status.name))
-    .map(({ status, count, overdue }) => ({ status, count, overdue }));
-  return { stats, previous, tabs, byStatus };
-};
-
-export type OverviewVolumeRow = { project_id: string; code: string; name: string; qty: number; lines: number; without_qty: number };
-
-/** Largest projects first (images, then lines, then code); after `take` of them the rest is one "Khác" slice. */
-export const overviewVolumeSlices = (rows: readonly OverviewVolumeRow[], take = overviewProjectSlices): OverviewVolumeSlice[] => {
-  const ranked = rows
-    .filter((row) => row.qty > 0)
-    .sort((a, b) => b.qty - a.qty || b.lines - a.lines || a.code.localeCompare(b.code));
-  // A single leftover project is shown as itself rather than as "Khác (1 dự án)".
-  const head = ranked.length === take + 1 ? ranked : ranked.slice(0, take);
-  const rest = ranked.slice(head.length);
-  const slices: OverviewVolumeSlice[] = head.map((row) => ({
-    project: { id: row.project_id, code: row.code, name: row.name },
-    projectCount: 1,
-    qty: row.qty,
-    lines: row.lines
+/** The organization's names of the dropdown stages (from the workflow statuses; Complete for the later ones). */
+export const stageNamesOf = (workflow: Workflow) =>
+  overviewTaskStages.map((stage) => ({
+    stage,
+    name: workflow.statuses.find((status) => status.code === stage)?.name ?? stageFallbackNames[stage]
   }));
-  if (rest.length > 0) {
-    slices.push({
-      project: null,
-      projectCount: rest.length,
-      qty: rest.reduce((sum, row) => sum + row.qty, 0),
-      lines: rest.reduce((sum, row) => sum + row.lines, 0)
-    });
-  }
-  return slices;
+const stageFallbackNames: Record<OverviewTaskStage, string> = {
+  ASSIGNED: "Mới giao",
+  PROCESSING: "Đang làm",
+  REWORK: "Cần sửa lại",
+  WAITING_QC: "Chờ QC",
+  QC_CHECKING: "Đang check",
+  FEEDBACK: "Feedback",
+  CHECKED: "Đã check",
+  COMPLETE: "Complete"
 };
 
-// Reads ----------------------------------------------------------------------------------------------------------------
-
-type DueRow = {
+type JobDbRow = {
   id: string;
-  number: string;
-  job_id: string;
-  job_code: string;
+  code: string;
+  name: string | null;
   project_id: string;
   project_code: string;
   project_name: string;
+  leader: UserRefJson | null;
+  received_at: Date;
+  deadline: Date;
+  created_at: Date;
+  created_by_account: boolean;
+  total_images: number;
+  status_id: string;
+  status_name: string;
+  status_color: string;
+  status_kind: JobStatusKind;
+  owned: boolean;
+  last_activity_at: Date;
+};
+
+type LineDbRow = {
+  id: string;
+  job_id: string;
+  number: string;
   process_id: string;
   process_name: string;
+  is_qc: boolean;
   assignee: UserRefJson;
+  qc: UserRefJson | null;
   status_id: string;
   status_code: string;
   status_name: string;
   status_color: string;
+  assigned_at: Date;
   deadline: Date;
-  overdue: boolean;
+  done_at: Date | null;
   qty_assigned: number | null;
-  total: number;
+  qty_done: number | null;
+  note: string | null;
+  waiting_since: Date | null;
 };
 
-type ProjectRow = {
-  project_id: string;
-  code: string;
-  name: string;
-  open_jobs: number;
-  late_jobs: number;
-  images_total: number;
-  images_done: number;
-  images_checked: number;
+type RiskDbRow = {
+  job_id: string;
+  reason: "CAPACITY" | "UNASSIGNED";
+  started_at: Date;
+  evaluated_at: Date;
+  work_hours: string;
+  capacity_hours: string;
+  hours_left: string;
+  people: number;
 };
 
-const toDueList = (window: OverviewRange, rows: readonly DueRow[]): OverviewDueList => ({
-  ...window,
-  total: rows[0]?.total ?? 0,
-  items: rows.map((row) => ({
-    id: row.id,
-    code: String(row.number),
-    jobId: row.job_id,
-    jobCode: row.job_code,
-    project: { id: row.project_id, code: row.project_code, name: row.project_name },
-    process: { id: row.process_id, name: row.process_name },
-    assignee: toUserRef(row.assignee)!,
-    status: { id: row.status_id, code: row.status_code, name: row.status_name, color: toColor(row.status_color) },
-    deadline: toIso(row.deadline),
-    overdue: row.overdue,
-    qtyAssigned: row.qty_assigned
-  }))
+const toJobRow = (row: JobDbRow): OverviewJobRow => ({
+  id: row.id,
+  code: row.code,
+  name: row.name,
+  project: { id: row.project_id, code: row.project_code, name: row.project_name },
+  leader: toUserRef(row.leader),
+  receivedAt: row.received_at,
+  deadline: row.deadline,
+  createdAt: row.created_at,
+  createdByAccount: row.created_by_account,
+  totalImages: row.total_images,
+  status: { id: row.status_id, name: row.status_name, color: toColor(row.status_color), kind: row.status_kind },
+  owned: row.owned,
+  lastActivityAt: row.last_activity_at
 });
 
-const toProjectProgress = (row: ProjectRow): OverviewProjectProgress => ({
-  project: { id: row.project_id, code: row.code, name: row.name },
-  openJobs: row.open_jobs,
-  lateJobs: row.late_jobs,
-  imagesTotal: row.images_total,
-  imagesDone: row.images_done,
-  imagesChecked: row.images_checked
+const toLineRow = (row: LineDbRow, workflow: Workflow, finish: ReturnType<typeof lineFinishStatusIds>): OverviewLineRow => ({
+  id: row.id,
+  jobId: row.job_id,
+  number: Number(row.number),
+  code: taskCode({ number: Number(row.number), subSeq: null, parentNumber: null }),
+  process: { id: row.process_id, name: row.process_name, isQc: row.is_qc },
+  assignee: toUserRef(row.assignee)!,
+  qc: toUserRef(row.qc),
+  status: { id: row.status_id, code: row.status_code, name: row.status_name, color: toColor(row.status_color) },
+  assignedAt: row.assigned_at,
+  deadline: row.deadline,
+  doneAt: row.done_at,
+  finished: isLineFinished(workflow, { statusId: row.status_id, isChecking: row.is_qc, doneAt: row.done_at }, finish),
+  qtyAssigned: row.qty_assigned,
+  qtyDone: row.qty_done,
+  note: row.note,
+  waitingSince: row.waiting_since
 });
+
+/** Who is on approved leave at `now` (organization time), among the organization's members. */
+const loadOnLeaveNow = async (sql: QuerySql, organizationId: string, now: Date, timeZone: string) =>
+  new Set(
+    (
+      await sql<{ user_id: string }[]>`
+        SELECT DISTINCT user_id FROM production.leave_requests
+        WHERE organization_id = ${organizationId} AND status = 'APPROVED'
+          AND slot_range @> (${now}::timestamptz AT TIME ZONE ${timeZone}::text)
+      `
+    ).map((row) => row.user_id)
+  );
 
 /**
- * GET /production/overview (PD-076). Any production member whose job "view" scope is not "none" (else 403, like the
- * job list); what they see is the job list's visibility (jobListFilterSql: view scope, live and not archived jobs,
- * PD-063 test accounts) plus lines assigned to a test account hidden from a real viewer. `scope=mine` (or the older
- * `leader=me`) keeps the jobs of the projects the caller owns (PD-078). A caller holding LEADER or ADMIN also gets the tab
- * counts (the status query then groups by "in a project I own" instead of filtering, so the tabs cost no extra query).
+ * GET /production/overview (PD-080). Holders of LEADER / ACCOUNT / ADMIN / DIRECTOR (else 403 OVERVIEW_FORBIDDEN); the job
+ * list's visibility (view scope — "none" → 403 —, live and not archived jobs, PD-063 test accounts). `scope` (default by
+ * role) keeps the jobs of the projects the caller co-owns ("mine") or every visible job ("all").
  */
-export const getProductionOverview = async (
-  context: AccessContext,
-  query: ProductionOverviewQuery,
-  now: Date = new Date()
-): Promise<ProductionOverview> => {
+export const getProductionOverview = async (context: AccessContext, query: ProductionOverviewQuery, now: Date = new Date()): Promise<ProductionOverview> => {
   assertProductionMember(context);
+  const roles = [...productionRolesOf(context)];
+  if (!seesOverview(roles)) {
+    throw overviewForbidden();
+  }
   const sql = getSql();
   const organizationId = context.organization.id;
-  const [scopes, settings, workflow] = await Promise.all([
-    loadJobScopes(sql, context),
-    loadSettings(sql, organizationId),
-    loadWorkflowModel(sql, organizationId)
-  ]);
+  const [scopes, settings, workflow] = await Promise.all([loadJobScopes(sql, context), loadSettings(sql, organizationId), loadWorkflowModel(sql, organizationId)]);
   if (scopes.view === "none") {
     throw forbidden("Bạn không có quyền xem tổng quan job.");
   }
-  const timeZone = settings.timezone;
+  const window = coreWindowOf(settings);
+  const timeZone = window.timeZone;
   const today = dayInTimeZone(now, timeZone);
   const range = resolveOverviewRange(query, today);
-  const chart = overviewChartRange(range);
-  const comparison = overviewComparisonRange(range, today);
-  const week = weekOfDay(today);
+  const instants = rangeInstants(range, timeZone);
+  const defaultScope = defaultOverviewScope(roles);
+  const scope = query.scope ?? (query.leader === overviewLeaderMine ? "mine" : defaultScope);
   const finish = lineFinishStatusIds(workflow);
-  const mineOnly = query.scope === "mine" || query.leader === overviewLeaderMine;
-  const leaderTabs = hasScopeTabs(context);
-  const scopedJobs = JobQuerySchema.parse(mineOnly ? { scope: "mine" } : {});
   const everyJob = JobQuerySchema.parse({});
+  const visibleJobs = () => jobListFilterSql(sql, context, scopes, everyJob, [], { person: false });
+  const openLine = () => sql`(t.done_at IS NULL AND t.closed_at IS NULL AND t.deadline < ${now})`;
 
-  // postgres.js fragments: a fresh one per use.
-  const startOf = (day: string) => sql`((${day}::date)::timestamp AT TIME ZONE ${timeZone}::text)`;
-  const endOf = (day: string) => sql`(((${day}::date) + 1)::timestamp AT TIME ZONE ${timeZone}::text)`;
-  const dayOf = (column: SqlFragment) => sql`to_char(${column} AT TIME ZONE ${timeZone}::text, 'YYYY-MM-DD')`;
-  const finishedAt = () => sql`coalesce(t.closed_at, t.checked_at, t.done_at)`;
-  const visibleJobs = (jobQuery = scopedJobs) => jobListFilterSql(sql, context, scopes, jobQuery, [], { person: false });
-  /**
-   * Live lines (`subtasks`: and their subtasks) of the visible jobs, on t / j / pr (process) / st (status), plus `join`.
-   * Lines assigned to a test account are hidden from a real viewer (PD-063).
-   */
-  const lines = ({ jobQuery = scopedJobs, subtasks = false, join = sql`` }: { jobQuery?: typeof scopedJobs; subtasks?: boolean; join?: SqlFragment } = {}) => sql`
-    FROM production.tasks t
-    JOIN production.jobs j ON j.organization_id = t.organization_id AND j.id = t.job_id
-    JOIN production.processes pr ON pr.organization_id = t.organization_id AND pr.id = t.process_id
-    JOIN production.statuses st ON st.organization_id = t.organization_id AND st.id = t.status_id
-    ${join}
-    WHERE t.organization_id = ${organizationId} AND t.deleted_at IS NULL
-      ${subtasks ? sql`` : sql`AND ${notSubtaskSql(sql)}`}
-      AND ${visibleUserIdSql(sql, context, sql`t.assignee_id`)}
-      AND ${visibleJobs(jobQuery)}
-  `;
-  const received = () => sql`AND t.assigned_at >= ${startOf(range.from)} AND t.assigned_at < ${endOf(range.to)}`;
-  const projectJoin = () => sql`JOIN production.projects p ON p.organization_id = j.organization_id AND p.id = j.project_id`;
-  const dueLines = (window: OverviewRange) => sql<DueRow[]>`
-    SELECT t.id, t.number::text AS number, t.job_id, j.code AS job_code,
-      p.id AS project_id, p.code AS project_code, p.name AS project_name, pr.id AS process_id, pr.name AS process_name,
-      ${userJsonSql(sql, "ua")} AS assignee,
-      st.id AS status_id, st.code AS status_code, st.name AS status_name, st.color AS status_color,
-      t.deadline, (t.done_at IS NULL AND t.deadline < ${now}) AS overdue, t.qty_assigned, count(*) OVER ()::int AS total
-    ${lines({ join: sql`${projectJoin()} JOIN public.app_users ua ON ua.id = t.assignee_id` })}
-      AND NOT ${lineFinishedSql(sql, finish, "pr")}
-      AND t.deadline >= ${startOf(window.from)} AND t.deadline < ${endOf(window.to)}
-    ORDER BY t.deadline, t.number
-    LIMIT ${overviewDueLimit}
-  `;
-
-  const [groups, daily, volume, projects, dueToday, dueThisWeek] = await Promise.all([
-    // The range's lines (and the comparison days before it) by status. A Leader's / Admin's lines are split by "in a
-    // project I own" (the tab counts) instead of filtered; the stats then keep those for "Tôi quản lý".
-    sql<OverviewLineGroup[]>`
-      SELECT t.status_id, st.code AS status_code, st.name AS status_name, st.color AS status_color, st.sort_order AS status_order,
-        pr.is_qc AS is_checking, (t.done_at IS NOT NULL) AS was_done, (t.assigned_at >= ${startOf(range.from)}) AS current,
-        ${leaderTabs ? ownedProjectJobSql(sql, context) : sql`false`} AS led,
-        count(*)::int AS lines, count(*) FILTER (WHERE t.done_at IS NULL AND t.deadline < ${now})::int AS past_deadline
-      ${lines({ jobQuery: leaderTabs ? everyJob : scopedJobs })}
-        AND t.assigned_at >= ${startOf(comparison?.from ?? range.from)} AND t.assigned_at < ${endOf(range.to)}
-      GROUP BY 1, 2, 3, 4, 5, 6, 7, 8, 9
-    `,
-    // Chart: lines received per day, and lines finished per day (whenever received).
-    sql<{ kind: "received" | "done"; day: string; count: number }[]>`
-      SELECT 'received' AS kind, ${dayOf(sql`t.assigned_at`)} AS day, count(*)::int AS count
-      ${lines()}
-        AND t.assigned_at >= ${startOf(chart.from)} AND t.assigned_at < ${endOf(chart.to)}
-      GROUP BY 2
-      UNION ALL
-      SELECT 'done' AS kind, ${dayOf(finishedAt())} AS day, count(*)::int AS count
-      ${lines()}
-        AND ${lineFinishedSql(sql, finish, "pr")}
-        AND ${finishedAt()} >= ${startOf(chart.from)} AND ${finishedAt()} < ${endOf(chart.to)}
-      GROUP BY 2
-    `,
-    // Volume per project: images of the work rows (NORMAL lines and subtasks, not Checking) received in the range.
-    sql<OverviewVolumeRow[]>`
-      SELECT p.id AS project_id, p.code, p.name,
-        coalesce(sum(t.qty_assigned) FILTER (WHERE t.kind = 'NORMAL' AND NOT pr.is_qc), 0)::int AS qty,
-        count(*) FILTER (WHERE ${notSubtaskSql(sql)})::int AS lines,
-        count(*) FILTER (WHERE t.kind = 'NORMAL' AND NOT pr.is_qc AND t.qty_assigned IS NULL)::int AS without_qty
-      ${lines({ subtasks: true, join: projectJoin() })}
-        ${received()}
-      GROUP BY p.id, p.code, p.name
-    `,
-    // Progress of the active projects over their open jobs (not "đóng"): image totals as the job list computes them.
-    sql<ProjectRow[]>`
-      WITH open_jobs AS MATERIALIZED (
-        SELECT j.id, j.project_id, j.total_images
-        FROM production.jobs j
-        JOIN production.job_statuses js ON js.organization_id = j.organization_id AND js.id = j.job_status_id
-        WHERE ${visibleJobs()} AND NOT js.is_closed
-      ),
-      job_work AS (
-        SELECT t.job_id,
-          sum(coalesce(t.qty_done, 0)) FILTER (WHERE t.done_at IS NOT NULL AND t.kind = 'NORMAL' AND NOT tp.is_qc) AS qty_done,
-          sum(coalesce(t.qty_done, 0)) FILTER (WHERE t.kind = 'NORMAL' AND (t.checked_at IS NOT NULL OR (tp.is_qc AND t.done_at IS NOT NULL))) AS qty_checked,
-          bool_or(t.is_late AND t.done_at IS NULL AND t.closed_at IS NULL AND ${notSubtaskSql(sql)}) AS late
-        FROM production.tasks t
-        JOIN production.processes tp ON tp.organization_id = t.organization_id AND tp.id = t.process_id
-        WHERE t.organization_id = ${organizationId} AND t.deleted_at IS NULL AND t.job_id IN (SELECT id FROM open_jobs)
-        GROUP BY t.job_id
+  const jobs = await sql<JobDbRow[]>`
+    SELECT j.id, j.code, j.name, p.id AS project_id, p.code AS project_code, p.name AS project_name,
+      CASE WHEN ul.id IS NULL THEN NULL ELSE ${userJsonSql(sql, "ul")} END AS leader,
+      j.received_at, j.deadline, j.created_at, j.total_images,
+      js.id AS status_id, js.name AS status_name, js.color AS status_color, js.kind AS status_kind,
+      ${ownedProjectJobSql(sql, context)} AS owned,
+      EXISTS (
+        SELECT 1 FROM production.user_roles ur
+        WHERE ur.organization_id = j.organization_id AND ur.user_id = j.created_by AND ur.role_code = 'ACCOUNT'
+      ) AS created_by_account,
+      greatest(
+        j.created_at,
+        (SELECT max(l.created_at) FROM production.task_logs l WHERE l.organization_id = j.organization_id AND l.job_id = j.id),
+        (SELECT max(c.created_at) FROM production.comments c WHERE c.organization_id = j.organization_id AND c.job_id = j.id AND c.deleted_at IS NULL)
+      ) AS last_activity_at
+    FROM production.jobs j
+    JOIN production.job_statuses js ON js.organization_id = j.organization_id AND js.id = j.job_status_id
+    JOIN production.projects p ON p.organization_id = j.organization_id AND p.id = j.project_id
+    LEFT JOIN public.app_users ul ON ul.id = j.leader_id
+    WHERE ${visibleJobs()}
+      AND (
+        (j.deadline >= ${instants.start} AND j.deadline < ${instants.end})
+        OR (j.deadline < ${now} AND js.kind NOT IN ('DELIVERING', 'DELIVERED'))
+        OR EXISTS (
+          SELECT 1 FROM production.tasks t
+          WHERE t.organization_id = j.organization_id AND t.job_id = j.id AND t.deleted_at IS NULL AND ${notSubtaskSql(sql)}
+            AND ${visibleUserIdSql(sql, context, sql`t.assignee_id`)}
+            AND ((t.deadline >= ${instants.start} AND t.deadline < ${instants.end}) OR ${openLine()})
+        )
       )
-      SELECT p.id AS project_id, p.code, p.name, count(*)::int AS open_jobs,
-        count(*) FILTER (WHERE w.late)::int AS late_jobs,
-        coalesce(sum(oj.total_images), 0)::int AS images_total,
-        coalesce(sum(w.qty_done), 0)::int AS images_done,
-        coalesce(sum(w.qty_checked), 0)::int AS images_checked
-      FROM open_jobs oj
-      JOIN production.projects p ON p.organization_id = ${organizationId} AND p.id = oj.project_id AND p.active
-      LEFT JOIN job_work w ON w.job_id = oj.id
-      GROUP BY p.id, p.code, p.name
-      ORDER BY late_jobs DESC, open_jobs DESC, lower(p.code), p.id
-    `,
-    dueLines({ from: today, to: today }),
-    dueLines(week)
+  `;
+  const jobIds = jobs.map((job) => job.id);
+  const [lines, onLeaveNow, risks] = await Promise.all([
+    jobIds.length === 0
+      ? []
+      : sql<LineDbRow[]>`
+          SELECT t.id, t.job_id, t.number::text AS number, pr.id AS process_id, pr.name AS process_name, pr.is_qc,
+            ${userJsonSql(sql, "ua")} AS assignee,
+            CASE WHEN uq.id IS NULL THEN NULL ELSE ${userJsonSql(sql, "uq")} END AS qc,
+            st.id AS status_id, st.code AS status_code, st.name AS status_name, st.color AS status_color,
+            t.assigned_at, t.deadline, t.done_at, t.note,
+            CASE WHEN t.qty_assigned IS NULL AND s.qty_assigned IS NULL THEN NULL ELSE (coalesce(t.qty_assigned, 0) + coalesce(s.qty_assigned, 0))::int END AS qty_assigned,
+            CASE WHEN t.qty_done IS NULL AND s.qty_done IS NULL THEN NULL ELSE (coalesce(t.qty_done, 0) + coalesce(s.qty_done, 0))::int END AS qty_done,
+            w.since AS waiting_since
+          FROM production.tasks t
+          JOIN production.processes pr ON pr.organization_id = t.organization_id AND pr.id = t.process_id
+          JOIN production.statuses st ON st.organization_id = t.organization_id AND st.id = t.status_id
+          JOIN public.app_users ua ON ua.id = t.assignee_id
+          LEFT JOIN public.app_users uq ON uq.id = t.qc_id
+          LEFT JOIN LATERAL (
+            SELECT sum(c.qty_assigned)::int AS qty_assigned, sum(c.qty_done)::int AS qty_done
+            FROM production.tasks c
+            WHERE c.organization_id = t.organization_id AND c.parent_task_id = t.id AND c.kind = 'NORMAL' AND c.deleted_at IS NULL
+          ) s ON true
+          LEFT JOIN LATERAL (
+            SELECT max(l.created_at) AS since FROM production.task_logs l
+            WHERE l.organization_id = t.organization_id AND l.task_id = t.id AND l.action = 'STATUS' AND l.to_value->>'code' = 'WAITING_QC'
+          ) w ON st.code IN ('DONE', 'WAITING_QC')
+          WHERE t.organization_id = ${organizationId} AND t.job_id = ANY(${jobIds}::uuid[]) AND t.deleted_at IS NULL AND ${notSubtaskSql(sql)}
+            AND ${visibleUserIdSql(sql, context, sql`t.assignee_id`)}
+        `,
+    loadOnLeaveNow(sql, organizationId, now, timeZone),
+    jobIds.length === 0
+      ? []
+      : sql<RiskDbRow[]>`
+          SELECT job_id, reason, started_at, evaluated_at, work_hours::text, capacity_hours::text, hours_left::text, people
+          FROM production.job_risk_episodes
+          WHERE organization_id = ${organizationId} AND ended_at IS NULL AND job_id = ANY(${jobIds}::uuid[])
+        `
   ]);
 
-  const summary = summarizeOverviewLines(workflow, groups, mineOnly && leaderTabs);
-  const dayCounts = (kind: "received" | "done") => new Map(daily.filter((row) => row.kind === kind).map((row) => [row.day, row.count]));
+  const riskMap = new Map<string, OverviewRiskRow>(
+    risks.map((row) => [
+      row.job_id,
+      {
+        reason: row.reason,
+        since: row.started_at,
+        evaluatedAt: row.evaluated_at,
+        workHours: Number(row.work_hours),
+        capacityHours: Number(row.capacity_hours),
+        hoursLeft: Number(row.hours_left),
+        people: row.people
+      }
+    ])
+  );
+  const scopeSwitch = hasOverviewScopeSwitch(roles);
+  const built = buildOverviewJobs({
+    now,
+    range: instants,
+    window,
+    alertMinutes: alertMinutesOf(settings),
+    jobs: jobs.map(toJobRow),
+    lines: lines.map((row) => toLineRow(row, workflow, finish)),
+    onLeaveNow,
+    risks: riskMap
+  });
+  const shown = scope === "mine" ? built.filter((job) => job.owned) : built;
+  const leaderNeeds = getsLeaderNeeds(roles);
+  const accountNeeds = getsAccountNeeds(roles);
+  const taskCreate = taskJobScopes(roles, settings.jobPermissions).create;
   return {
     today,
     timeZone,
     generatedAt: now.toISOString(),
     range,
-    leaderTabs: leaderTabs ? summary.tabs : null,
-    stats: summary.stats,
-    previous: comparison ? { ...comparison, ...summary.previous } : null,
-    byStatus: summary.byStatus,
-    daily: { ...chart, days: fillOverviewDays(chart, dayCounts("received"), dayCounts("done")) },
-    volume: {
-      totalQty: volume.reduce((sum, row) => sum + row.qty, 0),
-      withoutQty: volume.reduce((sum, row) => sum + row.without_qty, 0),
-      slices: overviewVolumeSlices(volume)
+    scope,
+    viewer: {
+      scopeSwitch,
+      defaultScope,
+      leaderNeeds,
+      accountNeeds,
+      canAssign: taskCreate !== "none" && (roles.includes("LEADER") || roles.includes("ADMIN")),
+      riskHistory: seesRiskHistory(roles)
     },
-    projects: projects.map(toProjectProgress),
-    dueToday: toDueList({ from: today, to: today }, dueToday),
-    dueThisWeek: toDueList(week, dueThisWeek)
+    scopeCounts: { mine: scopeSwitch ? built.filter((job) => job.owned).length : 0, all: built.length },
+    clock: { coreStart: window.start, coreEnd: window.end, alertHours: settings.alertAfterHours ?? 2 },
+    stageNames: stageNamesOf(workflow),
+    cards: overviewCards(shown),
+    leaderNeeds: leaderNeeds ? leaderNeedsOf(shown) : null,
+    accountNeeds: accountNeeds ? accountNeedsOf(shown) : null,
+    jobs: shown
   };
 };
+
+// Team load ------------------------------------------------------------------------------------------------------------
+
+type MemberDbRow = { user: UserRefJson; roles: string[]; leave_part: "FULL_DAY" | "MORNING" | "AFTERNOON" | null; leave_now: boolean };
+type LoadDbRow = { assignee_id: string; project_id: string; project_code: string; images: number; tasks: number; without_qty: number };
+
+/**
+ * GET /production/team-load (PD-080): "ảnh đang ôm" of every active production member holding STAFF, QC or LEADER (lines
+ * and subtasks in Mới giao / Đang làm / Cần sửa lại of live, not archived jobs — not Chờ QC), per project, and their
+ * approved leave today. For LEADER / ADMIN (they split tasks). Two grouped queries.
+ */
+export const getTeamLoad = async (context: AccessContext, now: Date = new Date()): Promise<TeamLoad> => {
+  assertProductionMember(context);
+  const roles = productionRolesOf(context);
+  if (!roles.has("LEADER") && !roles.has("ADMIN")) {
+    throw forbidden("Chỉ Leader và Quản trị xem tải việc của team.");
+  }
+  const sql = getSql();
+  const organizationId = context.organization.id;
+  const settings = await loadSettings(sql, organizationId);
+  const timeZone = coreWindowOf(settings).timeZone;
+  const today = dayInTimeZone(now, timeZone);
+  const [members, loads] = await Promise.all([
+    sql<MemberDbRow[]>`
+      SELECT ${userJsonSql(sql, "au")} AS user, array_agg(DISTINCT ur.role_code ORDER BY ur.role_code) AS roles,
+        (SELECT lr.part FROM production.leave_requests lr
+          WHERE lr.organization_id = ur.organization_id AND lr.user_id = ur.user_id AND lr.status = 'APPROVED'
+            AND ${today}::date BETWEEN lr.from_date AND lr.to_date
+          ORDER BY (lr.part = 'FULL_DAY') DESC, lr.from_date LIMIT 1) AS leave_part,
+        EXISTS (SELECT 1 FROM production.leave_requests lr
+          WHERE lr.organization_id = ur.organization_id AND lr.user_id = ur.user_id AND lr.status = 'APPROVED'
+            AND lr.slot_range @> (${now}::timestamptz AT TIME ZONE ${timeZone}::text)) AS leave_now
+      FROM production.user_roles ur
+      JOIN public.organization_memberships om
+        ON om.organization_id = ur.organization_id AND om.user_id = ur.user_id AND om.deleted_at IS NULL AND om.status = 'active'
+      JOIN public.app_users au ON au.id = ur.user_id
+      WHERE ur.organization_id = ${organizationId} AND ur.role_code IN ('STAFF', 'QC', 'LEADER')
+        AND ${visibleUserSql(sql, context)}
+      GROUP BY ur.organization_id, ur.user_id, au.id, au.display_name, au.email, au.avatar_url
+    `,
+    sql<LoadDbRow[]>`
+      SELECT t.assignee_id, p.id AS project_id, p.code AS project_code,
+        coalesce(sum(t.qty_assigned), 0)::int AS images,
+        count(*) FILTER (WHERE ${notSubtaskSql(sql)})::int AS tasks,
+        count(*) FILTER (WHERE ${notSubtaskSql(sql)} AND t.qty_assigned IS NULL AND NOT EXISTS (
+          SELECT 1 FROM production.tasks c
+          WHERE c.organization_id = t.organization_id AND c.parent_task_id = t.id AND c.kind = 'NORMAL' AND c.deleted_at IS NULL AND c.qty_assigned IS NOT NULL
+        ))::int AS without_qty
+      FROM production.tasks t
+      JOIN production.statuses st ON st.organization_id = t.organization_id AND st.id = t.status_id
+      JOIN production.jobs j ON j.organization_id = t.organization_id AND j.id = t.job_id AND j.deleted_at IS NULL AND j.archived_at IS NULL
+      JOIN production.projects p ON p.organization_id = j.organization_id AND p.id = j.project_id
+      WHERE t.organization_id = ${organizationId} AND t.deleted_at IS NULL AND st.code IN ('ASSIGNED', 'PROCESSING', 'REWORK')
+      GROUP BY t.assignee_id, p.id, p.code
+    `
+  ]);
+  const byPerson = new Map<string, LoadDbRow[]>();
+  for (const row of loads) {
+    const list = byPerson.get(row.assignee_id) ?? [];
+    list.push(row);
+    byPerson.set(row.assignee_id, list);
+  }
+  return {
+    today,
+    generatedAt: now.toISOString(),
+    members: members
+      .map((member) => {
+        const user = toUserRef(member.user)!;
+        const rows = (byPerson.get(user.id) ?? []).sort((a, b) => b.images - a.images || b.tasks - a.tasks || a.project_code.localeCompare(b.project_code));
+        return {
+          user,
+          roles: member.roles.filter((role): role is "STAFF" | "QC" | "LEADER" => role === "STAFF" || role === "QC" || role === "LEADER"),
+          leave: member.leave_part ? { part: member.leave_part, now: member.leave_now } : member.leave_now ? { part: "FULL_DAY" as const, now: true } : null,
+          openTasks: rows.reduce((sum, row) => sum + row.tasks, 0),
+          images: rows.reduce((sum, row) => sum + row.images, 0),
+          tasksWithoutQty: rows.reduce((sum, row) => sum + row.without_qty, 0),
+          byProject: rows.map((row) => ({ project: { id: row.project_id, code: row.project_code }, images: row.images, tasks: row.tasks }))
+        };
+      })
+      .sort((a, b) => a.user.displayName.localeCompare(b.user.displayName, "vi"))
+  };
+};
+
+// At risk history ------------------------------------------------------------------------------------------------------
+
+type EpisodeDbRow = {
+  job_id: string;
+  job_code: string;
+  project_id: string;
+  project_code: string;
+  project_name: string;
+  leader: UserRefJson | null;
+  reason: "CAPACITY" | "UNASSIGNED";
+  started_at: Date;
+  ended_at: Date | null;
+  end_reason: "CLEARED" | "FINISHED" | "CLIENT_LATE" | "REMOVED" | null;
+  deadline: Date;
+  job_deadline: Date;
+  delivered_at: Date | null;
+  delivered_kind: boolean;
+};
+
+/** A job was really client-late: delivered (first move to a DELIVERING / DELIVERED status) after its deadline, or still undelivered past it. */
+export const wasClientLate = (row: { deadline: Date; deliveredAt: Date | null; delivered: boolean }, now: Date) =>
+  row.deliveredAt ? row.deliveredAt > row.deadline : !row.delivered && row.deadline < now;
+
+/** Monday of the week of a day. */
+const mondayOf = (day: string) => addDays(day, -((new Date(`${day}T00:00:00Z`).getUTCDay() + 6) % 7));
+
+/**
+ * GET /production/overview/risk-history (PD-080): superadmin and Director only (403 otherwise). Episodes started in the
+ * range; one row per job (its first episode in the range), counted per week of that start, per Leader and per project.
+ */
+export const getRiskHistory = async (context: AccessContext, query: RiskHistoryQuery, now: Date = new Date()): Promise<RiskHistory> => {
+  assertProductionMember(context);
+  if (!seesRiskHistory([...productionRolesOf(context)])) {
+    throw forbidden("Lịch sử At risk dành cho Siêu quản trị và Director.");
+  }
+  const sql = getSql();
+  const organizationId = context.organization.id;
+  const settings = await loadSettings(sql, organizationId);
+  const timeZone = coreWindowOf(settings).timeZone;
+  const today = dayInTimeZone(now, timeZone);
+  const range = { from: query.from ?? query.to ?? addDays(mondayOf(today), -49), to: query.to ?? query.from ?? today };
+  const instants = rangeInstants(range, timeZone);
+  const rows = await sql<EpisodeDbRow[]>`
+    SELECT e.job_id, j.code AS job_code, p.id AS project_id, p.code AS project_code, p.name AS project_name,
+      CASE WHEN ul.id IS NULL THEN NULL ELSE ${userJsonSql(sql, "ul")} END AS leader,
+      e.reason, e.started_at, e.ended_at, e.end_reason, e.deadline, j.deadline AS job_deadline,
+      (SELECT min(l.created_at) FROM production.task_logs l
+        JOIN production.job_statuses ds ON ds.organization_id = l.organization_id AND ds.id::text = l.to_value->>'jobStatusId'
+        WHERE l.organization_id = j.organization_id AND l.job_id = j.id AND l.action = 'JOB' AND ds.kind IN ('DELIVERING', 'DELIVERED')) AS delivered_at,
+      js.kind IN ('DELIVERING', 'DELIVERED') AS delivered_kind
+    FROM production.job_risk_episodes e
+    JOIN production.jobs j ON j.organization_id = e.organization_id AND j.id = e.job_id
+    JOIN production.job_statuses js ON js.organization_id = j.organization_id AND js.id = j.job_status_id
+    JOIN production.projects p ON p.organization_id = j.organization_id AND p.id = j.project_id
+    LEFT JOIN public.app_users ul ON ul.id = e.leader_id
+    WHERE e.organization_id = ${organizationId} AND e.started_at >= ${instants.start} AND e.started_at < ${instants.end}
+      AND ${visibleUserIdSql(sql, context, sql`j.created_by`)}
+    ORDER BY e.started_at DESC
+  `;
+  type JobEntry = { row: EpisodeDbRow; episodes: number; clientLate: boolean };
+  const byJob = new Map<string, JobEntry>();
+  // Oldest episode first so a job is counted in the week its first episode of the range started.
+  for (const row of [...rows].reverse()) {
+    const entry = byJob.get(row.job_id);
+    if (entry) {
+      entry.episodes += 1;
+      // The latest episode's end (rows are oldest first here).
+      entry.row = { ...entry.row, ended_at: row.ended_at, end_reason: row.end_reason };
+      continue;
+    }
+    byJob.set(row.job_id, {
+      row,
+      episodes: 1,
+      clientLate: wasClientLate({ deadline: row.job_deadline, deliveredAt: row.delivered_at, delivered: row.delivered_kind }, now)
+    });
+  }
+  const entries = [...byJob.values()];
+  const tally = <K>(keyOf: (entry: JobEntry) => K) => {
+    const map = new Map<K, { jobs: number; clientLate: number; sample: JobEntry }>();
+    for (const entry of entries) {
+      const key = keyOf(entry);
+      const current = map.get(key) ?? { jobs: 0, clientLate: 0, sample: entry };
+      current.jobs += 1;
+      current.clientLate += entry.clientLate ? 1 : 0;
+      map.set(key, current);
+    }
+    return [...map.entries()];
+  };
+  return {
+    ...range,
+    totals: {
+      jobs: entries.length,
+      clientLate: entries.filter((entry) => entry.clientLate).length,
+      episodes: rows.length,
+      open: rows.filter((row) => row.ended_at === null).length
+    },
+    weeks: tally((entry) => mondayOf(dayInTimeZone(entry.row.started_at, timeZone)))
+      .map(([week, value]) => ({ week, jobs: value.jobs, clientLate: value.clientLate }))
+      .sort((a, b) => a.week.localeCompare(b.week)),
+    leaders: tally((entry) => entry.row.leader?.id ?? null)
+      .map(([, value]) => ({ leader: toUserRef(value.sample.row.leader), jobs: value.jobs, clientLate: value.clientLate }))
+      .sort((a, b) => b.jobs - a.jobs || (a.leader?.displayName ?? "").localeCompare(b.leader?.displayName ?? "", "vi")),
+    projects: tally((entry) => entry.row.project_id)
+      .map(([, value]) => ({
+        project: { id: value.sample.row.project_id, code: value.sample.row.project_code, name: value.sample.row.project_name },
+        jobs: value.jobs,
+        clientLate: value.clientLate
+      }))
+      .sort((a, b) => b.jobs - a.jobs || a.project.code.localeCompare(b.project.code)),
+    jobs: entries
+      .sort((a, b) => b.row.started_at.getTime() - a.row.started_at.getTime())
+      .slice(0, 200)
+      .map((entry) => ({
+        job: { id: entry.row.job_id, code: entry.row.job_code, project: { id: entry.row.project_id, code: entry.row.project_code } },
+        leader: toUserRef(entry.row.leader),
+        reason: entry.row.reason,
+        startedAt: toIso(entry.row.started_at),
+        endedAt: entry.row.ended_at ? toIso(entry.row.ended_at) : null,
+        endReason: entry.row.end_reason,
+        deadline: toIso(entry.row.job_deadline),
+        episodes: entry.episodes,
+        clientLate: entry.clientLate
+      }))
+  };
+};
+

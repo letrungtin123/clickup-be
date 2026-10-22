@@ -6,7 +6,6 @@ registerUniqueViolations({
   production_clients_name_uidx: { code: "CLIENT_NAME_TAKEN", message: "Tên khách hàng đã tồn tại." },
   production_projects_code_uidx: { code: "PROJECT_CODE_TAKEN", message: "Mã Project đã tồn tại." },
   production_processes_name_uidx: { code: "PROCESS_NAME_TAKEN", message: "Tên quy trình đã tồn tại." },
-  production_processes_single_qc_uidx: { code: "QC_PROCESS_EXISTS", message: "Đã có một quy trình QC đang hoạt động — tắt cờ QC ở quy trình kia trước." },
   production_shifts_name_uidx: { code: "SHIFT_NAME_TAKEN", message: "Tên ca làm đã tồn tại." },
   statuses_organization_id_code_key: { code: "STATUS_CODE_TAKEN", message: "Mã trạng thái đã tồn tại." },
   production_statuses_single_initial_uidx: { code: "INITIAL_STATUS_EXISTS", message: "Chỉ được có một trạng thái khởi tạo." },

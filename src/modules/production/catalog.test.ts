@@ -32,9 +32,9 @@ describe("parseCreditCsv (SPEC Phase 1 §6)", () => {
     );
     expect(errors).toEqual([]);
     expect(rows).toEqual([
-      { line: 2, projectCode: "ACME", processName: "Checking", credit: 0.25, money: null },
-      { line: 3, projectCode: "ACME", processName: "Normal Retouch", credit: 2.4, money: 6000 },
-      { line: 4, projectCode: "BETA", processName: "Premium Retouch", credit: 7.5, money: null }
+      { line: 2, projectCode: "ACME", processName: "Checking", credit: 0.25, money: null, hours: null },
+      { line: 3, projectCode: "ACME", processName: "Normal Retouch", credit: 2.4, money: 6000, hours: null },
+      { line: 4, projectCode: "BETA", processName: "Premium Retouch", credit: 7.5, money: null, hours: null }
     ]);
   });
 

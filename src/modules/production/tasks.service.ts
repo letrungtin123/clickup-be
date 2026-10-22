@@ -55,6 +55,7 @@ import {
   type TaskRow
 } from "./jobs.repo.js";
 import { enqueueProductionEvents, taskAssignedEvent, taskQtyEvent, taskQtyFilledEvent, taskStatusEvent } from "./notifications.js";
+import { assertProcessesPriced, pricingDay } from "./pricing.js";
 import { publishProductionChange } from "./realtime.js";
 import {
   assertTaskLinesCreatable,
@@ -672,6 +673,8 @@ export const listQcQueue = async (context: AccessContext, query: QcQueueQuery = 
 
 type JobForTasks = {
   id: string;
+  /** The job's project (PD-080b priced processes); optional for callers that build the row themselves (importers, tests). */
+  project_id?: string;
   leader_id: string | null;
   received_at: Date;
   deadline: Date;
@@ -683,7 +686,7 @@ type JobForTasks = {
 export const loadJobForTasks = async (tx: QuerySql, organizationId: string, jobId: string, lock: boolean) => {
   const job = (
     await tx<(JobForTasks & { archived_at: Date | null })[]>`
-      SELECT j.id, j.leader_id, j.received_at, j.deadline, j.total_images, j.total_images_manual, p.qc_buffer_hours, j.archived_at
+      SELECT j.id, j.project_id, j.leader_id, j.received_at, j.deadline, j.total_images, j.total_images_manual, p.qc_buffer_hours, j.archived_at
       FROM production.jobs j JOIN production.projects p ON p.organization_id = j.organization_id AND p.id = j.project_id
       WHERE j.organization_id = ${organizationId} AND j.id = ${jobId} AND j.deleted_at IS NULL
       ${lock ? tx`FOR UPDATE OF j` : tx``}
@@ -748,6 +751,10 @@ const assertLines = async (
  * PD-047: every NORMAL work line (not a Checking line) must name a QC ("Task N: Chọn QC cho task.", 400
  * TASK_LINES_INVALID). `historicQcOptional` lifts that rule for the work-log importers only (BE/scripts), which replay
  * history recorded without QC; API paths never set it.
+ *
+ * PD-080b: `requirePricedProcess` (the API paths "Chia task" and "Nhập Task") — every line's process must be priced for the
+ * job's project on the line's Ngày nhận (none given: today), else 400 PROCESS_NOT_PRICED (pricing.ts). Importers and seed
+ * scripts leave it off (history keeps the prices of its time).
  */
 export const insertTasks = async (
   tx: QuerySql,
@@ -755,10 +762,25 @@ export const insertTasks = async (
   workflow: Workflow,
   job: JobForTasks,
   lines: (CreateTaskLine & { sourceTaskId?: string | undefined })[],
-  options: { kind: TaskKind; feedbackId: string | null; defaultParentId: string | null; assignedAt?: Date; historicQcOptional?: boolean }
+  options: {
+    kind: TaskKind;
+    feedbackId: string | null;
+    defaultParentId: string | null;
+    assignedAt?: Date;
+    historicQcOptional?: boolean;
+    requirePricedProcess?: boolean;
+  }
 ) => {
   const organizationId = context.organization.id;
   await assertLines(tx, organizationId, lines, { requireQc: options.kind === "NORMAL" && options.historicQcOptional !== true });
+  if (options.requirePricedProcess && job.project_id) {
+    await assertProcessesPriced(
+      tx,
+      organizationId,
+      job.project_id,
+      lines.map((line, index) => ({ processId: line.processId, day: pricingDay(line.assignedAt), prefix: lines.length > 1 ? `Task ${index + 1}: ` : "" }))
+    );
+  }
   const initial = workflow.statuses.find((status) => status.isInitial && status.active);
   if (!initial) {
     throw new AppError("WORKFLOW_INCOMPLETE", "Chưa có trạng thái khởi tạo trong cấu hình.", 409);
@@ -918,7 +940,7 @@ export const createProductionTasks = async (context: AccessContext, jobId: strin
     await assertJobVisible(tx, context, jobId);
     assertTaskLinesCreatable(context, await loadTaskScopes(tx, context), lines.map((line) => line.assigneeId));
     const workflow = await loadWorkflowModel(tx, organizationId);
-    const created = await insertTasks(tx, context, workflow, job, lines, { kind: "NORMAL", feedbackId: null, defaultParentId: null });
+    const created = await insertTasks(tx, context, workflow, job, lines, { kind: "NORMAL", feedbackId: null, defaultParentId: null, requirePricedProcess: true });
     await settleJob(tx, organizationId, workflow, jobId);
     return created;
   });
@@ -1198,6 +1220,8 @@ const updateSubtask = async (tx: QuerySql, context: AccessContext, locked: Await
     if (problem) {
       throw new AppError("PROCESS_INVALID", problem, 400);
     }
+    // PD-080b: priced for the job's project on its line's Ngày nhận (a subtask keeps its line's).
+    await assertProcessesPriced(tx, organizationId, task.project_id, [{ processId, day: pricingDay(task.assigned_at) }]);
     processName = process!.name;
   }
   // PD-058: the line gives the difference only when it has a number (an empty subtask counts 0 in the pool).
@@ -1339,6 +1363,11 @@ export const updateProductionTask = async (context: AccessContext, taskId: strin
     const assignedAt = input.assignedAt ? new Date(input.assignedAt) : task.assigned_at;
     if ((input.deadline || input.assignedAt) && deadline < assignedAt) {
       throw new AppError("TASK_DATES_INVALID", "Ngày giao phải từ Ngày nhận trở đi.", 400);
+    }
+    // PD-080b: a new process, or a new Ngày nhận, must be priced for the job's project on that day.
+    const processChanged = input.processId !== undefined && input.processId !== task.process_id;
+    if (processChanged || pricingDay(assignedAt) !== pricingDay(task.assigned_at)) {
+      await assertProcessesPriced(tx, organizationId, task.project_id, [{ processId: input.processId ?? task.process_id, day: pricingDay(assignedAt) }]);
     }
     const errorQty = input.errorQty === undefined ? task.error_qty : input.errorQty;
     const otHours = input.otHours === undefined ? (task.ot_hours === null ? null : Number(task.ot_hours)) : input.otHours;

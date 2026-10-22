@@ -166,6 +166,10 @@ describe("production settings: close day; no Khoán pay policy, no moneyPublic (
       chatAttachmentsEnabled: true,
       jobPermissions: defaultJobPermissions,
       featurePermissions: defaultFeaturePermissions,
+      // PD-080: the Overview core window and alert threshold.
+      coreWindowStart: "09:30",
+      coreWindowEnd: "16:30",
+      alertAfterHours: 2,
       timezone: "Asia/Ho_Chi_Minh"
     };
     const parsed = ProductionSettingsSchema.parse({ ...settings, moneyPublic: true, khoanPayPolicy: "ALWAYS" });

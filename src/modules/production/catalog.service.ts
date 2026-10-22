@@ -23,6 +23,8 @@ import type {
   UpdateProductionSettingsRequestSchema
 } from "../../contracts/production-catalog.js";
 import {
+  defaultAlertAfterHours,
+  defaultCoreWindow,
   defaultFeaturePermissions,
   defaultJobPermissions,
   effectiveJobScopes,
@@ -51,7 +53,7 @@ import {
   productionRolesOf
 } from "./access.js";
 import { cachedConfig, invalidateProductionConfig } from "./catalog-cache.js";
-import { deleteCreditRuleVersion, importCreditRules, listRuleHistory, listRulesAt, setCreditRule, startNewVersion } from "./credit-rules.js";
+import { deleteCreditRuleVersion, importCreditRules, listRuleHistory, listRulesAt, setCreditRule, startNewVersion, versionInfoAt } from "./credit-rules.js";
 import { matchesCustomFieldFilters, resolveCustomFieldFilters, resolveCustomValues, setEntityTags } from "./custom-fields.js";
 import { selectProductionProjects, toProductionProject } from "./projects.service.js";
 import { businessDay, isValidDay } from "./time.js";
@@ -74,6 +76,10 @@ const settingKeys: Record<Exclude<keyof ProductionSettings, "kpiCloseDays">, str
   chatAttachmentsEnabled: "chat_attachments_enabled",
   jobPermissions: "job_permissions",
   featurePermissions: "feature_permissions",
+  // PD-080: the Overview core window and alert threshold.
+  coreWindowStart: "core_window_start",
+  coreWindowEnd: "core_window_end",
+  alertAfterHours: "alert_after_hours",
   timezone: "timezone"
 };
 
@@ -91,6 +97,10 @@ const defaults: ProductionSettings = {
   jobPermissions: defaultJobPermissions,
   // PD-065: the owner's defaults; nothing is stored until the superadmin saves the matrix.
   featurePermissions: defaultFeaturePermissions,
+  // PD-080: nothing is stored until the superadmin saves Cấu hình → Chung.
+  coreWindowStart: defaultCoreWindow.start,
+  coreWindowEnd: defaultCoreWindow.end,
+  alertAfterHours: defaultAlertAfterHours,
   timezone: "Asia/Ho_Chi_Minh"
 };
 
@@ -189,6 +199,13 @@ export const getSettings = async (context: AccessContext) => {
 export const updateSettings = async (context: AccessContext, input: In<typeof UpdateProductionSettingsRequestSchema>) => {
   assertConfigEditor(context);
   const sql = getSql();
+  // PD-080: the core window must stay a window (one end may be sent alone).
+  if (input.coreWindowStart !== undefined || input.coreWindowEnd !== undefined) {
+    const current = await loadSettings(sql, org(context));
+    if ((input.coreWindowStart ?? current.coreWindowStart) >= (input.coreWindowEnd ?? current.coreWindowEnd)) {
+      throw new AppError("CORE_WINDOW_INVALID", "Giờ bắt đầu khung lõi phải trước giờ kết thúc.", 400);
+    }
+  }
   await sql.begin(async (tx) => {
     if (input.kpiCloseDay !== undefined) {
       await scheduleCloseDay(tx, org(context), input.kpiCloseDay, context.user.id, businessDay(new Date()));
@@ -923,17 +940,19 @@ export const getCreditMatrix = async (context: AccessContext, at: string | undef
     throw new AppError("INVALID_DATE", "Ngày không hợp lệ.", 400);
   }
   const sql = getSql();
-  const [projects, processes, rules, money] = await Promise.all([
+  const [projects, processes, rules, money, version] = await Promise.all([
     selectProductionProjects(sql, context),
     listProcesses(context),
     listRulesAt(sql, org(context), day),
-    canSeeMoney(context)
+    canSeeMoney(context),
+    versionInfoAt(sql, org(context), day)
   ]);
   return {
     at: day,
     projects: projects.map((row) => toProductionProject(context, row)),
     processes: processes.items,
-    rules: rules.map((rule) => stripMoney(rule, money))
+    rules: rules.map((rule) => stripMoney(rule, money)),
+    version
   };
 };
 

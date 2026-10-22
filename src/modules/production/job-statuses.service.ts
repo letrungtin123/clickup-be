@@ -2,6 +2,7 @@ import type {
   CreateJobStatusRequest,
   DeleteJobStatusResult,
   JobStatusCollection,
+  JobStatusKind,
   UpdateJobStatusRequest
 } from "../../contracts/production-catalog.js";
 import { jobStatusLimit } from "../../contracts/production-catalog.js";
@@ -36,6 +37,7 @@ type JobStatusRow = {
   position: number;
   is_closed: boolean;
   requires_all_checked: boolean;
+  kind: JobStatusKind;
   job_count: number | null;
   updated_at: Date;
   updated_by: UserRefJson | null;
@@ -64,7 +66,7 @@ export const jobStatusLogValue = (status: Pick<JobStatusRef, "id" | "name" | "co
 });
 
 const selectStatuses = (sql: QuerySql, organizationId: string, withCounts: boolean) => sql<JobStatusRow[]>`
-  SELECT s.id, s.name, s.color, s.position, s.is_closed, s.requires_all_checked, s.updated_at,
+  SELECT s.id, s.name, s.color, s.position, s.is_closed, s.requires_all_checked, s.kind, s.updated_at,
     ${
       withCounts
         ? sql`(SELECT count(*)::int FROM production.jobs j
@@ -96,6 +98,7 @@ export const listJobStatuses = async (context: AccessContext): Promise<JobStatus
       position: row.position,
       isClosed: row.is_closed,
       requiresAllChecked: row.requires_all_checked,
+      kind: row.kind,
       jobCount: row.job_count,
       updatedAt: toIso(row.updated_at),
       updatedBy: toUserRef(row.updated_by)
@@ -104,7 +107,7 @@ export const listJobStatuses = async (context: AccessContext): Promise<JobStatus
 };
 
 /** POST /production/job-statuses (superadmin, PD-050): appended after the last one. */
-export const createJobStatus = async (context: AccessContext, input: CreateJobStatusRequest) => {
+export const createJobStatus = async (context: AccessContext, input: Omit<CreateJobStatusRequest, "kind"> & { kind?: JobStatusKind | undefined }) => {
   assertConfigEditor(context);
   const sql = getSql();
   await sql.begin(async (tx) => {
@@ -115,8 +118,8 @@ export const createJobStatus = async (context: AccessContext, input: CreateJobSt
       throw new AppError("JOB_STATUS_LIMIT", `Tối đa ${jobStatusLimit} trạng thái job.`, 409);
     }
     await tx`
-      INSERT INTO production.job_statuses (organization_id, name, color, position, is_closed, requires_all_checked, created_by, updated_by)
-      SELECT ${org(context)}, ${input.name}, ${input.color}, coalesce(max(position), 0) + 1, ${input.isClosed}, ${input.requiresAllChecked},
+      INSERT INTO production.job_statuses (organization_id, name, color, position, is_closed, requires_all_checked, kind, created_by, updated_by)
+      SELECT ${org(context)}, ${input.name}, ${input.color}, coalesce(max(position), 0) + 1, ${input.isClosed}, ${input.requiresAllChecked}, ${input.kind ?? "IN_PROGRESS"},
         ${context.user.id}, ${context.user.id}
       FROM production.job_statuses WHERE organization_id = ${org(context)}
     `;
@@ -126,7 +129,8 @@ export const createJobStatus = async (context: AccessContext, input: CreateJobSt
 
 /**
  * PATCH /production/job-statuses/:id (superadmin, PD-050): rename, colour, "đóng", "cần check hết task" (requiresAllChecked, PD-045 —
- * turning it on moves no job: jobs already in the status keep it). Jobs keep the status (they hold its id).
+ * turning it on moves no job: jobs already in the status keep it), its kind (PD-080, the Overview's meaning). Jobs keep the
+ * status (they hold its id).
  */
 export const updateJobStatus = async (context: AccessContext, id: string, input: UpdateJobStatusRequest) => {
   assertConfigEditor(context);
@@ -135,13 +139,15 @@ export const updateJobStatus = async (context: AccessContext, id: string, input:
   const color = input.color ?? null;
   const closed = input.isClosed ?? null;
   const allChecked = input.requiresAllChecked ?? null;
+  const kind = input.kind ?? null;
   const rows = await sql<{ id: string }[]>`
     UPDATE production.job_statuses
     SET name = coalesce(${name}, name), color = coalesce(${color}, color), is_closed = coalesce(${closed}::boolean, is_closed),
-      requires_all_checked = coalesce(${allChecked}::boolean, requires_all_checked), updated_by = ${context.user.id}
+      requires_all_checked = coalesce(${allChecked}::boolean, requires_all_checked), kind = coalesce(${kind}, kind), updated_by = ${context.user.id}
     WHERE organization_id = ${org(context)} AND id = ${id}
-      AND (name, color, is_closed, requires_all_checked) IS DISTINCT FROM
-        (coalesce(${name}, name), coalesce(${color}, color), coalesce(${closed}::boolean, is_closed), coalesce(${allChecked}::boolean, requires_all_checked))
+      AND (name, color, is_closed, requires_all_checked, kind) IS DISTINCT FROM
+        (coalesce(${name}, name), coalesce(${color}, color), coalesce(${closed}::boolean, is_closed), coalesce(${allChecked}::boolean, requires_all_checked),
+          coalesce(${kind}, kind))
     RETURNING id
   `;
   if (rows.length === 0) {

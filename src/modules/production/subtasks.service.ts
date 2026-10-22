@@ -8,6 +8,7 @@ import { assertProductionMember, productionRolesOf } from "./access.js";
 import { forbidden, loadTaskScopes, subtaskManageAllowed, taskCreateForbidden } from "./job-permissions.js";
 import { isSubtaskRow } from "./jobs.repo.js";
 import { publishProductionChange } from "./realtime.js";
+import { assertProcessesPriced, pricingDay } from "./pricing.js";
 import { maxSubtaskSeq, taskCode } from "./task-codes.js";
 import { getProductionTask, insertTaskLogs, lockedTask, settleJob } from "./tasks.service.js";
 import { subtaskProcessProblem, subtaskQtyProblem } from "./workflow.js";
@@ -70,6 +71,8 @@ export const createProductionSubtask = async (context: AccessContext, taskId: st
     if (processProblem) {
       throw new AppError("PROCESS_INVALID", processProblem, 400);
     }
+    // PD-080b: priced for the job's project on the line's Ngày nhận (the subtask takes the line's).
+    await assertProcessesPriced(tx, organizationId, task.project_id, [{ processId: input.processId, day: pricingDay(task.assigned_at) }]);
     // PD-058: the quantity is optional; it is carved from the line only when both have a number (same rule as before).
     const qty = input.qtyAssigned ?? null;
     const carve = qty !== null && task.qty_assigned !== null;

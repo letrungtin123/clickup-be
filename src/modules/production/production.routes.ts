@@ -91,6 +91,7 @@ import {
   upsertTeam
 } from "./catalog.service.js";
 import { createJobStatus, deleteJobStatus, listJobStatuses, reorderJobStatuses, updateJobStatus } from "./job-statuses.service.js";
+import { myOverviewHandler } from "./my-overview.routes.js";
 import { createProject, deleteProject, listProjects, updateProject } from "./projects.service.js";
 
 const DayQuery = z.object({ at: z.string().optional() });
@@ -135,6 +136,8 @@ export const createProductionRoutes = (): ExpressRouter => {
   routes.use("/me/notification-preferences", requireSupabaseUser);
 
   routes.get("/production/me", handle(async (context) => ProductionMeSchema.parse(await getProductionMe(context))));
+  // "Tổng quan của tôi" (PD-081): my own lines, points / KPI and QC queue.
+  routes.get("/production/my-overview", myOverviewHandler);
 
   // Members
   routes.get(

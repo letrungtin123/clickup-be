@@ -664,23 +664,46 @@ export const UpsertShiftRequestSchema = z
 
 // Credit rules ------------------------------------------------------------------------------------
 
+/**
+ * PD-080 "Giờ/tấm": with no hours typed / imported for a price, the estimate uses credit ÷ this (the official price file:
+ * Final Credit = hours × 11).
+ */
+export const creditPerHour = 11;
+/** Hours per image of a price: its own, else credit ÷ `creditPerHour` (PD-080); null without a price. */
+export const hoursPerImageOf = (rule: { creditPerImage: number; hoursPerImage?: number | null | undefined } | null | undefined) =>
+  rule ? (rule.hoursPerImage ?? Math.round((rule.creditPerImage / creditPerHour) * 10_000) / 10_000) : null;
+
 export const CreditRuleSchema = z.object({
   id: Id,
   projectId: Id,
   processId: Id,
   creditPerImage: z.number(),
   moneyPerImage: z.number().int().nullable(),
+  /** PD-080 "Giờ/tấm" (estimated work hours for one image); null = not set (derived as credit ÷ 11, `hoursPerImageOf`). */
+  hoursPerImage: z.number().nullable().optional(),
+  /** PD-080: the file this row was imported from (e.g. "Bang_gia_202610"); null for prices typed in the app. */
+  source: z.string().nullable().optional(),
   effectiveFrom: DateOnly,
   effectiveTo: DateOnly.nullable()
 });
 export type CreditRule = z.infer<typeof CreditRuleSchema>;
+
+/** PD-080: the name / source file of a price version (the rules starting on `effectiveFrom`), set by the import. */
+export const CreditVersionInfoSchema = z.object({
+  effectiveFrom: DateOnly,
+  name: z.string().nullable(),
+  source: z.string().nullable()
+});
+export type CreditVersionInfo = z.infer<typeof CreditVersionInfoSchema>;
 
 /** Matrix of rules effective on `at` (projects × processes), plus version history per cell on demand. */
 export const CreditMatrixSchema = z.object({
   at: DateOnly,
   projects: z.array(ProductionProjectSchema),
   processes: z.array(ProcessSchema),
-  rules: z.array(CreditRuleSchema)
+  rules: z.array(CreditRuleSchema),
+  /** PD-080: the named version in force on `at` (the latest one starting on or before it); null when none is named. */
+  version: CreditVersionInfoSchema.nullable().optional()
 });
 export type CreditMatrix = z.infer<typeof CreditMatrixSchema>;
 
@@ -692,6 +715,11 @@ export const SetCreditRuleRequestSchema = z
     processId: Id,
     creditPerImage: z.number().min(0).max(99_999_999.99),
     moneyPerImage: z.number().int().min(0).max(1_000_000_000).nullable(),
+    /**
+     * PD-080 "Giờ/tấm" (0–1000 hours); null clears it (credit ÷ 11 is used), omitted keeps the value of the version in
+     * force on `effectiveFrom`.
+     */
+    hoursPerImage: z.number().min(0).max(1000).nullable().optional(),
     /** New version starts on this day (VN calendar day); the previous version ends the day before. */
     effectiveFrom: DateOnly
   })
@@ -703,12 +731,20 @@ export const CreditVersionResultSchema = z.object({ created: z.number().int() })
 /** Bulk reorder of processes, shifts or custom fields (ids in the new order). */
 export const ReorderCatalogRequestSchema = z.object({ ids: z.array(Id).min(1).max(500) }).strict();
 
+/**
+ * Price import (CSV: project_code, process_name, credit, money and — PD-080 — an optional `hours` column = "Giờ/tấm").
+ * PD-080: `source` = the file it came from (stored on every imported row and on the version), `versionName` = an optional
+ * name of the new version (e.g. "Đơn giá 10/2026"). The import always writes a version starting on `effectiveFrom`;
+ * older versions are never overwritten (PR-12).
+ */
 export const CreditImportRequestSchema = z
   .object({
     csv: SafeText().min(1).max(2_000_000),
     effectiveFrom: DateOnly,
     /** Create unknown project codes / process names instead of rejecting the rows. */
-    createMissing: z.boolean().default(false)
+    createMissing: z.boolean().default(false),
+    source: SafeText().trim().min(1).max(200).optional(),
+    versionName: SafeText().trim().min(1).max(120).optional()
   })
   .strict();
 
@@ -850,6 +886,28 @@ export const jobStatusNameMaxLength = 60;
 /** At most this many statuses per organization. */
 export const jobStatusLimit = 50;
 
+/**
+ * PD-080 — the stable meaning of an admin-named job status (Overview V2): NEW (Mới nhận) · IN_PROGRESS (Đang làm, Chờ QC)
+ * · FEEDBACK (client feedback) · COMPLETE (Đã xong, ready to deliver) · DELIVERING (Đang giao client) · DELIVERED (Đã giao
+ * khách). A job is client-late when its client deadline passed and its kind is neither DELIVERING nor DELIVERED; At risk
+ * stops at COMPLETE and later. "Ready to complete" is derived (every line checked, kind before COMPLETE), not a kind.
+ */
+export const jobStatusKinds = ["NEW", "IN_PROGRESS", "FEEDBACK", "COMPLETE", "DELIVERING", "DELIVERED"] as const;
+export const JobStatusKindSchema = z.enum(jobStatusKinds);
+export type JobStatusKind = z.infer<typeof JobStatusKindSchema>;
+export const jobStatusKindLabels: Record<JobStatusKind, string> = {
+  NEW: "Mới (New)",
+  IN_PROGRESS: "Đang làm (In progress)",
+  FEEDBACK: "Feedback của khách",
+  COMPLETE: "Complete (xong, chờ giao)",
+  DELIVERING: "Đang giao client",
+  DELIVERED: "Đã giao khách"
+};
+/** Kinds where the job counts as delivered to the client (never client-late). */
+export const deliveredJobStatusKinds: readonly JobStatusKind[] = ["DELIVERING", "DELIVERED"];
+/** Kinds where the production work is over (no At risk, not "Chưa chia", not "ready to complete"). */
+export const finishedJobStatusKinds: readonly JobStatusKind[] = ["COMPLETE", "DELIVERING", "DELIVERED"];
+
 export const JobStatusSchema = z.object({
   id: Id,
   name: z.string(),
@@ -858,6 +916,8 @@ export const JobStatusSchema = z.object({
   isClosed: z.boolean(),
   /** PD-045: chosen only when every line of the job is "Đã check" (a Checking line: Done) — e.g. "Đã xong". */
   requiresAllChecked: z.boolean(),
+  /** PD-080: its stable meaning (Overview V2). Always sent since PD-080 (optional only for older test fixtures). */
+  kind: JobStatusKindSchema.optional(),
   /** Jobs (not deleted) in this status; null for non-admins (the settings page shows it). */
   jobCount: z.number().int().nullable(),
   /** Last change of the status (like settings' updated_by / updated_at); updatedBy null = migration / system. */
@@ -874,7 +934,8 @@ export const CreateJobStatusRequestSchema = z
     name: JobStatusName,
     color: Color.default("slate"),
     isClosed: z.boolean().default(false),
-    requiresAllChecked: z.boolean().default(false)
+    requiresAllChecked: z.boolean().default(false),
+    kind: JobStatusKindSchema.default("IN_PROGRESS")
   })
   .strict();
 export type CreateJobStatusRequest = z.infer<typeof CreateJobStatusRequestSchema>;
@@ -883,7 +944,8 @@ export const UpdateJobStatusRequestSchema = z
     name: JobStatusName.optional(),
     color: Color.optional(),
     isClosed: z.boolean().optional(),
-    requiresAllChecked: z.boolean().optional()
+    requiresAllChecked: z.boolean().optional(),
+    kind: JobStatusKindSchema.optional()
   })
   .strict()
   .refine((value) => Object.values(value).some((entry) => entry !== undefined), { message: "Gửi ít nhất một trường cần sửa." });
@@ -899,6 +961,12 @@ export const DeleteJobStatusResultSchema = JobStatusCollectionSchema.extend({
 export type DeleteJobStatusResult = z.infer<typeof DeleteJobStatusResultSchema>;
 
 // Settings & whitelist ----------------------------------------------------------------------------
+
+/** "HH:MM" (24 h) of the core window (PD-080). */
+export const CoreTimeSchema = z.string().regex(/^(?:[01]\d|2[0-3]):[0-5]\d$/, "Giờ dạng HH:MM (00:00 – 23:59).");
+/** PD-080 defaults: core window 09:30 – 16:30 (working days Mon–Sat), alerts after 2 hours of core time. */
+export const defaultCoreWindow = { start: "09:30", end: "16:30" } as const;
+export const defaultAlertAfterHours = 2;
 
 export const ProductionSettingsSchema = z.object({
   /**
@@ -931,10 +999,24 @@ export const ProductionSettingsSchema = z.object({
    * superadmin only (PATCH, PD-050); the superadmin always has every feature whatever the value.
    */
   featurePermissions: FeaturePermissionMatrixSchema,
+  /**
+   * PD-080 "Khung giờ lõi" (HH:MM, organization time, working days Mon–Sat): the Overview clocks ("Chờ QC", "Không cập
+   * nhật") run only inside it and the At risk capacity counts only its hours. Default 09:30 – 16:30; start before end.
+   */
+  coreWindowStart: CoreTimeSchema,
+  coreWindowEnd: CoreTimeSchema,
+  /** PD-080: core-time hours after which "Chờ QC" / "Không cập nhật" / an Account's new job "chưa chia" alert. Default 2. */
+  alertAfterHours: z.number().min(0.25).max(24),
   timezone: z.string()
 });
 export type ProductionSettings = z.infer<typeof ProductionSettingsSchema>;
-export const UpdateProductionSettingsRequestSchema = ProductionSettingsSchema.omit({ timezone: true, kpiCloseDays: true }).partial().strict();
+export const UpdateProductionSettingsRequestSchema = ProductionSettingsSchema.omit({ timezone: true, kpiCloseDays: true })
+  .partial()
+  .strict()
+  .refine((value) => !value.coreWindowStart || !value.coreWindowEnd || value.coreWindowStart < value.coreWindowEnd, {
+    message: "Giờ bắt đầu khung lõi phải trước giờ kết thúc.",
+    path: ["coreWindowEnd"]
+  });
 
 export const AllowedEmailSchema = z.object({ email: z.string(), addedBy: z.string().nullable(), createdAt: IsoDate });
 export const AllowedEmailCollectionSchema = z.object({ items: z.array(AllowedEmailSchema) });

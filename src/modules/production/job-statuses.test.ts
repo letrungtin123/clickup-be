@@ -452,12 +452,12 @@ describe("Cấu hình → Trạng thái job (PD-038)", () => {
     await createJobStatus(owner, CreateJobStatusRequestSchema.parse({ name: "  Chờ duyệt ", color: "teal", isClosed: false }));
     const insert = callsLike(/^INSERT INTO production\.job_statuses/)[0]!;
     expect(insert.text).toContain("coalesce(max(position), 0) + 1");
-    // requiresAllChecked defaults to false (PD-045).
-    expect(insert.values).toEqual([org, "Chờ duyệt", "teal", false, false, me, me, org]);
+    // requiresAllChecked defaults to false (PD-045); the kind to IN_PROGRESS (PD-080).
+    expect(insert.values).toEqual([org, "Chờ duyệt", "teal", false, false, "IN_PROGRESS", me, me, org]);
     db.state.calls = [];
     await createJobStatus(owner, CreateJobStatusRequestSchema.parse({ name: "Xong hết", requiresAllChecked: true }));
     expect(callsLike(/^INSERT INTO production\.job_statuses/)[0]!.text).toContain("requires_all_checked");
-    expect(callsLike(/^INSERT INTO production\.job_statuses/)[0]!.values).toEqual([org, "Xong hết", "slate", false, true, me, me, org]);
+    expect(callsLike(/^INSERT INTO production\.job_statuses/)[0]!.values).toEqual([org, "Xong hết", "slate", false, true, "IN_PROGRESS", me, me, org]);
     db.state.handler = (call) => (call.text.startsWith("UPDATE production.job_statuses") ? [{ id: statusNew }] : undefined);
     await updateJobStatus(owner, statusNew, UpdateCatalogStatusSchema.parse({ isClosed: true }));
     expect(callsLike(/^UPDATE production\.job_statuses/)[0]!.values).toContain(me);

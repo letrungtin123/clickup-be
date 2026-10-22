@@ -1,4 +1,4 @@
-import type { CreditImportResult, CreditRule } from "../../contracts/production-catalog.js";
+import type { CreditImportResult, CreditRule, CreditVersionInfo } from "../../contracts/production-catalog.js";
 import { AppError } from "../../lib/app-error.js";
 import type { QuerySql } from "../../lib/db-types.js";
 import { parseCsv } from "./csv.js";
@@ -10,12 +10,14 @@ export type CreditRuleRow = {
   process_id: string;
   credit_per_image: string;
   money_per_image: string | null;
+  hours_per_image: string | null;
+  source: string | null;
   effective_from: string;
   effective_to: string | null;
 };
 
 const dateColumns = (sql: QuerySql) => sql`
-  id, project_id, process_id, credit_per_image::text, money_per_image::text,
+  id, project_id, process_id, credit_per_image::text, money_per_image::text, hours_per_image::text, source,
   to_char(effective_from, 'YYYY-MM-DD') AS effective_from, to_char(effective_to, 'YYYY-MM-DD') AS effective_to
 `;
 
@@ -25,6 +27,8 @@ export const toCreditRule = (row: CreditRuleRow): CreditRule => ({
   processId: row.process_id,
   creditPerImage: Number(row.credit_per_image),
   moneyPerImage: row.money_per_image === null ? null : Number(row.money_per_image),
+  hoursPerImage: row.hours_per_image === null ? null : Number(row.hours_per_image),
+  source: row.source,
   effectiveFrom: row.effective_from,
   effectiveTo: row.effective_to
 });
@@ -141,6 +145,10 @@ export const setCreditRule = async (
     processId: string;
     creditPerImage: number;
     moneyPerImage: number | null;
+    /** PD-080 "Giờ/tấm": undefined keeps the value of the version in force that day (or of the same-day version). */
+    hoursPerImage?: number | null | undefined;
+    /** PD-080: the import file; undefined = typed in the app (no source on a new row, unchanged on a same-day fix). */
+    source?: string | null | undefined;
     effectiveFrom: string;
     userId: string | null;
   }
@@ -164,15 +172,17 @@ export const setCreditRule = async (
     }
     await sql`
       UPDATE production.credit_rules
-      SET credit_per_image = ${input.creditPerImage}, money_per_image = ${input.moneyPerImage}
+      SET credit_per_image = ${input.creditPerImage}, money_per_image = ${input.moneyPerImage},
+        hours_per_image = ${input.hoursPerImage === undefined ? sql`hours_per_image` : sql`${input.hoursPerImage}::numeric`},
+        source = ${input.source === undefined ? sql`source` : sql`${input.source}::text`}
       WHERE id = ${sameDay.id}
     `;
     return sameDay.id;
   }
 
   const covering = (
-    await sql<{ id: string; effective_to: string | null }[]>`
-      SELECT id, to_char(effective_to, 'YYYY-MM-DD') AS effective_to FROM production.credit_rules
+    await sql<{ id: string; effective_to: string | null; hours_per_image: string | null }[]>`
+      SELECT id, to_char(effective_to, 'YYYY-MM-DD') AS effective_to, hours_per_image::text FROM production.credit_rules
       WHERE organization_id = ${input.organizationId} AND project_id = ${input.projectId} AND process_id = ${input.processId}
         AND effective_from < ${input.effectiveFrom}::date
         AND (effective_to IS NULL OR ${input.effectiveFrom}::date < effective_to)
@@ -180,6 +190,8 @@ export const setCreditRule = async (
     `
   )[0];
   let newEnd: string | null = null;
+  // PD-080: a new version keeps the hours of the one it follows unless new hours are given.
+  const hours = input.hoursPerImage !== undefined ? input.hoursPerImage : covering?.hours_per_image != null ? Number(covering.hours_per_image) : null;
   if (covering) {
     const usedUntil = await lastPricedDay(sql, input.organizationId, covering.id);
     if (usedUntil && usedUntil >= input.effectiveFrom) {
@@ -201,9 +213,10 @@ export const setCreditRule = async (
 
   const created = (
     await sql<{ id: string }[]>`
-      INSERT INTO production.credit_rules (organization_id, project_id, process_id, credit_per_image, money_per_image, effective_from, effective_to, created_by)
+      INSERT INTO production.credit_rules
+        (organization_id, project_id, process_id, credit_per_image, money_per_image, hours_per_image, source, effective_from, effective_to, created_by)
       VALUES (${input.organizationId}, ${input.projectId}, ${input.processId}, ${input.creditPerImage}, ${input.moneyPerImage},
-              ${input.effectiveFrom}::date, ${newEnd}::date, ${input.userId})
+              ${hours}, ${input.source ?? null}, ${input.effectiveFrom}::date, ${newEnd}::date, ${input.userId})
       RETURNING id
     `
   )[0]!;
@@ -253,6 +266,8 @@ export const startNewVersion = async (sql: QuerySql, organizationId: string, eff
       processId: rule.processId,
       creditPerImage: rule.creditPerImage,
       moneyPerImage: rule.moneyPerImage,
+      hoursPerImage: rule.hoursPerImage ?? null,
+      source: rule.source ?? null,
       effectiveFrom,
       userId
     });
@@ -261,7 +276,10 @@ export const startNewVersion = async (sql: QuerySql, organizationId: string, eff
   return created;
 };
 
-export type ParsedCreditRow = { line: number; projectCode: string; processName: string; credit: number; money: number | null };
+export type ParsedCreditRow = { line: number; projectCode: string; processName: string; credit: number; money: number | null; hours: number | null };
+
+/** PD-080: header names accepted for the optional "Giờ/tấm" column. */
+export const creditHoursHeaders = ["hours", "hours_per_image", "gio_tam"];
 
 /**
  * Validates an import file (project_code, process_name, credit, money). Pure: returns either all
@@ -277,7 +295,13 @@ export const parseCreditCsv = (csv: string): { rows: ParsedCreditRow[]; errors: 
   }
   const header = records[0]!.cells.map((cell) => cell.trim().toLowerCase());
   const column = (name: string) => header.indexOf(name);
-  const indexes = { project: column("project_code"), process: column("process_name"), credit: column("credit"), money: column("money") };
+  const indexes = {
+    project: column("project_code"),
+    process: column("process_name"),
+    credit: column("credit"),
+    money: column("money"),
+    hours: creditHoursHeaders.map(column).find((index) => index >= 0) ?? -1
+  };
   if (indexes.project < 0 || indexes.process < 0 || indexes.credit < 0) {
     return { rows, errors: [{ line: records[0]!.line, message: "Thiếu cột project_code, process_name hoặc credit." }] };
   }
@@ -289,6 +313,7 @@ export const parseCreditCsv = (csv: string): { rows: ParsedCreditRow[]; errors: 
     const processName = get(indexes.process);
     const creditText = get(indexes.credit).replace(",", ".");
     const moneyText = get(indexes.money).replace(/[.\s_]/g, "");
+    const hoursText = get(indexes.hours).replace(",", ".");
     const lineErrors: string[] = [];
     if (!projectCode || projectCode.length > 40) {
       lineErrors.push("project_code trống hoặc quá dài");
@@ -305,6 +330,10 @@ export const parseCreditCsv = (csv: string): { rows: ParsedCreditRow[]; errors: 
     if (!Number.isInteger(money) || money < 0) {
       lineErrors.push(`money "${get(indexes.money)}" không hợp lệ (số nguyên VND ≥ 0)`);
     }
+    const hours = hoursText === "" ? null : Number(hoursText);
+    if (hours !== null && (!Number.isFinite(hours) || hours < 0 || hours > 1000)) {
+      lineErrors.push(`hours "${hoursText}" không hợp lệ (số giờ/tấm từ 0 đến 1000)`);
+    }
     const key = `${projectCode.toUpperCase()}|${processName.toLowerCase()}`;
     if (seen.has(key)) {
       lineErrors.push(`trùng cặp Project × quy trình với dòng ${seen.get(key)}`);
@@ -315,7 +344,14 @@ export const parseCreditCsv = (csv: string): { rows: ParsedCreditRow[]; errors: 
       errors.push({ line: record.line, message: lineErrors.join("; ") });
       continue;
     }
-    rows.push({ line: record.line, projectCode, processName, credit: Math.round(credit * 100) / 100, money: money === 0 ? null : money });
+    rows.push({
+      line: record.line,
+      projectCode,
+      processName,
+      credit: Math.round(credit * 100) / 100,
+      money: money === 0 ? null : money,
+      hours: hours === null ? null : Math.round(hours * 10_000) / 10_000
+    });
   }
   if (rows.length === 0 && errors.length === 0) {
     errors.push({ line: records[0]!.line, message: "Không có dòng dữ liệu." });
@@ -326,7 +362,16 @@ export const parseCreditCsv = (csv: string): { rows: ParsedCreditRow[]; errors: 
 /** All-or-nothing import inside the caller's transaction. */
 export const importCreditRules = async (
   sql: QuerySql,
-  input: { organizationId: string; csv: string; effectiveFrom: string; createMissing: boolean; userId: string | null }
+  input: {
+    organizationId: string;
+    csv: string;
+    effectiveFrom: string;
+    createMissing: boolean;
+    userId: string | null;
+    /** PD-080: the import file (stored on every row and on the version) and an optional version name. */
+    source?: string | undefined;
+    versionName?: string | undefined;
+  }
 ): Promise<CreditImportResult> => {
   if (!isValidDay(input.effectiveFrom)) {
     throw new AppError("INVALID_DATE", "Ngày hiệu lực không hợp lệ.", 400);
@@ -375,11 +420,12 @@ export const importCreditRules = async (
     }
     const processKey = row.processName.toLowerCase();
     if (!processes.has(processKey)) {
-      const isQc = processKey === "checking";
+      // PD-080b: several QC-type processes may be active ("Checking", "Checking Clipping"…): a new "Checking…" process is one.
+      const isQc = processKey === "checking" || processKey.startsWith("checking ");
       const created = (
         await sql<{ id: string }[]>`
           INSERT INTO production.processes (organization_id, name, is_qc, sort_order)
-          VALUES (${input.organizationId}, ${row.processName}, ${isQc && !(await hasQcProcess(sql, input.organizationId))}, 50)
+          VALUES (${input.organizationId}, ${row.processName}, ${isQc}, 50)
           RETURNING id
         `
       )[0]!;
@@ -393,6 +439,8 @@ export const importCreditRules = async (
         processId: processes.get(processKey)!,
         creditPerImage: row.credit,
         moneyPerImage: row.money,
+        hoursPerImage: row.hours,
+        source: input.source ?? null,
         effectiveFrom: input.effectiveFrom,
         userId: input.userId
       });
@@ -409,9 +457,28 @@ export const importCreditRules = async (
   if (errors.length > 0) {
     return { ...result, imported: 0, errors };
   }
+  // PD-080: name the version (its day, the file it came from); a later import of the same day renames it.
+  if (input.source || input.versionName) {
+    await sql`
+      INSERT INTO production.credit_versions (organization_id, effective_from, name, source, created_by)
+      VALUES (${input.organizationId}, ${input.effectiveFrom}::date, ${input.versionName ?? null}, ${input.source ?? null}, ${input.userId})
+      ON CONFLICT (organization_id, effective_from) DO UPDATE
+      SET name = coalesce(EXCLUDED.name, production.credit_versions.name), source = coalesce(EXCLUDED.source, production.credit_versions.source),
+        created_by = EXCLUDED.created_by, created_at = now()
+    `;
+  }
   return { ...result, ok: true };
 };
 
-const hasQcProcess = async (sql: QuerySql, organizationId: string) =>
-  (await sql<{ count: number }[]>`SELECT count(*)::int AS count FROM production.processes WHERE organization_id = ${organizationId} AND is_qc AND active`)[0]!
-    .count > 0;
+/** PD-080: the named version in force on `day` (the latest one starting on or before it), null when none is named. */
+export const versionInfoAt = async (sql: QuerySql, organizationId: string, day: string): Promise<CreditVersionInfo | null> => {
+  const row = (
+    await sql<{ effective_from: string; name: string | null; source: string | null }[]>`
+      SELECT to_char(effective_from, 'YYYY-MM-DD') AS effective_from, name, source FROM production.credit_versions
+      WHERE organization_id = ${organizationId} AND effective_from <= ${day}::date
+      ORDER BY effective_from DESC LIMIT 1
+    `
+  )[0];
+  return row ? { effectiveFrom: row.effective_from, name: row.name, source: row.source } : null;
+};
+

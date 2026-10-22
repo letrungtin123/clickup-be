@@ -976,3 +976,96 @@ describe("Link chia việc (PD-040)", () => {
     expect(workLogColumns.at(-1)).toMatchObject({ header: "Link chia việc", key: "workLink" });
   });
 });
+
+// PD-080b — only priced processes ---------------------------------------------------------------------------------------
+
+describe("PD-080b — a line's process must be priced for the job's project on its Ngày nhận", () => {
+  const pricedJob = (call: Call) =>
+    call.text.includes("FROM production.jobs j JOIN production.projects p")
+      ? [{ id: jobId, project_id: projectId, leader_id: null, received_at: jobReceived, deadline: jobDeadline, total_images: 0, total_images_manual: false, qc_buffer_hours: 4, archived_at: null }]
+      : undefined;
+  const pricing = (priced: boolean, projectPriced = true) => (call: Call) =>
+    call.text.includes("AS project_priced")
+      ? (call.values.find((value): value is string[] => Array.isArray(value) && value.every((item) => /^\d{4}-/.test(String(item)))) ?? []).map((_, index) => ({
+          index: index + 1,
+          process_name: "Retouch",
+          project_code: "AXP",
+          priced,
+          project_priced: projectPriced
+        }))
+      : undefined;
+  const pricingCalls = () => callsLike(/AS project_priced/);
+
+  it("Chia task: every line checked in one query on its own Ngày nhận day; an unpriced one → 400, nothing written", async () => {
+    db.state.handler = lineQueries({ extra: (call) => pricedJob(call) ?? pricing(false)(call) });
+    const refused = await failure(
+      createProductionTasks(contextWith(["LEADER"]), jobId, [line({ assignedAt: "2026-10-25T00:00:00+07:00" }), line({ assignedAt: "2026-10-26T08:00:00+07:00" })])
+    );
+    expect(refused).toMatchObject({ code: "PROCESS_NOT_PRICED", status: 400 });
+    expect(refused?.message).toContain("Task 1: Quy trình “Retouch” chưa có đơn giá cho Project “AXP” ngày 25/10/2026");
+    expect(refused?.message).toContain("Task 2: Quy trình “Retouch” chưa có đơn giá cho Project “AXP” ngày 26/10/2026");
+    expect(pricingCalls()).toHaveLength(1);
+    expect(pricingCalls()[0]!.values).toContainEqual(["2026-10-25", "2026-10-26"]);
+    expect(callsLike(/^INSERT INTO production\.tasks/)).toHaveLength(0);
+
+    db.state.calls = [];
+    db.state.handler = lineQueries({ extra: (call) => pricedJob(call) ?? pricing(true)(call) });
+    await createProductionTasks(contextWith(["LEADER"]), jobId, [line()]).catch(() => undefined);
+    expect(callsLike(/^INSERT INTO production\.tasks/)).toHaveLength(1);
+  });
+
+  it("a project without any price: one message “Project … chưa có đơn giá — liên hệ Quản trị.”", async () => {
+    db.state.handler = lineQueries({ extra: (call) => pricedJob(call) ?? pricing(false, false)(call) });
+    expect(await failure(createProductionTasks(contextWith(["LEADER"]), jobId, [line()]))).toMatchObject({
+      code: "PROCESS_NOT_PRICED",
+      status: 400,
+      message: "Project “AXP” chưa có đơn giá — liên hệ Quản trị."
+    });
+  });
+
+  it("Nhập Task: refused the same way on the entry's Ngày nhận", async () => {
+    const entry = CreateWorkEntryRequestSchema.parse({
+      projectId,
+      jobId,
+      processId,
+      shiftId,
+      qcId: checker,
+      assignedAt: "2026-10-26T00:00:00+07:00",
+      deadline: "2026-10-26T23:59:00+07:00"
+    });
+    db.state.handler = lineQueries({
+      extra: (call) =>
+        call.text.startsWith("SELECT 1 FROM production.projects") ? [{ "?column?": 1 }]
+        : call.text.startsWith("SELECT project_id FROM production.jobs") ? [{ project_id: projectId }]
+        : (pricedJob(call) ?? pricing(false)(call))
+    });
+    const refused = await failure(createWorkEntry(contextWith(["LEADER"]), entry));
+    expect(refused).toMatchObject({ code: "PROCESS_NOT_PRICED", status: 400 });
+    expect(refused?.message).toBe("Quy trình “Retouch” chưa có đơn giá cho Project “AXP” ngày 26/10/2026 — liên hệ Quản trị.");
+    expect(callsLike(/^INSERT INTO production\.tasks/)).toHaveLength(0);
+  });
+
+  it("editing a line: a new process or a new Ngày nhận day is checked; other edits ask nothing", async () => {
+    const other = "99999999-9999-4999-8999-999999999999";
+    const handler = (priced: boolean) => (call: Call) =>
+      call.text.startsWith("SELECT job_id FROM production.tasks") ? [{ job_id: jobId }]
+      : call.text.includes("AS job_leader_id") ? [taskRow()]
+      : call.text.startsWith("SELECT id, active, is_qc, name FROM production.processes") ? [{ id: other, active: true, is_qc: false, name: "Retouch 2" }, { id: processId, active: true, is_qc: false, name: "Retouch" }]
+      : call.text.startsWith("SELECT om.user_id") ? [{ user_id: me, roles: ["STAFF"], superadmin: false }]
+      : pricing(priced)(call);
+    db.state.handler = handler(false);
+    expect(await failure(updateProductionTask(contextWith(["LEADER"], true), taskId, { processId: other }))).toMatchObject({ code: "PROCESS_NOT_PRICED", status: 400 });
+    expect(pricingCalls()[0]!.values).toContainEqual([other]);
+    expect(callsLike(/^UPDATE production\.tasks SET qty_assigned/)).toHaveLength(0);
+
+    db.state.calls = [];
+    expect(await failure(updateProductionTask(contextWith(["LEADER"], true), taskId, { assignedAt: "2026-10-26T00:00:00+07:00" }))).toMatchObject({
+      code: "PROCESS_NOT_PRICED"
+    });
+    expect(pricingCalls()[0]!.values).toContainEqual(["2026-10-26"]);
+
+    db.state.calls = [];
+    await updateProductionTask(contextWith(["LEADER"], true), taskId, { note: "x" }).catch(() => undefined);
+    expect(pricingCalls()).toHaveLength(0);
+  });
+});
